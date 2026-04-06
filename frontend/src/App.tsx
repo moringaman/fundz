@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from 'react';
 import { createChart, ColorType, CandlestickSeries } from 'lightweight-charts';
 import type { IChartApi, Time } from 'lightweight-charts';
-import { Activity, Bot, Wallet, Settings, Menu, X, TrendingUp, History, Zap, Play, ArrowUpRight, ArrowDownRight, Minus, HelpCircle, RotateCcw, Users, AlertTriangle, BarChart3, Shield, Target, ChevronUp, ChevronDown, Key, Brain, Gauge, Save, Eye, EyeOff, Check, RefreshCw, Info } from 'lucide-react';
+import { Activity, Bot, Wallet, Settings, Menu, X, TrendingUp, History, Zap, Play, ArrowUpRight, ArrowDownRight, Minus, HelpCircle, RotateCcw, Users, AlertTriangle, BarChart3, Shield, ChevronUp, ChevronDown, Key, Brain, Save, Eye, EyeOff, Check, RefreshCw, Info, MessageCircle, FileText, Calendar } from 'lucide-react';
 import { useAppStore } from './lib/store';
 import { paperApi, automationApi, settingsApi } from './lib/api';
 import { Chart } from './components/Chart';
@@ -26,8 +26,13 @@ import {
   useFundTeamStatus,
   useFundTeamRoster,
   useFundAllocationDecision,
+  useFundTechnicalAnalysis,
   useSettings,
+  useFundConversations,
+  useDailyReport,
+  useDailyReports,
 } from './hooks/useQueries';
+import { useTeamChatStream } from './hooks/useTeamChatStream';
 import './index.css';
 
 const SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'ADAUSDT'];
@@ -90,6 +95,387 @@ function NavBadge({ children, variant = 'default' }: { children: React.ReactNode
   );
 }
 
+// ─── Team Chat Toast Notifications ──────────────────────────────────────────
+
+function TeamChatToasts() {
+  const { teamChatToasts, dismissTeamChatToast } = useAppStore();
+
+  useEffect(() => {
+    if (teamChatToasts.length === 0) return;
+    const timers = teamChatToasts.map((msg) =>
+      setTimeout(() => dismissTeamChatToast(msg.id), 8000)
+    );
+    return () => timers.forEach(clearTimeout);
+  }, [teamChatToasts, dismissTeamChatToast]);
+
+  if (teamChatToasts.length === 0) return null;
+
+  const typeColors: Record<string, string> = {
+    warning: 'var(--red)',
+    analysis: 'var(--accent)',
+    decision: 'var(--green)',
+    recommendation: 'var(--amber)',
+    greeting: 'var(--text-secondary)',
+  };
+  const typeBgColors: Record<string, string> = {
+    warning: 'var(--red-dim)',
+    analysis: 'var(--accent-dim)',
+    decision: 'var(--green-dim)',
+    recommendation: 'var(--amber-dim)',
+    greeting: 'var(--bg-elevated)',
+  };
+
+  return (
+    <div className="team-chat-toasts">
+      {teamChatToasts.map((msg) => (
+        <div
+          key={msg.id}
+          className="team-chat-toast"
+          style={{
+            borderLeft: `3px solid ${typeColors[msg.message_type] || 'var(--accent)'}`,
+            background: typeBgColors[msg.message_type] || 'var(--bg-panel)',
+          }}
+          onClick={() => dismissTeamChatToast(msg.id)}
+        >
+          <div className="team-chat-toast-header">
+            <span className="team-chat-toast-avatar">{msg.avatar}</span>
+            <span className="team-chat-toast-name">{msg.agent_name}</span>
+            <span className="team-chat-toast-type">{msg.message_type}</span>
+          </div>
+          <div className="team-chat-toast-content">
+            {msg.content.replace(/\*\*/g, '').slice(0, 120)}
+            {msg.content.length > 120 ? '…' : ''}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ─── Team Chat Panel (for Fund Team page) ───────────────────────────────────
+
+function TeamChatPanel() {
+  const { data: conversations = [], isLoading } = useFundConversations(100);
+  const chatEndRef = useRef<HTMLDivElement>(null);
+  const msgs: any[] = Array.isArray(conversations) ? conversations : [];
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [msgs.length]);
+
+  const typeColors: Record<string, string> = {
+    warning: 'var(--red)',
+    analysis: 'var(--accent)',
+    decision: 'var(--green)',
+    recommendation: 'var(--amber)',
+    greeting: 'var(--text-secondary)',
+  };
+
+  const formatContent = (content: string) => {
+    // Convert **bold** to styled spans
+    return content.split(/\*\*(.*?)\*\*/g).map((part, i) =>
+      i % 2 === 1
+        ? <strong key={i} style={{ color: 'var(--text-primary)', fontWeight: 700 }}>{part}</strong>
+        : <span key={i}>{part}</span>
+    );
+  };
+
+  const formatTime = (iso: string) => {
+    try {
+      const d = new Date(iso);
+      return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    } catch { return ''; }
+  };
+
+  return (
+    <div className="team-chat-panel">
+      <div className="team-chat-header">
+        <MessageCircle size={15} style={{ color: 'var(--accent)' }} />
+        <span>Team Discussion</span>
+        <span className="team-chat-badge">{msgs.length}</span>
+      </div>
+      <div className="team-chat-messages">
+        {isLoading && (
+          <div style={{ textAlign: 'center', padding: '2rem', color: 'var(--text-dim)', fontSize: '.75rem' }}>
+            Loading conversations…
+          </div>
+        )}
+        {!isLoading && msgs.length === 0 && (
+          <div style={{ textAlign: 'center', padding: '2rem', color: 'var(--text-dim)', fontSize: '.75rem' }}>
+            <MessageCircle size={24} style={{ opacity: .3, display: 'block', margin: '0 auto .5rem' }} />
+            No conversations yet. Team discussions appear when the scheduler runs.
+          </div>
+        )}
+        {msgs.map((msg: any) => (
+          <div key={msg.id} className="team-chat-msg">
+            <div className="team-chat-msg-avatar">{msg.avatar}</div>
+            <div className="team-chat-msg-body">
+              <div className="team-chat-msg-meta">
+                <span className="team-chat-msg-name">{msg.agent_name}</span>
+                <span
+                  className="team-chat-msg-type-badge"
+                  style={{ color: typeColors[msg.message_type] || 'var(--text-secondary)' }}
+                >
+                  {msg.message_type}
+                </span>
+                <span className="team-chat-msg-time">{formatTime(msg.timestamp)}</span>
+              </div>
+              <div className="team-chat-msg-content">
+                {formatContent(msg.content)}
+              </div>
+              {msg.mentions && msg.mentions.length > 0 && (
+                <div className="team-chat-msg-mentions">
+                  {msg.mentions.map((m: string) => (
+                    <span key={m} className="team-chat-mention">@{m.replace('_', ' ')}</span>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        ))}
+        <div ref={chatEndRef} />
+      </div>
+    </div>
+  );
+}
+
+// ─── Daily Report Panel (for Fund Team page) ────────────────────────────────
+
+function DailyReportPanel() {
+  const { data: todayReport, isLoading: reportLoading } = useDailyReport();
+  const { data: pastReports = [] } = useDailyReports(7);
+  const [generating, setGenerating] = useState(false);
+  const [selectedDate, setSelectedDate] = useState<string | null>(null);
+  const { data: selectedReport } = useDailyReport(selectedDate || undefined);
+
+  const report: any = selectedDate ? selectedReport : todayReport;
+  const reports: any[] = Array.isArray(pastReports) ? pastReports : [];
+  const hasReport = report && !report.message;
+
+  const handleGenerate = async () => {
+    setGenerating(true);
+    try {
+      const { fundApi: fApi } = await import('./lib/api');
+      await fApi.generateDailyReport(undefined, true);
+      window.location.reload();
+    } catch { /* ignore */ }
+    finally { setGenerating(false); }
+  };
+
+  const pnlColor = (val: number) => val > 0 ? 'var(--green)' : val < 0 ? 'var(--red)' : 'var(--text-secondary)';
+
+  return (
+    <div className="daily-report-panel">
+      <div className="daily-report-header">
+        <div style={{ display: 'flex', alignItems: 'center', gap: '.5rem' }}>
+          <FileText size={15} style={{ color: 'var(--accent)' }} />
+          <span>Daily Report</span>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '.5rem' }}>
+          {/* Past report date pills */}
+          {reports.slice(0, 5).map((r: any) => (
+            <button
+              key={r.report_date}
+              type="button"
+              onClick={() => setSelectedDate(r.report_date === selectedDate ? null : r.report_date)}
+              className="daily-report-date-pill"
+              style={{
+                background: (selectedDate || new Date().toISOString().slice(0, 10)) === r.report_date
+                  ? 'var(--accent-dim)' : 'var(--bg-elevated)',
+                color: (selectedDate || new Date().toISOString().slice(0, 10)) === r.report_date
+                  ? 'var(--accent)' : 'var(--text-secondary)',
+                borderColor: (selectedDate || new Date().toISOString().slice(0, 10)) === r.report_date
+                  ? 'var(--accent)' : 'var(--border-mid)',
+              }}
+            >
+              {r.report_date?.slice(5)}
+            </button>
+          ))}
+          <button
+            type="button"
+            className="settings-btn"
+            onClick={handleGenerate}
+            disabled={generating}
+            style={{ fontSize: '.68rem', padding: '.3rem .6rem' }}
+          >
+            <RefreshCw size={11} /> {generating ? 'Generating…' : 'Generate'}
+          </button>
+        </div>
+      </div>
+
+      {reportLoading && (
+        <div style={{ textAlign: 'center', padding: '2rem', color: 'var(--text-dim)', fontSize: '.75rem' }}>
+          Loading report…
+        </div>
+      )}
+
+      {!reportLoading && !hasReport && (
+        <div style={{ textAlign: 'center', padding: '2.5rem 1rem', color: 'var(--text-dim)', fontSize: '.75rem' }}>
+          <Calendar size={28} style={{ opacity: .3, display: 'block', margin: '0 auto .5rem' }} />
+          No report available yet. Reports are generated automatically every hour when the scheduler is running.
+        </div>
+      )}
+
+      {hasReport && (
+        <div className="daily-report-body">
+          {/* Key Metrics Row */}
+          <div className="daily-report-metrics-grid">
+            <div className="daily-report-metric">
+              <span className="daily-report-metric-label">Total P&L</span>
+              <span className="daily-report-metric-value" style={{ color: pnlColor(report.total_pnl || 0) }}>
+                ${(report.total_pnl || 0).toFixed(2)}
+              </span>
+            </div>
+            <div className="daily-report-metric">
+              <span className="daily-report-metric-label">Realized</span>
+              <span className="daily-report-metric-value" style={{ color: pnlColor(report.realized_pnl || 0) }}>
+                ${(report.realized_pnl || 0).toFixed(2)}
+              </span>
+            </div>
+            <div className="daily-report-metric">
+              <span className="daily-report-metric-label">Unrealized</span>
+              <span className="daily-report-metric-value" style={{ color: pnlColor(report.unrealized_pnl || 0) }}>
+                ${(report.unrealized_pnl || 0).toFixed(2)}
+              </span>
+            </div>
+            <div className="daily-report-metric">
+              <span className="daily-report-metric-label">Daily Return</span>
+              <span className="daily-report-metric-value" style={{ color: pnlColor(report.daily_return_pct || 0) }}>
+                {(report.daily_return_pct || 0).toFixed(3)}%
+              </span>
+            </div>
+            <div className="daily-report-metric">
+              <span className="daily-report-metric-label">Trades Opened</span>
+              <span className="daily-report-metric-value">{report.trades_opened || 0}</span>
+            </div>
+            <div className="daily-report-metric">
+              <span className="daily-report-metric-label">Trades Closed</span>
+              <span className="daily-report-metric-value">{report.trades_closed || 0}</span>
+            </div>
+            <div className="daily-report-metric">
+              <span className="daily-report-metric-label">Open Positions</span>
+              <span className="daily-report-metric-value">{report.open_positions_count || 0}</span>
+            </div>
+            <div className="daily-report-metric">
+              <span className="daily-report-metric-label">Portfolio Value</span>
+              <span className="daily-report-metric-value">${(report.portfolio_value || 0).toFixed(0)}</span>
+            </div>
+          </div>
+
+          {/* Market Conditions + Risk */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '.75rem', marginTop: '.75rem' }}>
+            {report.market_conditions && Object.keys(report.market_conditions).length > 0 && (
+              <div className="daily-report-section">
+                <div className="daily-report-section-title">Market Conditions</div>
+                <div className="daily-report-kv">
+                  {report.market_conditions.regime && <div><span>Regime</span><span>{report.market_conditions.regime}</span></div>}
+                  {report.market_conditions.sentiment && <div><span>Sentiment</span><span>{report.market_conditions.sentiment}</span></div>}
+                  {report.market_conditions.volatility && <div><span>Volatility</span><span>{report.market_conditions.volatility}</span></div>}
+                  {report.market_conditions.analyst_recommendation && <div><span>Recommendation</span><span>{report.market_conditions.analyst_recommendation}</span></div>}
+                </div>
+              </div>
+            )}
+
+            {report.risk_summary && Object.keys(report.risk_summary).length > 0 && (
+              <div className="daily-report-section">
+                <div className="daily-report-section-title">Risk Summary</div>
+                <div className="daily-report-kv">
+                  {report.risk_summary.risk_level && (
+                    <div>
+                      <span>Level</span>
+                      <span style={{
+                        color: report.risk_summary.risk_level === 'safe' ? 'var(--green)' :
+                               report.risk_summary.risk_level === 'danger' ? 'var(--red)' : 'var(--amber)',
+                        fontWeight: 700,
+                      }}>{report.risk_summary.risk_level.toUpperCase()}</span>
+                    </div>
+                  )}
+                  {report.risk_summary.exposure_pct != null && <div><span>Exposure</span><span>{report.risk_summary.exposure_pct?.toFixed(1)}%</span></div>}
+                  {report.risk_summary.concentration_risk && <div><span>Concentration</span><span>{report.risk_summary.concentration_risk}</span></div>}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Agent Leaderboard */}
+          {report.agent_leaderboard && report.agent_leaderboard.length > 0 && (
+            <div className="daily-report-section" style={{ marginTop: '.75rem' }}>
+              <div className="daily-report-section-title">Agent Leaderboard</div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '.3rem' }}>
+                {report.agent_leaderboard.map((a: any, i: number) => (
+                  <div key={a.agent_id || i} style={{
+                    display: 'flex', alignItems: 'center', gap: '.6rem',
+                    padding: '.4rem .6rem', borderRadius: 6,
+                    background: i === 0 ? 'var(--green-dim)' : 'transparent',
+                  }}>
+                    <span style={{
+                      fontSize: '.7rem', fontWeight: 700, width: 20, textAlign: 'center',
+                      color: i === 0 ? 'var(--green)' : 'var(--text-dim)',
+                    }}>#{a.rank || i + 1}</span>
+                    <span style={{ flex: 1, fontSize: '.75rem', color: 'var(--text-primary)' }}>
+                      {a.name || a.agent_id}
+                    </span>
+                    <span style={{
+                      fontSize: '.75rem', fontFamily: 'var(--mono)', fontWeight: 700,
+                      color: pnlColor(a.total_pnl || 0),
+                    }}>
+                      ${(a.total_pnl || 0).toFixed(2)}
+                    </span>
+                    <span style={{ fontSize: '.65rem', color: 'var(--text-dim)' }}>
+                      WR {((a.win_rate || 0) * 100).toFixed(0)}%
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* CIO Summary */}
+          {report.cio_summary && (
+            <div className="daily-report-section" style={{ marginTop: '.75rem' }}>
+              <div className="daily-report-section-title">
+                CIO Commentary
+                {report.cio_sentiment && (
+                  <span style={{
+                    marginLeft: '.5rem', fontSize: '.6rem', padding: '.1rem .4rem', borderRadius: 4,
+                    background: 'var(--accent-dim)', color: 'var(--accent)',
+                  }}>{report.cio_sentiment.replace('_', ' ')}</span>
+                )}
+              </div>
+              <p style={{ fontSize: '.75rem', color: 'var(--text-secondary)', lineHeight: 1.6, margin: 0 }}>
+                {report.cio_summary}
+              </p>
+            </div>
+          )}
+
+          {/* Team Discussion Summary */}
+          {report.team_discussion_summary && (
+            <div className="daily-report-section" style={{ marginTop: '.75rem' }}>
+              <div className="daily-report-section-title">
+                Team Discussions
+                <span style={{
+                  marginLeft: '.5rem', fontSize: '.6rem', padding: '.1rem .4rem', borderRadius: 4,
+                  background: 'var(--bg-elevated)', color: 'var(--text-dim)',
+                }}>{report.team_message_count || 0} messages</span>
+              </div>
+              <p style={{ fontSize: '.75rem', color: 'var(--text-secondary)', lineHeight: 1.6, margin: 0 }}>
+                {report.team_discussion_summary}
+              </p>
+            </div>
+          )}
+
+          {/* Generated timestamp */}
+          {report.generated_at && (
+            <div style={{ marginTop: '.75rem', fontSize: '.62rem', color: 'var(--text-dim)', textAlign: 'right', fontFamily: 'var(--mono)' }}>
+              Generated: {new Date(report.generated_at).toLocaleString()}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function App() {
   const [activePage, setActivePage] = useState('dashboard');
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -99,6 +485,7 @@ function App() {
   useWebSocket();
   useMarketStream(timeframe);
   useWsQueryInvalidation();
+  useTeamChatStream();
 
   // Data for sidebar badges
   const { data: automationStatus } = useAutomationStatus();
@@ -121,6 +508,7 @@ function App() {
 
   return (
     <div className="app-container">
+      <TeamChatToasts />
       <button
         className={`sidebar-overlay ${sidebarOpen ? 'visible' : ''}`}
         onClick={() => setSidebarOpen(false)}
@@ -2374,11 +2762,12 @@ function timeAgo(isoString: string): string {
 
 function FundTeamPage() {
   const { data: marketAnalysis, isLoading: marketLoading } = useFundMarketAnalysis();
+  const { data: technicalAnalysis, isLoading: technicalLoading } = useFundTechnicalAnalysis();
   const { data: riskData, isLoading: riskLoading } = useFundRiskAssessment();
   const { data: cioReport, isLoading: cioLoading } = useFundCIOReport();
   const { data: attribution, isLoading: attrLoading } = useFundPerformanceAttribution();
   const { data: allocation, isLoading: allocLoading } = useFundAllocationDecision();
-  const { data: teamRoster, isLoading: rosterLoading } = useFundTeamRoster();
+  const { data: teamRoster } = useFundTeamRoster();
   const { data: agents } = useAgents();
 
   const riskLevel: string = (riskData as any)?.risk_level ?? 'unknown';
@@ -2457,10 +2846,12 @@ function FundTeamPage() {
           </span>
         </div>
       </div>
+      <div style={{  marginBottom: '2rem' }}>
+      <TeamChatPanel />
+      </div>
 
       {/* Main Grid */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))', gap: '1.5rem' }}>
-
         {/* === Research Analyst === */}
         <div className="panel" style={{ gridColumn: 'span 2' }}>
           <div className="panel-header">
@@ -2550,6 +2941,125 @@ function FundTeamPage() {
           )}
         </div>
 
+        {/* === Technical Analyst === */}
+        <div className="panel">
+          <div className="panel-header">
+            <div className="panel-title">
+              <img src={getTeamMember('technical_analyst').avatar} alt={getTeamMember('technical_analyst').name} style={{ width: '36px', height: '36px', borderRadius: '50%', objectFit: 'cover' }} />
+              <div style={{ marginLeft: '.75rem' }}>
+                <div style={{ fontSize: '.9rem', fontWeight: 700 }}>{getTeamMember('technical_analyst').name}</div>
+                <div style={{ fontSize: '.65rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)', marginTop: '.125rem' }}>{getTeamMember('technical_analyst').title}</div>
+              </div>
+            </div>
+            <span style={{ fontSize: '.65rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)' }}>
+              CHART ANALYSIS
+            </span>
+          </div>
+
+          {technicalLoading ? (
+            <div style={{ display: 'flex', justifyContent: 'center', padding: '1.5rem', color: 'var(--text-dim)' }}>Analyzing charts...</div>
+          ) : technicalAnalysis ? (
+            <div>
+              {/* Current Price & Signal */}
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+                <div>
+                  <div style={{ fontSize: '1.1rem', fontWeight: 700, fontFamily: 'var(--mono)', color: 'var(--text)' }}>
+                    ${((technicalAnalysis as any).current_price || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                  </div>
+                  <div style={{ fontSize: '.65rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)' }}>BTCUSDT</div>
+                </div>
+                <div style={{
+                  padding: '4px 12px',
+                  borderRadius: '6px',
+                  fontSize: '.75rem',
+                  fontFamily: 'var(--mono)',
+                  fontWeight: 700,
+                  background: (technicalAnalysis as any).overall_signal === 'bullish' ? 'var(--green-dim)' : (technicalAnalysis as any).overall_signal === 'bearish' ? 'var(--red-dim)' : 'var(--bg-hover)',
+                  color: (technicalAnalysis as any).overall_signal === 'bullish' ? 'var(--green)' : (technicalAnalysis as any).overall_signal === 'bearish' ? 'var(--red)' : 'var(--text-dim)',
+                }}>
+                  {(technicalAnalysis as any).overall_signal?.toUpperCase() || 'HOLD'} ({((technicalAnalysis as any).confidence || 0) * 100}%)
+                </div>
+              </div>
+
+              {/* Price Levels */}
+              {(technicalAnalysis as any).price_levels && (
+                <div style={{ marginBottom: '.75rem' }}>
+                  <div style={{ fontSize: '.6rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)', textTransform: 'uppercase', marginBottom: '.4rem' }}>Key Levels</div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '.4rem' }}>
+                    {(technicalAnalysis as any).price_levels.resistance?.slice(0, 2).map((r: number, i: number) => (
+                      <div key={`r${i}`} style={{ display: 'flex', justifyContent: 'space-between', padding: '.3rem .5rem', background: 'var(--red-dim)', borderRadius: '4px' }}>
+                        <span style={{ fontSize: '.6rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)' }}>R{i + 1}</span>
+                        <span style={{ fontSize: '.7rem', color: 'var(--red)', fontFamily: 'var(--mono)', fontWeight: 600 }}>${r.toLocaleString()}</span>
+                      </div>
+                    ))}
+                    {(technicalAnalysis as any).price_levels.support?.slice(0, 2).map((s: number, i: number) => (
+                      <div key={`s${i}`} style={{ display: 'flex', justifyContent: 'space-between', padding: '.3rem .5rem', background: 'var(--green-dim)', borderRadius: '4px' }}>
+                        <span style={{ fontSize: '.6rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)' }}>S{i + 1}</span>
+                        <span style={{ fontSize: '.7rem', color: 'var(--green)', fontFamily: 'var(--mono)', fontWeight: 600 }}>${s.toLocaleString()}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Fibonacci */}
+              {(technicalAnalysis as any).price_levels?.fibonacci_retracements && (
+                <div style={{ marginBottom: '.75rem' }}>
+                  <div style={{ fontSize: '.6rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)', textTransform: 'uppercase', marginBottom: '.4rem' }}>Fibonacci Retracements</div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '.25rem' }}>
+                    {Object.entries((technicalAnalysis as any).price_levels.fibonacci_retracements).slice(0, 3).map(([level, price]: [string, any]) => (
+                      <div key={level} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '.65rem', fontFamily: 'var(--mono)', color: 'var(--text-secondary)' }}>
+                        <span>{level}</span>
+                        <span>${(price || 0).toLocaleString()}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Patterns */}
+              {((technicalAnalysis as any).patterns?.length > 0) && (
+                <div>
+                  <div style={{ fontSize: '.6rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)', textTransform: 'uppercase', marginBottom: '.4rem' }}>Pattern Signals</div>
+                  {((technicalAnalysis as any).patterns as any[]).slice(0, 2).map((pattern: any, i: number) => (
+                    <div key={i} style={{
+                      padding: '.4rem .5rem',
+                      background: 'var(--bg-hover)',
+                      borderRadius: '4px',
+                      marginBottom: '.3rem',
+                      borderLeft: `2px solid ${pattern.direction === 'bullish' ? 'var(--green)' : 'var(--red)'}`,
+                    }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '.2rem' }}>
+                        <span style={{ fontSize: '.7rem', fontFamily: 'var(--mono)', fontWeight: 600, color: 'var(--text)' }}>{pattern.pattern_type?.replace(/_/g, ' ')}</span>
+                        <span style={{ fontSize: '.65rem', fontFamily: 'var(--mono)', color: pattern.direction === 'bullish' ? 'var(--green)' : 'var(--red)' }}>{pattern.direction?.toUpperCase()} {(pattern.confidence * 100).toFixed(0)}%</span>
+                      </div>
+                      <div style={{ display: 'flex', gap: '.5rem', fontSize: '.6rem', fontFamily: 'var(--mono)', color: 'var(--text-dim)' }}>
+                        <span>SL: ${pattern.stop_loss?.toFixed(0)}</span>
+                        <span>TP1: ${pattern.take_profit_1?.toFixed(0)}</span>
+                        <span>RR: {pattern.risk_reward?.toFixed(1)}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Multi-Timeframe */}
+              {(technicalAnalysis as any).multi_timeframe && (
+                <div style={{ marginTop: '.75rem', padding: '.4rem .5rem', background: 'var(--bg-hover)', borderRadius: '4px' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <span style={{ fontSize: '.6rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)', textTransform: 'uppercase' }}>Multi-TF</span>
+                    <span style={{ fontSize: '.65rem', fontFamily: 'var(--mono)', color: (technicalAnalysis as any).multi_timeframe.trend_confirmation ? 'var(--green)' : 'var(--amber)' }}>
+                      {(technicalAnalysis as any).multi_timeframe.alignment?.toUpperCase()} | {((technicalAnalysis as any).multi_timeframe.confluence_score || 0) * 100}%
+                    </span>
+                  </div>
+                </div>
+              )}
+            </div>
+          ) : (
+            <div style={{ color: 'var(--text-dim)', fontSize: '.75rem', textAlign: 'center', padding: '1rem' }}>No technical analysis available</div>
+          )}
+        </div>
+
         {/* === Risk Manager === */}
         <div className="panel">
           <div className="panel-header">
@@ -2632,11 +3142,11 @@ function FundTeamPage() {
               )}
 
               {/* Reasoning */}
-              {(riskData as any).reasoning && (
+              {/* {(riskData as any).reasoning && (
                 <div style={{ marginTop: '.75rem', fontSize: '.68rem', color: 'var(--text-secondary)', fontFamily: 'var(--sans)', lineHeight: 1.5, padding: '.5rem', background: 'var(--bg-hover)', borderRadius: '4px', borderLeft: '2px solid var(--border)' }}>
                   {(riskData as any).reasoning}
                 </div>
-              )}
+              )} */}
             </div>
           ) : (
             <div style={{ color: 'var(--text-dim)', fontSize: '.75rem', textAlign: 'center', padding: '1rem' }}>No risk data available</div>
@@ -2879,6 +3389,9 @@ function FundTeamPage() {
         </div>
 
       </div>
+
+      {/* Daily Report Panel */}
+      <DailyReportPanel />
     </div>
   );
 }

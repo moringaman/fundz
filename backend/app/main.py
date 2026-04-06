@@ -256,7 +256,7 @@ async def websocket_market(websocket: WebSocket):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from app.database import engine, Base
-    from app.models import AgentRunRecord, AgentMetricRecord  # noqa: F401
+    from app.models import AgentRunRecord, AgentMetricRecord, TeamChatMessageRecord, DailyReport  # noqa: F401
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -266,6 +266,10 @@ async def lifespan(app: FastAPI):
         await llm_service.initialize()
     except Exception as e:
         logger.warning(f"LLM service not initialized: {e}")
+
+    # Wire team chat broadcasts to the WS connection manager
+    from app.services.team_chat import team_chat
+    team_chat.set_broadcast(lambda msg: manager.broadcast(msg))
 
     broadcast_task = asyncio.create_task(_market_broadcast_loop())
 

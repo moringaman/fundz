@@ -18,6 +18,9 @@ from app.services.research_analyst import research_analyst
 from app.services.fund_manager import fund_manager
 from app.services.cio_agent import cio_agent
 from app.services.execution_coordinator import execution_coordinator
+from app.services.technical_analyst import technical_analyst
+from app.services.team_chat import team_chat
+from app.services.daily_report import daily_report_service
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +71,7 @@ class AgentScheduler:
 
         # Team Decision Tier state
         self._last_team_analysis: Optional[datetime] = None
+        self._last_daily_report: Optional[datetime] = None
         self._current_allocation: Dict[str, float] = {}
         self._current_risk_assessment = None
         self._current_analyst_report = None
@@ -117,6 +121,9 @@ class AgentScheduler:
 
                 # INDIVIDUAL AGENT TIER (EXISTING): Run per-agent on their schedule
                 await self._run_enabled_agents()
+
+                # DAILY REPORT TIER: Generate once per hour (catches end-of-day)
+                await self._maybe_generate_daily_report()
 
             except Exception as e:
                 logger.error(f"Scheduler loop error: {e}")
@@ -205,6 +212,7 @@ class AgentScheduler:
                 self._current_analyst_report = analyst_report
                 logger.info(f"Team Tier: Analyst report - Market {analyst_report.market_regime.regime}, "
                            f"Sentiment: {analyst_report.market_regime.sentiment}")
+                await team_chat.log_analyst_report(analyst_report)
             except Exception as e:
                 logger.error(f"Team Tier: Research analyst failed: {e}")
 
@@ -218,6 +226,7 @@ class AgentScheduler:
                 )
                 self._current_allocation = portfolio_decision.allocation_pct
                 logger.info(f"Team Tier: Portfolio manager updated allocation for {len(agents_list)} agents")
+                await team_chat.log_portfolio_decision(portfolio_decision, agents_list)
             except Exception as e:
                 logger.error(f"Team Tier: Portfolio manager failed: {e}")
 
@@ -230,6 +239,7 @@ class AgentScheduler:
                 self._current_risk_assessment = risk_assessment
                 logger.info(f"Team Tier: Risk assessment - Level: {risk_assessment.risk_level}, "
                            f"Daily PnL: ${risk_assessment.daily_pnl:+.2f}")
+                await team_chat.log_risk_assessment(risk_assessment)
             except Exception as e:
                 logger.error(f"Team Tier: Risk manager failed: {e}")
 
@@ -238,6 +248,7 @@ class AgentScheduler:
                 execution_plan = await execution_coordinator.optimize_execution_plan([])
                 self._current_execution_plan = execution_plan
                 logger.info(f"Team Tier: Execution coordinator - {execution_plan.pending_orders_count} pending orders")
+                await team_chat.log_execution_plan(execution_plan)
             except Exception as e:
                 logger.error(f"Team Tier: Execution coordinator failed: {e}")
 
@@ -250,11 +261,32 @@ class AgentScheduler:
                     )
                     self._current_cio_report = cio_report
                     logger.info(f"Team Tier: CIO report - Sentiment: {cio_report.cio_sentiment}")
+                    await team_chat.log_cio_report(cio_report)
             except Exception as e:
                 logger.error(f"Team Tier: CIO report failed: {e}")
 
         except Exception as e:
             logger.error(f"Team analysis tier failed: {e}")
+
+    async def _maybe_generate_daily_report(self):
+        """Generate a daily report every hour (updates with latest data)."""
+        try:
+            now = datetime.now()
+            if self._last_daily_report and \
+               (now - self._last_daily_report).total_seconds() < 3600:
+                return  # already ran within the last hour
+
+            logger.info("Generating daily report snapshot")
+            await daily_report_service.generate_daily_report(force=True)
+            self._last_daily_report = now
+
+            await team_chat.add_message(
+                agent_role="cio",
+                content=f"Daily report for {now.strftime('%Y-%m-%d')} has been updated with the latest fund metrics.",
+                message_type="recommendation",
+            )
+        except Exception as e:
+            logger.error(f"Daily report generation failed: {e}")
 
     async def _run_enabled_agents(self):
         for agent_id, config in self._enabled_agents.items():
@@ -272,6 +304,9 @@ class AgentScheduler:
                     if self._current_risk_assessment.risk_level == "danger":
                         logger.warning(f"Skipping agent {config.get('name')} ({agent_id}): "
                                      f"portfolio risk level is DANGER")
+                        await team_chat.log_agent_gate_block(
+                            config.get('name', agent_id), "portfolio risk level is DANGER"
+                        )
                         continue
 
                 # GATE 2: Check if agent is within allocation from Portfolio Manager
@@ -432,6 +467,33 @@ class AgentScheduler:
                         executed=False,
                         error=risk_check.reason
                     )
+                
+                technical_report = await technical_analyst.analyze(symbol)
+                if technical_report.overall_signal != signal and technical_report.confidence > 0.6:
+                    logger.warning(f"Trade rejected by technical analyst: signal {signal} conflicts with TA {technical_report.overall_signal} (conf: {technical_report.confidence})")
+                    self._record_run(agent_id, symbol, signal, confidence, current_price, False, error=f"Technical analyst disagrees: {technical_report.overall_signal}")
+                    return AgentRun(
+                        agent_id=agent_id,
+                        timestamp=datetime.now(),
+                        symbol=symbol,
+                        signal="hold",
+                        confidence=0,
+                        price=current_price,
+                        executed=False,
+                        error=f"Technical analyst disagrees: {technical_report.overall_signal}"
+                    )
+                
+                if technical_report.patterns:
+                    best_pattern = max(technical_report.patterns, key=lambda p: p.confidence)
+                    if best_pattern.stop_loss and best_pattern.take_profit_1:
+                        adjusted_sl = min(risk_check.stop_loss_price, best_pattern.stop_loss) if risk_check.stop_loss_price else best_pattern.stop_loss
+                        adjusted_tp = max(risk_check.take_profit_price, best_pattern.take_profit_1) if risk_check.take_profit_price else best_pattern.take_profit_1
+                        logger.info(f"Technical analyst levels: SL ${best_pattern.stop_loss:.2f}, TP1 ${best_pattern.take_profit_1:.2f}, TP2 ${best_pattern.take_profit_2:.2f}")
+                
+                if technical_report.price_levels.support or technical_report.price_levels.resistance:
+                    nearest_support = min(technical_report.price_levels.support, key=lambda x: abs(x - current_price)) if technical_report.price_levels.support else None
+                    nearest_res = min(technical_report.price_levels.resistance, key=lambda x: abs(x - current_price)) if technical_report.price_levels.resistance else None
+                    logger.info(f"Key levels - Support: ${nearest_support:,.0f}, Resistance: ${nearest_res:,.0f}")
                 
                 if risk_check.stop_loss_price:
                     logger.info(f"Risk levels - SL: ${risk_check.stop_loss_price:.2f}, TP: ${risk_check.take_profit_price:.2f}")

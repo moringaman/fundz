@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException
 from typing import Any, List, Optional, Dict
 from pydantic import BaseModel
-from datetime import datetime
+from datetime import datetime, date
 
 from app.services.research_analyst import research_analyst
 from app.services.fund_manager import fund_manager
@@ -10,6 +10,8 @@ from app.services.execution_coordinator import execution_coordinator
 from app.services.cio_agent import cio_agent
 from app.services.agent_scheduler import agent_scheduler
 from app.services.llm import LLMRegistry
+from app.services.team_chat import team_chat
+from app.services.daily_report import daily_report_service
 
 router = APIRouter(prefix="/fund", tags=["fund"])
 
@@ -134,7 +136,7 @@ async def get_team_roster():
     Get the fund management team roster with member info
     """
     try:
-        roles = ['research_analyst', 'portfolio_manager', 'risk_manager', 'execution_coordinator', 'cio_agent']
+        roles = ['research_analyst', 'technical_analyst', 'portfolio_manager', 'risk_manager', 'execution_coordinator', 'cio_agent']
         roster = []
 
         for role in roles:
@@ -204,6 +206,100 @@ async def get_market_analysis(symbols: Optional[List[str]] = None):
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Market analysis failed: {str(e)}")
+
+
+# ==================== Technical Analyst Endpoints ====================
+
+class PriceLevelResponse(BaseModel):
+    support: List[float]
+    resistance: List[float]
+    pivot_points: Dict[str, float]
+    fibonacci_retracements: Dict[str, float]
+    fibonacci_extensions: Dict[str, float]
+
+
+class PatternSignalResponse(BaseModel):
+    pattern_type: str
+    direction: str
+    confidence: float
+    entry_price: float
+    stop_loss: float
+    take_profit_1: float
+    take_profit_2: float
+    risk_reward: float
+    reasoning: str
+
+
+class MultiTimeframeResponse(BaseModel):
+    timeframe_1h: Dict[str, str]
+    timeframe_4h: Dict[str, str]
+    timeframe_1d: Dict[str, str]
+    alignment: str
+    trend_confirmation: bool
+    confluence_score: float
+
+
+class TechnicalAnalysisResponse(BaseModel):
+    timestamp: datetime
+    symbol: str
+    current_price: float
+    price_levels: PriceLevelResponse
+    patterns: List[PatternSignalResponse]
+    multi_timeframe: Optional[MultiTimeframeResponse]
+    overall_signal: str
+    confidence: float
+    key_observations: List[str]
+
+
+@router.get("/technical-analysis", response_model=TechnicalAnalysisResponse)
+async def get_technical_analysis(symbol: str = "BTCUSDT"):
+    """
+    Get technical analyst's chart analysis with price levels, patterns, and multi-timeframe
+    """
+    try:
+        from app.services.technical_analyst import technical_analyst
+
+        report = await technical_analyst.analyze(symbol)
+
+        return TechnicalAnalysisResponse(
+            timestamp=report.timestamp,
+            symbol=report.symbol,
+            current_price=report.current_price,
+            price_levels=PriceLevelResponse(
+                support=report.price_levels.support,
+                resistance=report.price_levels.resistance,
+                pivot_points=report.price_levels.pivot_points,
+                fibonacci_retracements=report.price_levels.fibonacci_retracements,
+                fibonacci_extensions=report.price_levels.fibonacci_extensions
+            ),
+            patterns=[
+                PatternSignalResponse(
+                    pattern_type=p.pattern_type,
+                    direction=p.direction,
+                    confidence=p.confidence,
+                    entry_price=p.entry_price,
+                    stop_loss=p.stop_loss,
+                    take_profit_1=p.take_profit_1,
+                    take_profit_2=p.take_profit_2,
+                    risk_reward=p.risk_reward,
+                    reasoning=p.reasoning
+                )
+                for p in report.patterns
+            ],
+            multi_timeframe=MultiTimeframeResponse(
+                timeframe_1h=report.multi_timeframe.timeframe_1h,
+                timeframe_4h=report.multi_timeframe.timeframe_4h,
+                timeframe_1d=report.multi_timeframe.timeframe_1d,
+                alignment=report.multi_timeframe.alignment,
+                trend_confirmation=report.multi_timeframe.trend_confirmation,
+                confluence_score=report.multi_timeframe.confluence_score
+            ) if report.multi_timeframe else None,
+            overall_signal=report.overall_signal,
+            confidence=report.confidence,
+            key_observations=report.key_observations
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Technical analysis failed: {str(e)}")
 
 
 # ==================== Portfolio Manager Endpoints ====================
@@ -462,6 +558,58 @@ async def post_strategy_review(question: str, context: Optional[Dict] = None):
 
 
 # ==================== Team Decision Visibility ====================
+
+@router.get("/conversations")
+async def get_conversations(limit: int = 50, since: Optional[str] = None):
+    """
+    Get recent team chat messages (agent-to-agent conversations).
+    Optionally filter to messages after a given ISO timestamp.
+    """
+    try:
+        return team_chat.get_messages(limit=limit, since=since)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch conversations: {str(e)}")
+
+
+# ==================== Daily Reports ====================
+
+@router.get("/daily-report")
+async def get_daily_report(report_date: Optional[str] = None):
+    """
+    Get the daily report for a specific date (YYYY-MM-DD).
+    Defaults to today. Returns null if no report exists yet.
+    """
+    try:
+        target = date.fromisoformat(report_date) if report_date else date.today()
+        report = await daily_report_service.get_report(target)
+        return report or {"message": f"No report available for {target.isoformat()}"}
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch daily report: {str(e)}")
+
+
+@router.get("/daily-reports")
+async def get_daily_reports(limit: int = 30):
+    """Get the most recent daily reports."""
+    try:
+        return await daily_report_service.get_reports(limit=limit)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch daily reports: {str(e)}")
+
+
+@router.post("/daily-report/generate")
+async def generate_daily_report(report_date: Optional[str] = None, force: bool = False):
+    """Manually trigger daily report generation."""
+    try:
+        target = date.fromisoformat(report_date) if report_date else date.today()
+        report = await daily_report_service.generate_daily_report(report_date=target, force=force)
+        return report
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate daily report: {str(e)}")
+
 
 @router.get("/team-decisions", response_model=List[AgentDecisionResponse])
 async def get_team_decisions(limit: int = 50):

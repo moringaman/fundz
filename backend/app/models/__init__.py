@@ -360,7 +360,79 @@ class AgentDecision(Base):
     )
 
 
+class TeamChatMessageRecord(Base):
+    """Persisted team chat messages for conversation history."""
+    __tablename__ = "team_chat_messages"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    agent_id = Column(String(50), nullable=False)
+    agent_name = Column(String(100), nullable=False)
+    agent_role = Column(String(50), nullable=False)
+    avatar = Column(String(10), default="🤖")
+    content = Column(Text, nullable=False)
+    message_type = Column(String(30), nullable=False)  # analysis, decision, warning, recommendation
+    mentions = Column(JSON, default=list)
+    extra_metadata = Column("metadata", JSON, default=dict)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("idx_team_chat_created_at", "created_at"),
+        Index("idx_team_chat_agent_role", "agent_role"),
+    )
+
+
+class DailyReport(Base):
+    """End-of-day report aggregating all fund metrics and team discussions."""
+    __tablename__ = "daily_reports"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    report_date = Column(String(10), nullable=False, unique=True)  # YYYY-MM-DD
+    generated_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    # Market conditions
+    market_conditions = Column(JSON, default=dict)  # {regime, sentiment, volatility, top_opportunity, risk_level}
+
+    # P&L metrics
+    total_pnl = Column(Float, default=0.0)
+    realized_pnl = Column(Float, default=0.0)
+    unrealized_pnl = Column(Float, default=0.0)
+    daily_return_pct = Column(Float, default=0.0)
+
+    # Trade metrics
+    trades_opened = Column(Integer, default=0)
+    trades_closed = Column(Integer, default=0)
+    total_buy_volume = Column(Float, default=0.0)
+    total_sell_volume = Column(Float, default=0.0)
+    open_positions_count = Column(Integer, default=0)
+
+    # Team performance
+    team_performance = Column(JSON, default=dict)  # {agent_id: {pnl, win_rate, signals, runs}}
+    team_discussion_summary = Column(Text, nullable=True)
+    team_message_count = Column(Integer, default=0)
+
+    # Agent metrics
+    agent_leaderboard = Column(JSON, default=list)  # [{agent_id, name, pnl, win_rate, rank}]
+    best_agent_id = Column(String(36), nullable=True)
+    worst_agent_id = Column(String(36), nullable=True)
+
+    # Risk summary
+    risk_summary = Column(JSON, default=dict)  # {avg_risk_level, danger_count, max_exposure_pct}
+
+    # Portfolio state at end of day
+    portfolio_value = Column(Float, default=0.0)
+    portfolio_balances = Column(JSON, default=dict)  # {asset: amount}
+
+    # CIO commentary
+    cio_sentiment = Column(String(50), nullable=True)
+    cio_summary = Column(Text, nullable=True)
+
+    __table_args__ = (
+        Index("idx_daily_report_date", "report_date"),
+    )
+
+
 from app.models import User, ApiKey, TradingPair, Agent, AgentPair, AgentSignal, Trade, Position, Balance, Kline
 from app.models import SignalType, OrderSide, OrderStatus
 from app.models import AgentRunRecord, AgentMetricRecord
 from app.models import AnalystReport, PortfolioDecision, RiskAssessmentRecord, ExecutionPlan, CIOReport, AgentDecision
+from app.models import TeamChatMessageRecord, DailyReport

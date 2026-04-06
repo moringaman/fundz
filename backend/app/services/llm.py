@@ -31,16 +31,25 @@ class LLMRegistry:
         'research_analyst': {
             'name': 'Dr. Marina Chen',
             'title': 'Chief Research Analyst',
-            'model': 'claude-opus-4-6',
+            'model': 'meta-llama/llama-3.1-8b-instruct',
             'temperature': 0.7,
             'max_tokens': 2000,
             'avatar': 'https://api.dicebear.com/7.x/avataaars/svg?seed=Dr.%20Marina%20Chen&gender=female',
             'bio': 'Senior analyst with PhD in quantitative finance. Specializes in macro market analysis and opportunity identification.'
         },
+        'technical_analyst': {
+            'name': 'Marcus Webb',
+            'title': 'Technical Analyst',
+            'model': 'google/gemma-2-9b-it',
+            'temperature': 0.4,
+            'max_tokens': 1500,
+            'avatar': 'https://api.dicebear.com/7.x/avataaars/svg?seed=Marcus%20Webb&gender=male',
+            'bio': 'Chart specialist with 15 years experience. Expert in price patterns, support/resistance, and multi-timeframe analysis.'
+        },
         'portfolio_manager': {
             'name': 'James Sterling',
             'title': 'Portfolio Manager',
-            'model': 'claude-sonnet-4-6',
+            'model': 'meta-llama/llama-3.1-8b-instruct',
             'temperature': 0.5,
             'max_tokens': 1200,
             'avatar': 'https://api.dicebear.com/7.x/avataaars/svg?seed=James%20Sterling&gender=male',
@@ -49,7 +58,7 @@ class LLMRegistry:
         'risk_manager': {
             'name': 'Elena Vasquez',
             'title': 'Chief Risk Officer',
-            'model': 'claude-sonnet-4-6',
+            'model': 'google/gemma-2-9b-it',
             'temperature': 0.3,
             'max_tokens': 800,
             'avatar': 'https://api.dicebear.com/7.x/avataaars/svg?seed=Elena%20Vasquez&gender=female',
@@ -58,7 +67,7 @@ class LLMRegistry:
         'execution_coordinator': {
             'name': 'Alex Liu',
             'title': 'Execution Specialist',
-            'model': 'claude-haiku-4-5',
+            'model': 'mistralai/mixtral-8x7b-instruct',
             'temperature': 0.2,
             'max_tokens': 400,
             'avatar': 'https://api.dicebear.com/7.x/avataaars/svg?seed=Alex%20Liu&gender=male',
@@ -67,7 +76,7 @@ class LLMRegistry:
         'cio_agent': {
             'name': 'Victoria Montgomery',
             'title': 'Chief Investment Officer',
-            'model': 'claude-sonnet-4-6',
+            'model': 'meta-llama/llama-3.1-8b-instruct',
             'temperature': 0.6,
             'max_tokens': 3000,
             'avatar': 'https://api.dicebear.com/7.x/avataaars/svg?seed=Victoria%20Montgomery&gender=female',
@@ -76,7 +85,7 @@ class LLMRegistry:
         'trading_agent': {
             'name': 'Automated Trader',
             'title': 'Trading Agent',
-            'model': 'claude-haiku-4-5',
+            'model': 'mistralai/mixtral-8x7b-instruct',
             'temperature': 0.5,
             'max_tokens': 800,
             'avatar': 'https://api.dicebear.com/7.x/avataaars/svg?seed=Trader&gender=male',

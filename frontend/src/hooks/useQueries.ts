@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient, QueryClient } from '@tanstack/react-query';
-import { tradingApi, agentApi, paperApi, automationApi, settingsApi } from '../lib/api';
+import { tradingApi, agentApi, paperApi, automationApi, settingsApi, fundApi } from '../lib/api';
 import { wsClient } from '../lib/websocket';
 import { useEffect } from 'react';
 
@@ -214,12 +214,49 @@ export function useFundTeamRoster() {
   });
 }
 
+export function useFundTechnicalAnalysis(symbol = 'BTCUSDT') {
+  return useQuery({
+    queryKey: ['fundTechnicalAnalysis', symbol],
+    queryFn: () => fetch(`/api/fund/technical-analysis?symbol=${symbol}`).then(r => r.json()),
+    staleTime: 60_000,
+    refetchInterval: 300_000,
+  });
+}
+
 // ─── Settings ────────────────────────────────────────────────────────────────
 export function useSettings() {
   return useQuery({
     queryKey: ['settings'],
     queryFn: () => settingsApi.getSettings().then((r) => r.data),
     staleTime: 60_000,
+  });
+}
+
+// ─── Fund Team Conversations ─────────────────────────────────────────────────
+export function useFundConversations(limit = 50) {
+  return useQuery({
+    queryKey: ['fundConversations', limit],
+    queryFn: () => fundApi.getConversations(limit).then((r) => r.data),
+    staleTime: 30_000,
+    refetchInterval: 60_000,
+  });
+}
+
+// ─── Daily Reports ───────────────────────────────────────────────────────────
+export function useDailyReport(reportDate?: string) {
+  return useQuery({
+    queryKey: ['dailyReport', reportDate],
+    queryFn: () => fundApi.getDailyReport(reportDate).then((r) => r.data),
+    staleTime: 300_000,
+    refetchInterval: 600_000,
+  });
+}
+
+export function useDailyReports(limit = 30) {
+  return useQuery({
+    queryKey: ['dailyReports', limit],
+    queryFn: () => fundApi.getDailyReports(limit).then((r) => r.data),
+    staleTime: 300_000,
   });
 }
 
@@ -246,12 +283,18 @@ export function useWsQueryInvalidation() {
       qc.invalidateQueries({ queryKey: ['pnl'] });
     };
 
+    const onTeamChat = () => {
+      qc.invalidateQueries({ queryKey: ['fundConversations'] });
+    };
+
     wsClient.on('agent_run', onAgentRun);
     wsClient.on('trade_executed', onTradeExecuted);
+    wsClient.on('team_chat', onTeamChat);
 
     return () => {
       wsClient.off('agent_run', onAgentRun);
       wsClient.off('trade_executed', onTradeExecuted);
+      wsClient.off('team_chat', onTeamChat);
     };
   }, [qc]);
 }

@@ -1290,3 +1290,258 @@ body {
 .submit-btn.buy:hover  { background: #00ff8a; }
 .submit-btn.sell { background: var(--red);   color: white; }
 .submit-btn.sell:hover { background: #ff1a3d; }
+
+/* ── Team Chat Toasts ───────────────────────────────────────────────── */
+.team-chat-toasts {
+  position: fixed;
+  top: 1rem;
+  right: 1rem;
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  gap: .5rem;
+  max-width: 380px;
+  pointer-events: none;
+}
+.team-chat-toast {
+  pointer-events: auto;
+  padding: .65rem .85rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  cursor: pointer;
+  animation: toastSlideIn .3s ease-out;
+  transition: opacity .2s, transform .2s;
+  backdrop-filter: blur(12px);
+}
+.team-chat-toast:hover { opacity: .7; }
+.team-chat-toast-header {
+  display: flex;
+  align-items: center;
+  gap: .4rem;
+  margin-bottom: .3rem;
+}
+.team-chat-toast-avatar { font-size: 1rem; }
+.team-chat-toast-name {
+  font-size: .72rem;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+.team-chat-toast-type {
+  font-size: .6rem;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--text-secondary);
+  margin-left: auto;
+}
+.team-chat-toast-content {
+  font-size: .72rem;
+  color: var(--text-secondary);
+  line-height: 1.45;
+}
+
+@keyframes toastSlideIn {
+  from { opacity: 0; transform: translateX(20px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+/* ── Team Chat Panel ────────────────────────────────────────────────── */
+.team-chat-panel {
+  margin-top: 2rem;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  display: flex;
+  flex-direction: column;
+  max-height: 500px;
+  overflow: hidden;
+}
+.team-chat-header {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  padding: .85rem 1.1rem;
+  border-bottom: 1px solid var(--border);
+  font-size: .82rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  flex-shrink: 0;
+}
+.team-chat-badge {
+  margin-left: auto;
+  background: var(--accent-dim);
+  color: var(--accent);
+  font-size: .65rem;
+  font-weight: 700;
+  padding: .15rem .5rem;
+  border-radius: 10px;
+  font-family: var(--mono);
+}
+.team-chat-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: .75rem;
+}
+.team-chat-messages::-webkit-scrollbar { width: 4px; }
+.team-chat-messages::-webkit-scrollbar-track { background: transparent; }
+.team-chat-messages::-webkit-scrollbar-thumb { background: var(--border-mid); border-radius: 2px; }
+
+.team-chat-msg {
+  display: flex;
+  gap: .65rem;
+  padding: .65rem .5rem;
+  border-bottom: 1px solid var(--border);
+  transition: background .15s;
+}
+.team-chat-msg:last-of-type { border-bottom: none; }
+.team-chat-msg:hover { background: var(--bg-hover); border-radius: 8px; }
+
+.team-chat-msg-avatar {
+  font-size: 1.3rem;
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-elevated);
+  border-radius: 50%;
+}
+.team-chat-msg-body { flex: 1; min-width: 0; }
+.team-chat-msg-meta {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  margin-bottom: .2rem;
+}
+.team-chat-msg-name {
+  font-size: .75rem;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+.team-chat-msg-type-badge {
+  font-size: .58rem;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  font-weight: 700;
+}
+.team-chat-msg-time {
+  font-size: .62rem;
+  color: var(--text-dim);
+  font-family: var(--mono);
+  margin-left: auto;
+}
+.team-chat-msg-content {
+  font-size: .76rem;
+  color: var(--text-secondary);
+  line-height: 1.55;
+  word-break: break-word;
+}
+.team-chat-msg-mentions {
+  display: flex;
+  gap: .3rem;
+  margin-top: .35rem;
+  flex-wrap: wrap;
+}
+.team-chat-mention {
+  font-size: .6rem;
+  padding: .1rem .4rem;
+  border-radius: 4px;
+  background: var(--accent-dim);
+  color: var(--accent);
+  font-family: var(--mono);
+  font-weight: 600;
+}
+
+/* ── Daily Report Panel ─────────────────────────────────────────────── */
+.daily-report-panel {
+  margin-top: 2rem;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+}
+.daily-report-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .5rem;
+  padding: .85rem 1.1rem;
+  border-bottom: 1px solid var(--border);
+  font-size: .82rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  flex-wrap: wrap;
+}
+.daily-report-date-pill {
+  font-size: .62rem;
+  font-family: var(--mono);
+  font-weight: 600;
+  padding: .2rem .5rem;
+  border-radius: 5px;
+  border: 1px solid var(--border-mid);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all .15s;
+}
+.daily-report-date-pill:hover { background: var(--bg-hover); }
+.daily-report-body { padding: 1rem 1.1rem; }
+
+.daily-report-metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: .5rem;
+}
+@media (max-width: 768px) {
+  .daily-report-metrics-grid { grid-template-columns: repeat(2, 1fr); }
+}
+.daily-report-metric {
+  text-align: center;
+  padding: .6rem .4rem;
+  background: var(--bg-elevated);
+  border-radius: 8px;
+  border: 1px solid var(--border);
+}
+.daily-report-metric-label {
+  display: block;
+  font-size: .6rem;
+  text-transform: uppercase;
+  letter-spacing: .07em;
+  color: var(--text-secondary);
+  margin-bottom: .25rem;
+}
+.daily-report-metric-value {
+  font-size: .9rem;
+  font-weight: 700;
+  font-family: var(--mono);
+  color: var(--text-primary);
+}
+
+.daily-report-section {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: .75rem .85rem;
+}
+.daily-report-section-title {
+  font-size: .68rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--text-secondary);
+  margin-bottom: .5rem;
+  display: flex;
+  align-items: center;
+}
+.daily-report-kv {
+  display: flex;
+  flex-direction: column;
+  gap: .25rem;
+}
+.daily-report-kv > div {
+  display: flex;
+  justify-content: space-between;
+  font-size: .72rem;
+}
+.daily-report-kv > div > span:first-child { color: var(--text-dim); }
+.daily-report-kv > div > span:last-child { color: var(--text-primary); font-family: var(--mono); font-weight: 600; }

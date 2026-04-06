@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     azure_openai_key: Optional[str] = None
     azure_openai_deployment: Optional[str] = None
     openrouter_api_key: Optional[str] = None
-    llm_model: str = "openai/gpt-4o-mini"
+    llm_model: str = "mistralai/mixtral-8x7b-instruct"
     llm_temperature: float = 0.7
     llm_max_tokens: int = 1000
 
