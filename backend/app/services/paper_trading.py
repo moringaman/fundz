@@ -1,0 +1,310 @@
+from typing import Optional, List
+from datetime import datetime
+import uuid
+import logging
+
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, delete
+
+from app.database import get_async_session
+from app.models import (
+    Trade as PaperOrder,
+    Position as PaperPosition,
+    Balance as PaperBalance,
+    OrderSide,
+    OrderStatus,
+)
+from app.clients.phemex import PhemexClient
+from app.config import settings
+
+
+class PaperTradingService:
+    def __init__(self, phemex_client: Optional[PhemexClient] = None):
+        self.logger = logging.getLogger(__name__)
+        self._enabled = True
+        self.phemex_client = phemex_client or PhemexClient(
+            api_key=settings.phemex_api_key,
+            api_secret=settings.phemex_api_secret,
+            testnet=settings.phemex_testnet,
+        )
+
+    # ------------------------------------------------------------------
+    # Lifecycle helpers
+    # ------------------------------------------------------------------
+
+    def enable(self):
+        self._enabled = True
+
+    def disable(self):
+        self._enabled = False
+
+    async def reset(self):
+        await self.reset_trading_session()
+
+    # ------------------------------------------------------------------
+    # Balance
+    # ------------------------------------------------------------------
+
+    async def get_all_balances(self) -> List[PaperBalance]:
+        """Return all paper-trading balances for the default user."""
+        async with get_async_session() as db:
+            result = await db.execute(
+                select(PaperBalance).where(PaperBalance.user_id == "default-user")
+            )
+            return result.scalars().all()
+
+    # ------------------------------------------------------------------
+    # Orders
+    # ------------------------------------------------------------------
+
+    async def place_order(
+        self,
+        symbol: str,
+        side: OrderSide,
+        quantity: float,
+        price: Optional[float] = None,
+        agent_id: Optional[str] = None,
+    ):
+        """Place a paper trading order using real market price when price is omitted."""
+        if not self._enabled:
+            raise ValueError("Paper trading is currently disabled")
+
+        if price is None:
+            try:
+                ticker = await self.phemex_client.get_ticker(symbol)
+                price = float(ticker.get("result", {}).get("closeRp", 0)) / 100000
+            except Exception as e:
+                self.logger.error(f"Failed to fetch market price: {e}")
+                raise ValueError("Unable to fetch current market price")
+
+        async with get_async_session() as db:
+            # Ensure USDT balance exists
+            usdt_balance = await db.scalar(
+                select(PaperBalance).where(
+                    PaperBalance.user_id == "default-user",
+                    PaperBalance.asset == "USDT",
+                )
+            )
+            if not usdt_balance:
+                usdt_balance = PaperBalance(
+                    user_id="default-user", asset="USDT", available=50000.0, locked=0.0
+                )
+                db.add(usdt_balance)
+                await db.flush()
+
+            # Ensure base-asset balance exists (for sells / bookkeeping)
+            base_asset = symbol.replace("USDT", "") if "USDT" in symbol else symbol
+            base_balance = await db.scalar(
+                select(PaperBalance).where(
+                    PaperBalance.user_id == "default-user",
+                    PaperBalance.asset == base_asset,
+                )
+            )
+            if not base_balance:
+                base_balance = PaperBalance(
+                    user_id="default-user", asset=base_asset, available=0.0, locked=0.0
+                )
+                db.add(base_balance)
+                await db.flush()
+
+            order = PaperOrder(
+                id=str(uuid.uuid4()),
+                user_id="default-user",
+                agent_id=agent_id,
+                symbol=symbol,
+                side=side,
+                quantity=quantity,
+                price=price,
+                total=quantity * price,
+                fee=quantity * price * 0.001,
+                status=OrderStatus.FILLED,
+                created_at=datetime.now(),
+                filled_at=datetime.now(),
+            )
+            db.add(order)
+
+            if side == OrderSide.BUY:
+                cost = quantity * price
+                if usdt_balance.available < cost:
+                    raise ValueError(
+                        f"Insufficient USDT balance: need {cost:.2f}, have {usdt_balance.available:.2f}"
+                    )
+                usdt_balance.available -= cost
+
+                position = await db.scalar(
+                    select(PaperPosition).where(
+                        PaperPosition.user_id == "default-user",
+                        PaperPosition.symbol == symbol,
+                    )
+                )
+                if position:
+                    total_qty = position.quantity + quantity
+                    position.entry_price = (
+                        position.entry_price * position.quantity + price * quantity
+                    ) / total_qty
+                    position.quantity = total_qty
+                    position.current_price = price
+                else:
+                    position = PaperPosition(
+                        user_id="default-user",
+                        agent_id=agent_id,
+                        symbol=symbol,
+                        side=OrderSide.BUY,
+                        quantity=quantity,
+                        entry_price=price,
+                        current_price=price,
+                        unrealized_pnl=0.0,
+                        realized_pnl=0.0,
+                    )
+                    db.add(position)
+
+            elif side == OrderSide.SELL:
+                position = await db.scalar(
+                    select(PaperPosition).where(
+                        PaperPosition.user_id == "default-user",
+                        PaperPosition.symbol == symbol,
+                    )
+                )
+                if not position or position.quantity < quantity:
+                    raise ValueError("Insufficient position to sell")
+
+                realized = (price - position.entry_price) * quantity
+                usdt_balance.available += quantity * price
+
+                if position.quantity == quantity:
+                    await db.delete(position)
+                else:
+                    position.quantity -= quantity
+                    position.realized_pnl = (position.realized_pnl or 0.0) + realized
+                    position.current_price = price
+
+            await db.commit()
+            return order
+
+    async def get_orders(self, symbol: Optional[str] = None, limit: int = 50) -> List[PaperOrder]:
+        """Return paper trade order history for the default user."""
+        async with get_async_session() as db:
+            query = (
+                select(PaperOrder)
+                .where(PaperOrder.user_id == "default-user")
+                .order_by(PaperOrder.created_at.desc())
+                .limit(limit)
+            )
+            if symbol:
+                query = query.where(PaperOrder.symbol == symbol)
+            result = await db.execute(query)
+            return result.scalars().all()
+
+    async def cancel_order(self, order_id: str) -> bool:
+        """Cancel a pending paper order."""
+        async with get_async_session() as db:
+            order = await db.scalar(
+                select(PaperOrder).where(
+                    PaperOrder.id == order_id,
+                    PaperOrder.status == OrderStatus.PENDING,
+                )
+            )
+            if order:
+                order.status = OrderStatus.CANCELLED
+                await db.commit()
+                return True
+            return False
+
+    # ------------------------------------------------------------------
+    # Positions
+    # ------------------------------------------------------------------
+
+    async def get_positions(self, symbol: Optional[str] = None) -> List[PaperPosition]:
+        """Return open paper trading positions."""
+        async with get_async_session() as db:
+            query = select(PaperPosition).where(PaperPosition.user_id == "default-user")
+            if symbol:
+                query = query.where(PaperPosition.symbol == symbol)
+            result = await db.execute(query)
+            return result.scalars().all()
+
+    # ------------------------------------------------------------------
+    # P&L
+    # ------------------------------------------------------------------
+
+    async def calculate_pnl(self) -> dict:
+        """Calculate paper trading performance metrics."""
+        async with get_async_session() as db:
+            orders_result = await db.execute(
+                select(PaperOrder).where(
+                    PaperOrder.user_id == "default-user",
+                    PaperOrder.status == OrderStatus.FILLED,
+                )
+            )
+            orders = orders_result.scalars().all()
+
+            positions_result = await db.execute(
+                select(PaperPosition).where(PaperPosition.user_id == "default-user")
+            )
+            positions = positions_result.scalars().all()
+
+        buy_volume = sum(o.quantity * o.price for o in orders if o.side == OrderSide.BUY)
+        sell_volume = sum(o.quantity * o.price for o in orders if o.side == OrderSide.SELL)
+
+        # Fetch live prices for unrealized PnL
+        current_prices: dict = {}
+        for pos in positions:
+            try:
+                current_prices[pos.symbol] = await self.fetch_current_price(pos.symbol)
+            except Exception as e:
+                self.logger.error(f"Failed to fetch price for {pos.symbol}: {e}")
+                current_prices[pos.symbol] = pos.entry_price or 0.0
+
+        unrealized_pnl = sum(
+            (current_prices.get(pos.symbol, pos.entry_price or 0.0) - (pos.entry_price or 0.0))
+            * pos.quantity
+            for pos in positions
+        )
+
+        realized_pnl = sell_volume - buy_volume
+
+        return {
+            "total_pnl": realized_pnl + unrealized_pnl,
+            "realized_pnl": realized_pnl,
+            "unrealized_pnl": unrealized_pnl,
+            "buy_volume": buy_volume,
+            "sell_volume": sell_volume,
+            "trade_count": len(orders),
+            "open_positions": len(positions),
+        }
+
+    async def fetch_current_price(self, symbol: str) -> float:
+        """Fetch live market price for a symbol."""
+        try:
+            ticker = await self.phemex_client.get_ticker(symbol)
+            return float(ticker.get("result", {}).get("closeRp", 0)) / 100000
+        except Exception as e:
+            self.logger.error(f"Failed to fetch price for {symbol}: {e}")
+            return 0.0
+
+    # ------------------------------------------------------------------
+    # Reset
+    # ------------------------------------------------------------------
+
+    async def reset_trading_session(self):
+        """Wipe all paper trading data and re-seed default balances."""
+        async with get_async_session() as db:
+            await db.execute(
+                delete(PaperOrder).where(PaperOrder.user_id == "default-user")
+            )
+            await db.execute(
+                delete(PaperPosition).where(PaperPosition.user_id == "default-user")
+            )
+            await db.execute(
+                delete(PaperBalance).where(PaperBalance.user_id == "default-user")
+            )
+            for asset, amount in [("BTC", 1.0), ("USDT", 50000.0), ("ETH", 10.0), ("SOL", 100.0)]:
+                db.add(
+                    PaperBalance(
+                        user_id="default-user", asset=asset, available=amount, locked=0.0
+                    )
+                )
+            await db.commit()
+
+
+paper_trading = PaperTradingService()
