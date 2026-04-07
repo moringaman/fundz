@@ -496,14 +496,23 @@ class PaperTradingService:
                 "trailing_stop_pct": pos.trailing_stop_pct,
             }
 
-    async def update_highest_price(self, position_id: str, current_price: float):
-        """Update the highest price watermark for trailing stop tracking."""
+    async def update_highest_price(self, position_id: str, current_price: float, is_short: bool = False):
+        """Update the price watermark for trailing stop tracking.
+        
+        For longs: tracks the highest price (sell exit if price drops from peak).
+        For shorts: tracks the lowest price (buy exit if price rises from trough).
+        """
         async with get_async_session() as db:
             pos = await db.get(PaperPosition, position_id)
             if pos:
-                if pos.highest_price is None or current_price > pos.highest_price:
-                    pos.highest_price = current_price
-                    await db.commit()
+                if is_short:
+                    if pos.highest_price is None or current_price < pos.highest_price:
+                        pos.highest_price = current_price
+                        await db.commit()
+                else:
+                    if pos.highest_price is None or current_price > pos.highest_price:
+                        pos.highest_price = current_price
+                        await db.commit()
 
     # ------------------------------------------------------------------
     # Closed Trades (FIFO-matched buy→sell pairs with realised P&L)
@@ -706,11 +715,16 @@ class PaperTradingService:
                 self.logger.error(f"Failed to fetch price for {pos.symbol}: {e}")
                 current_prices[pos.symbol] = pos.entry_price or 0.0
 
-        unrealized_pnl = sum(
-            (current_prices.get(pos.symbol, pos.entry_price or 0.0) - (pos.entry_price or 0.0))
-            * pos.quantity
-            for pos in positions
-        )
+        unrealized_pnl = 0.0
+        for pos in positions:
+            current_price = current_prices.get(pos.symbol, pos.entry_price or 0.0)
+            entry = pos.entry_price or 0.0
+            qty = pos.quantity or 0
+            pos_side = pos.side.value if hasattr(pos.side, 'value') else str(pos.side)
+            if pos_side.lower() == 'sell':
+                unrealized_pnl += (entry - current_price) * qty
+            else:
+                unrealized_pnl += (current_price - entry) * qty
 
         return {
             "total_pnl": closed_pnl + unrealized_pnl,

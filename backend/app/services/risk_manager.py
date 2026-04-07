@@ -154,15 +154,23 @@ class RiskManager:
         if trailing_stop and position.get('highest_price'):
             highest = position['highest_price']
             if side.lower() == 'buy':
-                trailing_trigger = (current_price - highest) / highest * 100 <= -trailing_stop
+                # LONG: exit when price drops trailing_stop% below the high-water mark
+                trail_price = highest * (1 - trailing_stop / 100)
+                trailing_trigger = current_price <= trail_price
             else:
-                trailing_trigger = (highest - current_price) / highest * 100 <= -trailing_stop
+                # SHORT: highest_price tracks the LOWEST price (best for shorts)
+                # Exit when price rises trailing_stop% above the low-water mark
+                trail_price = highest * (1 + trailing_stop / 100)
+                trailing_trigger = current_price >= trail_price
             
             if trailing_trigger:
                 return RiskCheckResult(
                     allowed=True,
                     action="exit",
-                    reason=f"Trailing stop triggered at ${current_price:.2f}"
+                    reason=(
+                        f"Trailing stop triggered at ${current_price:.2f} "
+                        f"(best: ${highest:.2f}, trail: {trailing_stop}%)"
+                    )
                 )
         
         return RiskCheckResult(
@@ -195,10 +203,11 @@ class RiskManager:
         current_positions: List[Dict[str, Any]] = None,
         daily_pnl: Optional[float] = None,
         total_capital: float = 10000,
-        max_daily_loss: float = 5.0
+        max_daily_loss_pct: float = 5.0
     ) -> RiskAssessment:
         """
-        Generate portfolio-level risk assessment
+        Generate portfolio-level risk assessment.
+        max_daily_loss_pct is the maximum daily loss as a PERCENTAGE of total capital.
         """
         current_positions = current_positions or []
         daily_pnl = daily_pnl if daily_pnl is not None else self.get_daily_pnl()
@@ -213,6 +222,9 @@ class RiskManager:
             )
 
             exposure_pct = (total_exposure / total_capital * 100) if total_capital else 0
+
+            # Convert daily P&L to percentage of capital for threshold comparison
+            daily_pnl_pct = (daily_pnl / total_capital * 100) if total_capital else 0
 
             # Find largest position
             largest_pos = None
@@ -246,9 +258,10 @@ class RiskManager:
             except Exception:
                 exposure_threshold = 80.0
 
-            if daily_pnl <= -max_daily_loss:
+            # Compare daily P&L percentage against max daily loss percentage
+            if daily_pnl_pct <= -max_daily_loss_pct:
                 risk_level = "danger"
-            elif daily_pnl <= -max_daily_loss / 2 or exposure_pct > exposure_threshold:
+            elif daily_pnl_pct <= -max_daily_loss_pct / 2 or exposure_pct > exposure_threshold:
                 risk_level = "caution"
             else:
                 risk_level = "safe"
@@ -260,13 +273,13 @@ class RiskManager:
             if exposure_pct > exposure_threshold:
                 recommendations.append(f"Portfolio exposure high ({exposure_pct:.1f}% of capital, threshold: {exposure_threshold:.0f}%)")
             if daily_pnl < 0:
-                recommendations.append(f"Daily P&L negative: ${daily_pnl:.2f}")
+                recommendations.append(f"Daily P&L negative: ${daily_pnl:.2f} ({daily_pnl_pct:+.2f}% of capital)")
             if concentration == "high":
                 recommendations.append(f"Concentration risk high: {largest_symbol} is {largest_exposure:.1f}% of portfolio")
 
             # Use LLM for detailed risk reasoning
             reasoning = await self._generate_risk_reasoning(
-                risk_level, daily_pnl, exposure_pct, concentration, max_daily_loss
+                risk_level, daily_pnl, exposure_pct, concentration, max_daily_loss_pct
             )
 
             return RiskAssessment(
@@ -274,7 +287,7 @@ class RiskManager:
                 risk_level=risk_level,
                 daily_pnl=daily_pnl,
                 portfolio_exposure=total_exposure,
-                max_daily_loss_limit=max_daily_loss,
+                max_daily_loss_limit=max_daily_loss_pct,
                 exposure_pct_of_capital=exposure_pct,
                 largest_position_symbol=largest_symbol,
                 largest_position_size=largest_pos.get('quantity', 0) if largest_pos else 0.0,

@@ -10,6 +10,16 @@ from app.config import settings
 from app.api.routes import market, trading, agents, backtest, paper_trading, automation, llm, fund
 from app.api.routes import settings as settings_routes
 
+# Configure root logger so app.* loggers are visible
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+# Silence noisy SQLAlchemy echo (engine echo=True uses this logger)
+logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
+logging.getLogger("sqlalchemy.engine.Engine").setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 
@@ -307,6 +317,13 @@ async def lifespan(app: FastAPI):
         await llm_service.initialize()
     except Exception as e:
         logger.warning(f"LLM service not initialized: {e}")
+
+    # Load persisted settings from DB
+    from app.api.routes.settings import _load_all_settings
+    try:
+        await _load_all_settings()
+    except Exception as e:
+        logger.warning(f"Settings load from DB failed (using defaults): {e}")
 
     # Wire team chat broadcasts to the WS connection manager
     from app.services.team_chat import team_chat

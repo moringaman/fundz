@@ -82,6 +82,7 @@ class AgentScheduler:
         self._current_execution_plan = None
         self._current_cio_report = None
         self._current_confluence_scores: Dict[str, Dict] = {}
+        self._current_trade_insights: Optional[Dict] = None
     
     @property
     def is_running(self) -> bool:
@@ -202,6 +203,12 @@ class AgentScheduler:
                     if metrics.total_runs > 0 else "No trades yet"
                 ),
             }
+
+        # Trade retrospective insights for this agent
+        if self._current_trade_insights and self._current_trade_insights.get("agent_insights"):
+            agent_insight = self._current_trade_insights["agent_insights"].get(agent_id)
+            if agent_insight:
+                ctx["trade_patterns"] = agent_insight
 
         return ctx if ctx else None
 
@@ -422,6 +429,7 @@ class AgentScheduler:
                     trailing_pct = (
                         getattr(pos, 'trailing_stop_pct', None)
                         or agent_config.get('trailing_stop_pct')
+                        or 3.0  # default 3% trailing stop for all positions
                     )
 
                     stored_sl = getattr(pos, 'stop_loss_price', None)
@@ -439,17 +447,52 @@ class AgentScheduler:
                     if is_short:
                         if current_price < highest:
                             highest = current_price
-                            await paper_trading.update_highest_price(pos.id, current_price)
+                            await paper_trading.update_highest_price(pos.id, current_price, is_short=True)
                     else:
                         if current_price > highest:
                             highest = current_price
-                            await paper_trading.update_highest_price(pos.id, current_price)
+                            await paper_trading.update_highest_price(pos.id, current_price, is_short=False)
 
                     risk_config = RiskConfig(
                         stop_loss_pct=sl_pct,
                         take_profit_pct=tp_pct,
                         trailing_stop_pct=trailing_pct,
                     )
+
+                    # ── Auto-tighten stop-loss based on trailing stop watermark ──
+                    # When price has moved favourably, physically move the SL
+                    # so profits are locked in even between LLM review cycles.
+                    if trailing_pct and highest:
+                        if is_short:
+                            # For shorts: trailing SL moves DOWN as price falls
+                            ideal_sl = highest * (1 + trailing_pct / 100)
+                            if sl_price is None or ideal_sl < sl_price:
+                                # Only tighten (lower SL for shorts)
+                                if sl_price is None or (sl_price - ideal_sl) >= current_price * 0.002:
+                                    await paper_trading.update_position_sl_tp(
+                                        pos.id, stop_loss_price=ideal_sl
+                                    )
+                                    logger.info(
+                                        f"Trailing SL tightened: {pos.symbol} SHORT "
+                                        f"SL ${sl_price or 0:.2f}→${ideal_sl:.2f} "
+                                        f"(low watermark ${highest:.2f}, trail {trailing_pct}%)"
+                                    )
+                                    sl_price = ideal_sl
+                        else:
+                            # For longs: trailing SL moves UP as price rises
+                            ideal_sl = highest * (1 - trailing_pct / 100)
+                            if ideal_sl > entry and (sl_price is None or ideal_sl > sl_price):
+                                # Only tighten (raise SL for longs), and only above entry
+                                if sl_price is None or (ideal_sl - sl_price) >= current_price * 0.002:
+                                    await paper_trading.update_position_sl_tp(
+                                        pos.id, stop_loss_price=ideal_sl
+                                    )
+                                    logger.info(
+                                        f"Trailing SL tightened: {pos.symbol} LONG "
+                                        f"SL ${sl_price or 0:.2f}→${ideal_sl:.2f} "
+                                        f"(high watermark ${highest:.2f}, trail {trailing_pct}%)"
+                                    )
+                                    sl_price = ideal_sl
 
                     position_dict = {
                         'side': pos_side,
@@ -468,7 +511,7 @@ class AgentScheduler:
                     direction = "SHORT" if is_short else "LONG"
                     logger.info(
                         f"SL/TP monitor: {pos.symbol} {direction} | price=${current_price:.2f} entry=${entry:.2f} "
-                        f"SL=${sl_price:.2f} TP=${tp_price:.2f} pnl={pnl_pct:+.2f}% → {check.action}"
+                        f"SL=${sl_price:.2f} TP=${tp_price:.2f} trail={trailing_pct}% wm=${highest:.2f} pnl={pnl_pct:+.2f}% → {check.action}"
                     )
 
                     if check.action == "exit":
@@ -558,8 +601,9 @@ class AgentScheduler:
                 )
             market_ctx = "\n".join(market_ctx_lines) or "No broader market context available."
 
-            # Build per-position summaries
+            # Build per-position summaries and cache current SL/TP
             position_blocks = []
+            pos_current_levels: dict = {}  # {pos_id: {"sl": float|None, "tp": float|None}}
             for pos in positions:
                 try:
                     current_price = await paper_trading.fetch_current_price(pos.symbol)
@@ -572,6 +616,7 @@ class AgentScheduler:
                 pnl_pct = ((current_price - entry) / entry) * 100 if entry else 0
                 sl = getattr(pos, 'stop_loss_price', None)
                 tp = getattr(pos, 'take_profit_price', None)
+                pos_current_levels[pos.id] = {"sl": sl, "tp": tp, "price": current_price}
 
                 # TA confluence for this symbol
                 ta = confluence.get(pos.symbol, {})
@@ -614,7 +659,8 @@ class AgentScheduler:
                 '  {"position_id": "...", "symbol": "...", '
                 '"new_stop_loss": <number|null>, "new_take_profit": <number|null>, '
                 '"reason": "..."}\n'
-                '], "summary": "one-line overall summary"}'
+                '], "summary": "one-line overall summary"}\n\n'
+                "IMPORTANT: Values must be plain numbers (e.g. 67500.00), NOT strings with $ signs."
             )
 
             user_prompt = (
@@ -641,20 +687,37 @@ class AgentScheduler:
                 return
 
             adjusted_count = 0
+            def _safe_float(v):
+                """Parse float from LLM output, stripping $, commas, whitespace."""
+                if v is None:
+                    return None
+                if isinstance(v, (int, float)):
+                    return float(v)
+                return float(str(v).replace("$", "").replace(",", "").strip())
+
             for adj in adjustments:
                 pid = adj.get("position_id")
                 if not pid:
                     continue
-                new_sl = adj.get("new_stop_loss")
-                new_tp = adj.get("new_take_profit")
+                new_sl = _safe_float(adj.get("new_stop_loss"))
+                new_tp = _safe_float(adj.get("new_take_profit"))
                 reason = adj.get("reason", "")
                 symbol = adj.get("symbol", "?")
 
+                # Compare with current values — skip if change < 0.3% of price
+                old = pos_current_levels.get(pid, {})
+                ref_price = old.get("price", 1)
+                min_delta = ref_price * 0.003  # 0.3% minimum change
+
                 kwargs = {}
                 if new_sl is not None:
-                    kwargs["stop_loss_price"] = float(new_sl)
+                    old_sl = old.get("sl")
+                    if old_sl is None or abs(new_sl - old_sl) >= min_delta:
+                        kwargs["stop_loss_price"] = new_sl
                 if new_tp is not None:
-                    kwargs["take_profit_price"] = float(new_tp)
+                    old_tp = old.get("tp")
+                    if old_tp is None or abs(new_tp - old_tp) >= min_delta:
+                        kwargs["take_profit_price"] = new_tp
                 if not kwargs:
                     continue
 
@@ -662,12 +725,18 @@ class AgentScheduler:
                 if result:
                     adjusted_count += 1
                     parts = []
-                    if new_sl is not None:
-                        parts.append(f"SL→${new_sl:.2f}")
-                    if new_tp is not None:
-                        parts.append(f"TP→${new_tp:.2f}")
+                    if "stop_loss_price" in kwargs:
+                        old_sl = old.get("sl")
+                        parts.append(f"SL ${old_sl:.2f}→${new_sl:.2f}" if old_sl else f"SL→${new_sl:.2f}")
+                    if "take_profit_price" in kwargs:
+                        old_tp = old.get("tp")
+                        parts.append(f"TP ${old_tp:.2f}→${new_tp:.2f}" if old_tp else f"TP→${new_tp:.2f}")
                     logger.info(
                         f"SL/TP Review: {symbol} {' '.join(parts)} — {reason}"
+                    )
+                else:
+                    logger.warning(
+                        f"SL/TP Review: Failed to update position {pid} — not found"
                     )
 
             if adjusted_count > 0:
@@ -707,6 +776,9 @@ class AgentScheduler:
                         "is_enabled": a.is_enabled,
                         "allocation_percentage": a.allocation_percentage,
                         "max_position_size": a.max_position_size,
+                        "stop_loss_pct": a.config.get("stop_loss_pct", 2.0),
+                        "take_profit_pct": a.config.get("take_profit_pct", 4.0),
+                        "trailing_stop_pct": a.config.get("trailing_stop_pct", 3.0),
                     }
                     for a in agents
                 ]
@@ -855,10 +927,13 @@ class AgentScheduler:
 
             # 3. Risk Manager: Portfolio-level risk check with real positions + P&L
             try:
+                from app.api.routes.settings import get_risk_limits
+                _risk_limits = get_risk_limits()
                 risk_assessment = await risk_manager.generate_risk_assessment(
                     current_positions=current_positions,
                     daily_pnl=daily_pnl,
                     total_capital=total_capital,
+                    max_daily_loss_pct=_risk_limits.max_daily_loss_pct,
                 )
                 self._current_risk_assessment = risk_assessment
                 logger.info(f"Team Tier: Risk assessment - Level: {risk_assessment.risk_level}, "
@@ -893,8 +968,39 @@ class AgentScheduler:
                     self._current_cio_report = cio_report
                     logger.info(f"Team Tier: CIO report - Sentiment: {cio_report.cio_sentiment}")
                     await team_chat.log_cio_report(cio_report)
+
+                    # 5.1 Execute CIO strategic recommendations
+                    if cio_report.strategic_recommendations:
+                        cio_actions = self._map_cio_recommendations(
+                            cio_report.strategic_recommendations, agents_list
+                        )
+                        if cio_actions:
+                            logger.info(f"Team Tier: Executing {len(cio_actions)} CIO recommendation(s)")
+                            await self._execute_strategy_actions(cio_actions, agents_list)
             except Exception as e:
                 logger.error(f"Team Tier: CIO report failed: {e}")
+
+            # 6. Trade Retrospective (every 20 minutes alongside CIO)
+            try:
+                if self._last_team_analysis is None or \
+                   (datetime.now() - self._last_team_analysis).total_seconds() >= 1200:
+                    from app.services.trade_retrospective import trade_retrospective
+                    retro = await trade_retrospective.analyze_recent_trades(agents_list)
+                    if retro:
+                        self._current_trade_insights = retro
+                        logger.info(f"Team Tier: Trade retrospective — {len(retro.get('trade_analyses', []))} trades reviewed")
+                        # Feed insights back to team chat
+                        if retro.get("summary"):
+                            await team_chat.add_message(
+                                agent_role="trade_analyst",
+                                content=f"📈 **Trade Retrospective**: {retro['summary']}",
+                                message_type="analysis",
+                            )
+                        # Auto-execute parameter adjustments
+                        if retro.get("parameter_adjustments"):
+                            await self._apply_retrospective_adjustments(retro["parameter_adjustments"], agents_list)
+            except Exception as e:
+                logger.error(f"Team Tier: Trade retrospective failed: {e}")
 
         except Exception as e:
             logger.error(f"Team analysis tier failed: {e}")
@@ -1001,7 +1107,7 @@ class AgentScheduler:
                     max_position=config.get('max_position_size', 0.1),
                     stop_loss_pct=config.get('stop_loss_pct', 2.0),
                     take_profit_pct=config.get('take_profit_pct', 4.0),
-                    trailing_stop_pct=config.get('trailing_stop_pct'),
+                    trailing_stop_pct=config.get('trailing_stop_pct', 3.0),
                     use_paper=use_paper_mode
                 )
 
@@ -1507,6 +1613,133 @@ class AgentScheduler:
             runs = [r for r in runs if r.agent_id == agent_id]
         return runs[-limit:]
 
+    def _map_cio_recommendations(
+        self,
+        recommendations: List,
+        agents_list: List[Dict],
+    ) -> List:
+        """Convert CIO StrategicRecommendation objects into StrategyActionProposal
+        objects that _execute_strategy_actions can consume."""
+        from app.services.strategy_review import StrategyActionProposal
+
+        agents_by_name = {a.get("name", "").lower(): a for a in agents_list}
+        agents_by_id = {a["id"]: a for a in agents_list}
+        mapped = []
+
+        ACTION_MAP = {
+            "enable_agent": "enable_agent",
+            "disable_agent": "disable_agent",
+            "pause_strategy": "disable_agent",
+            "increase_allocation": "adjust_params",
+            "reduce_allocation": "adjust_params",
+            "reduce_risk": "adjust_params",
+            "add_new_strategy": "create_agent",
+            "diversify": "create_agent",
+        }
+
+        for rec in recommendations:
+            action_type = ACTION_MAP.get(rec.recommendation)
+            if not action_type:
+                continue
+            # Only act on high-confidence CIO recommendations
+            if rec.confidence < 0.6:
+                continue
+
+            target_id = None
+            target_name = rec.target
+            # Resolve target to agent id
+            if rec.target and rec.target != "portfolio":
+                agent = agents_by_id.get(rec.target) or agents_by_name.get(rec.target.lower())
+                if agent:
+                    target_id = agent["id"]
+                    target_name = agent.get("name", rec.target)
+
+            params: dict = {}
+            if rec.recommendation == "increase_allocation":
+                params["allocation_change_pct"] = 5
+            elif rec.recommendation in ("reduce_allocation", "reduce_risk"):
+                params["allocation_change_pct"] = -5
+            elif rec.recommendation in ("add_new_strategy", "diversify"):
+                # All supported strategy types for diversification
+                ALL_STRATEGIES = ["momentum", "mean_reversion", "breakout", "scalping", "trend_following"]
+                existing = {a.get("strategy_type") for a in agents_list}
+
+                # Try to extract a specific strategy from the rationale
+                found_stype = None
+                for stype in ALL_STRATEGIES:
+                    if stype.replace("_", " ") in rec.rationale.lower() or stype in rec.rationale.lower():
+                        found_stype = stype
+                        break
+
+                if not found_stype:
+                    # No specific strategy named — auto-pick the best missing
+                    # strategy for diversification
+                    missing = [s for s in ALL_STRATEGIES if s not in existing]
+                    if missing:
+                        found_stype = missing[0]
+                        logger.info(f"CIO: Diversification — auto-selected '{found_stype}' "
+                                    f"(missing from {len(existing)} existing strategies)")
+                    else:
+                        logger.info(f"CIO: Skipping add_new_strategy — all strategy types already covered")
+                        continue
+
+                if found_stype in existing:
+                    logger.info(f"CIO: Skipping add_new_strategy for '{found_stype}' — already exists")
+                    continue
+                params["strategy_type"] = found_stype
+
+            proposal = StrategyActionProposal(
+                action=action_type,
+                target_agent_id=target_id,
+                target_agent_name=target_name,
+                strategy_type=params.get("strategy_type"),
+                params=params,
+                rationale=f"[CIO] {rec.rationale}",
+                initiated_by="cio",
+                confluence_score=rec.confidence,
+            )
+            mapped.append(proposal)
+
+        return mapped
+
+    async def _apply_retrospective_adjustments(
+        self,
+        adjustments: List[Dict],
+        agents_list: List[Dict],
+    ):
+        """Apply parameter adjustments recommended by the trade retrospective."""
+        from app.models import Agent as DBAgent
+
+        for adj in adjustments:
+            agent_id = adj.get("agent_id")
+            if not agent_id:
+                continue
+            try:
+                async with get_async_session() as db:
+                    agent = await db.get(DBAgent, agent_id)
+                    if not agent:
+                        continue
+                    changed = []
+                    if "stop_loss_pct" in adj and adj["stop_loss_pct"]:
+                        new_sl = max(0.5, min(10.0, adj["stop_loss_pct"]))
+                        agent.config = {**(agent.config or {}), "stop_loss_pct": new_sl}
+                        changed.append(f"SL→{new_sl:.1f}%")
+                    if "take_profit_pct" in adj and adj["take_profit_pct"]:
+                        new_tp = max(1.0, min(20.0, adj["take_profit_pct"]))
+                        agent.config = {**(agent.config or {}), "take_profit_pct": new_tp}
+                        changed.append(f"TP→{new_tp:.1f}%")
+                    if changed:
+                        await db.commit()
+                        logger.info(f"Retrospective: adjusted {agent.name} — {', '.join(changed)}")
+                        from app.services.team_chat import team_chat
+                        await team_chat.add_message(
+                            agent_role="trade_analyst",
+                            content=f"🔧 **Parameter Adjustment** {agent.name}: {', '.join(changed)} — {adj.get('reason', '')}",
+                            message_type="decision",
+                        )
+            except Exception as e:
+                logger.warning(f"Retrospective adjustment failed for {agent_id}: {e}")
+
     async def _execute_strategy_actions(
         self,
         actions: List,
@@ -1550,47 +1783,139 @@ class AgentScheduler:
                             result_msg = "Agent already enabled or not found"
 
                 elif action.action == "create_agent":
-                    # Create a new agent in the DB
+                    # Create a new agent in the DB — with duplicate guard
                     async with get_async_session() as db:
-                        # Find the first user to own the agent
-                        from app.models import User
-                        user = await db.scalar(select(User).limit(1))
-                        if not user:
-                            result_msg = "No user found to own new agent"
-                        else:
-                            new_agent = DBAgent(
-                                user_id=user.id,
-                                name=action.target_agent_name or f"Auto-{action.strategy_type}",
-                                strategy_type=action.strategy_type or "momentum",
-                                config={
-                                    "trading_pairs": [action.params.get("symbol", "BTCUSDT")],
-                                    "auto_created": True,
-                                    "created_by": "strategy_review",
-                                },
-                                is_enabled=True,
-                                allocation_percentage=10.0,
-                                max_position_size=1000.0,
-                                risk_limit=100.0,
-                            )
-                            db.add(new_agent)
-                            await db.commit()
-                            await db.refresh(new_agent)
-
-                            # Register for scheduling
-                            agent_config = {
-                                'id': new_agent.id,
-                                'name': new_agent.name,
-                                'strategy_type': new_agent.strategy_type,
-                                'trading_pairs': [action.params.get("symbol", "BTCUSDT")],
-                                'is_enabled': True,
-                                'allocation_percentage': 10.0,
-                                'max_position_size': 1000.0,
-                                'risk_limit': 100.0,
-                            }
-                            self.register_agent(agent_config)
-                            await self._bootstrap_from_backtest(agent_config)
-                            result_msg = f"Created agent {new_agent.name} ({new_agent.id[:8]})"
+                        # Check for existing agent with same strategy type
+                        strategy = action.strategy_type or "momentum"
+                        existing = (await db.execute(
+                            select(DBAgent).where(DBAgent.strategy_type == strategy)
+                        )).scalars().all()
+                        if existing:
+                            names = ", ".join(a.name for a in existing)
+                            result_msg = f"Skipped — agent(s) with strategy '{strategy}' already exist: {names}"
                             logger.info(f"Strategy action: {result_msg}")
+                        else:
+                            from app.models import User
+                            from app.api.routes.settings import get_risk_limits, get_trading_prefs
+                            user = await db.scalar(select(User).limit(1))
+                            if not user:
+                                result_msg = "No user found to own new agent"
+                            else:
+                                # Strategy-specific configuration
+                                risk = get_risk_limits()
+                                prefs = get_trading_prefs()
+                                trading_pairs = prefs.trading_pairs or ["BTCUSDT", "ETHUSDT"]
+
+                                STRATEGY_PROFILES = {
+                                    "momentum": {
+                                        "name": "Momentum Rider",
+                                        "stop_loss_pct": risk.default_stop_loss_pct,
+                                        "take_profit_pct": risk.default_take_profit_pct,
+                                        "trailing_stop_pct": 3.0,
+                                        "indicators_config": {
+                                            "rsi_period": 14, "rsi_overbought": 70, "rsi_oversold": 30,
+                                            "macd_fast": 12, "macd_slow": 26, "macd_signal": 9,
+                                        },
+                                        "description": "Follows strong momentum using RSI + MACD alignment",
+                                    },
+                                    "mean_reversion": {
+                                        "name": "Mean Reverter",
+                                        "stop_loss_pct": max(risk.default_stop_loss_pct, 2.5),
+                                        "take_profit_pct": risk.default_take_profit_pct * 0.75,
+                                        "trailing_stop_pct": 2.0,
+                                        "indicators_config": {
+                                            "bb_period": 20, "bb_std": 2.0,
+                                            "rsi_period": 14, "rsi_overbought": 75, "rsi_oversold": 25,
+                                        },
+                                        "description": "Buys oversold / sells overbought using Bollinger Bands + RSI",
+                                    },
+                                    "breakout": {
+                                        "name": "Breakout Hunter",
+                                        "stop_loss_pct": risk.default_stop_loss_pct * 1.2,
+                                        "take_profit_pct": risk.default_take_profit_pct * 1.5,
+                                        "trailing_stop_pct": 4.0,
+                                        "indicators_config": {
+                                            "atr_period": 14, "atr_multiplier": 1.5,
+                                            "lookback_period": 20,
+                                        },
+                                        "description": "Detects and trades range breakouts with ATR-based stops",
+                                    },
+                                    "scalping": {
+                                        "name": "Scalp Sniper",
+                                        "stop_loss_pct": max(risk.default_stop_loss_pct * 0.5, 0.5),
+                                        "take_profit_pct": max(risk.default_take_profit_pct * 0.5, 1.0),
+                                        "trailing_stop_pct": 1.5,
+                                        "indicators_config": {
+                                            "rsi_period": 7, "rsi_overbought": 65, "rsi_oversold": 35,
+                                            "ema_fast": 9, "ema_slow": 21,
+                                        },
+                                        "description": "Quick in-and-out trades on short-term signals",
+                                    },
+                                    "trend_following": {
+                                        "name": "Trend Follower",
+                                        "stop_loss_pct": risk.default_stop_loss_pct * 1.5,
+                                        "take_profit_pct": risk.default_take_profit_pct * 2.0,
+                                        "trailing_stop_pct": 5.0,
+                                        "indicators_config": {
+                                            "sma_fast": 20, "sma_slow": 50,
+                                            "macd_fast": 12, "macd_slow": 26, "macd_signal": 9,
+                                            "atr_period": 14,
+                                        },
+                                        "description": "Rides sustained trends with wide stops and extended targets",
+                                    },
+                                }
+
+                                profile = STRATEGY_PROFILES.get(strategy, STRATEGY_PROFILES["momentum"])
+                                agent_name = action.target_agent_name or profile["name"]
+                                # Avoid generic names like "portfolio"
+                                if agent_name.lower() in ("portfolio", "none", "n/a", ""):
+                                    agent_name = profile["name"]
+
+                                new_agent = DBAgent(
+                                    user_id=user.id,
+                                    name=agent_name,
+                                    strategy_type=strategy,
+                                    config={
+                                        "trading_pairs": trading_pairs,
+                                        "auto_created": True,
+                                        "created_by": action.initiated_by or "strategy_review",
+                                        "stop_loss_pct": profile["stop_loss_pct"],
+                                        "take_profit_pct": profile["take_profit_pct"],
+                                        "trailing_stop_pct": profile["trailing_stop_pct"],
+                                        "indicators_config": profile["indicators_config"],
+                                        "description": profile["description"],
+                                    },
+                                    is_enabled=True,
+                                    allocation_percentage=10.0,
+                                    max_position_size=risk.max_position_size_pct / 100 * 10000,
+                                    risk_limit=100.0,
+                                )
+                                db.add(new_agent)
+                                await db.commit()
+                                await db.refresh(new_agent)
+
+                                # Register for scheduling
+                                agent_config = {
+                                    'id': new_agent.id,
+                                    'name': new_agent.name,
+                                    'strategy_type': new_agent.strategy_type,
+                                    'trading_pairs': trading_pairs,
+                                    'is_enabled': True,
+                                    'allocation_percentage': 10.0,
+                                    'max_position_size': new_agent.max_position_size,
+                                    'risk_limit': 100.0,
+                                    'stop_loss_pct': profile["stop_loss_pct"],
+                                    'take_profit_pct': profile["take_profit_pct"],
+                                    'trailing_stop_pct': profile["trailing_stop_pct"],
+                                }
+                                self.register_agent(agent_config)
+                                await self._bootstrap_from_backtest(agent_config)
+                                result_msg = (
+                                    f"Created agent '{agent_name}' ({strategy}) "
+                                    f"with {len(trading_pairs)} pairs, "
+                                    f"SL={profile['stop_loss_pct']}% TP={profile['take_profit_pct']}%"
+                                )
+                                logger.info(f"Strategy action: {result_msg}")
 
                 elif action.action == "adjust_params" and action.target_agent_id:
                     change = action.params.get("allocation_change_pct", 0)
@@ -1621,7 +1946,7 @@ class AgentScheduler:
                             initiated_by=action.initiated_by,
                             confluence_score=action.confluence_score,
                             backtest_net_pnl=action.backtest_net_pnl,
-                            executed=bool(result_msg and "not found" not in result_msg.lower()),
+                            executed=bool(result_msg and "not found" not in result_msg.lower() and "skipped" not in result_msg.lower()),
                             execution_result=result_msg,
                         )
                         db.add(record)
