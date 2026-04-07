@@ -19,6 +19,10 @@ from app.config import settings
 
 
 class PaperTradingService:
+    # Configurable fee rate — Phemex taker rate is ~0.06%, we default to
+    # the same so paper trading P&L is realistic.
+    FEE_RATE = 0.0006  # 0.06% per side (entry and exit)
+
     def __init__(self, phemex_client: Optional[PhemexClient] = None):
         self.logger = logging.getLogger(__name__)
         self._enabled = True
@@ -146,6 +150,9 @@ class PaperTradingService:
                 db.add(base_balance)
                 await db.flush()
 
+            notional = quantity * price
+            fee = notional * self.FEE_RATE
+
             order = PaperOrder(
                 id=str(uuid.uuid4()),
                 user_id="default-user",
@@ -154,14 +161,17 @@ class PaperTradingService:
                 side=side,
                 quantity=quantity,
                 price=price,
-                total=quantity * price,
-                fee=quantity * price * 0.001,
+                total=notional,
+                fee=fee,
                 status=OrderStatus.FILLED,
                 is_paper=True,
                 created_at=datetime.now(),
                 filled_at=datetime.now(),
             )
             db.add(order)
+
+            # Deduct fee from balance immediately
+            usdt_balance.available -= fee
 
             if side == OrderSide.BUY:
                 # Check if closing an existing SHORT position first
@@ -514,6 +524,57 @@ class PaperTradingService:
                         pos.highest_price = current_price
                         await db.commit()
 
+    async def close_position(self, position_id: str) -> Optional[dict]:
+        """Close an open position at current market price.
+
+        Places an opposite-side order for the full quantity, which the
+        normal ``place_order`` logic will match against the existing position
+        and record the closed trade.
+        """
+        async with get_async_session() as db:
+            pos = await db.get(PaperPosition, position_id)
+            if not pos or pos.user_id != "default-user":
+                return None
+
+            symbol = pos.symbol
+            quantity = pos.quantity
+            side = pos.side.value if hasattr(pos.side, "value") else str(pos.side)
+            entry = pos.entry_price or 0
+
+        # Fetch live price
+        try:
+            current_price = await self.fetch_current_price(symbol)
+        except Exception:
+            current_price = None
+
+        # Opposite side to close
+        close_side = "buy" if side.lower() == "sell" else "sell"
+
+        order = await self.place_order(
+            symbol=symbol,
+            side=close_side,
+            quantity=quantity,
+            price=current_price,
+            agent_id=pos.agent_id,
+        )
+
+        is_short = side.lower() == "sell"
+        if is_short:
+            pnl = (entry - (current_price or entry)) * quantity
+        else:
+            pnl = ((current_price or entry) - entry) * quantity
+
+        return {
+            "closed": True,
+            "symbol": symbol,
+            "side": side,
+            "quantity": quantity,
+            "entry_price": entry,
+            "exit_price": current_price,
+            "pnl": round(pnl, 4),
+            "order": order,
+        }
+
     # ------------------------------------------------------------------
     # Closed Trades (FIFO-matched buy→sell pairs with realised P&L)
     # ------------------------------------------------------------------
@@ -726,10 +787,20 @@ class PaperTradingService:
             else:
                 unrealized_pnl += (current_price - entry) * qty
 
+        # Total fees paid across all filled orders
+        total_fees = sum(o.fee or 0 for o in orders)
+
+        # Estimated exit fees for open positions (not yet paid)
+        open_exit_fees = 0.0
+        for pos in positions:
+            cp = current_prices.get(pos.symbol, pos.entry_price or 0.0)
+            open_exit_fees += (pos.quantity or 0) * cp * self.FEE_RATE
+
         return {
-            "total_pnl": closed_pnl + unrealized_pnl,
+            "total_pnl": closed_pnl + unrealized_pnl - total_fees - open_exit_fees,
             "realized_pnl": closed_pnl,
-            "unrealized_pnl": unrealized_pnl,
+            "unrealized_pnl": unrealized_pnl - open_exit_fees,
+            "total_fees": total_fees + open_exit_fees,
             "buy_volume": buy_volume,
             "sell_volume": sell_volume,
             "trade_count": len(orders),

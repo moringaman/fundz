@@ -514,3 +514,12 @@ from app.models import AgentRunRecord, AgentMetricRecord
 from app.models import AnalystReport, PortfolioDecision, RiskAssessmentRecord, ExecutionPlan, CIOReport, AgentDecision
 from app.models import TeamChatMessageRecord, DailyReport
 from app.models import BacktestRecord, StrategyAction
+
+
+class AppSetting(Base):
+    """Key-value store for persistent application settings."""
+    __tablename__ = "app_settings"
+
+    key = Column(String(100), primary_key=True)
+    value = Column(JSON, nullable=False, default=dict)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

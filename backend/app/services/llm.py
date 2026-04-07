@@ -394,6 +394,16 @@ Return JSON: {{"trend": "strong_bullish|bullish|neutral|bearish|strong_bearish",
 - Total P&L: ${perf.get('total_pnl', 0):+,.2f}
 - Recent Streak: {perf.get('streak', 'N/A')}""")
 
+            # Trade retrospective insights — learnings from past trades
+            patterns = team_context.get("trade_patterns")
+            if patterns and patterns.get("learning_summary"):
+                parts.append(f"""TRADE PATTERN ANALYSIS (learn from your past trades):
+- {patterns['learning_summary']}
+- Exit Efficiency: {patterns.get('avg_exit_efficiency', 'N/A')}
+- Best Setup: {patterns.get('best_pattern', 'N/A')}
+- Worst Setup: {patterns.get('worst_pattern', 'N/A')}
+APPLY THESE LEARNINGS: Favour your best setups, avoid your worst patterns, and adjust confidence accordingly.""")
+
             if parts:
                 team_section = "\n\nTEAM INTELLIGENCE (factor these into your decision):\n" + "\n\n".join(parts) + """
 

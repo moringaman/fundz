@@ -36,7 +36,7 @@ const routeToPage: Record<string, string> = {
 
 function App() {
   const [timeframe, setTimeframe] = useState('1h');
-  const sidebarOpen = useAppSelector((s) => s.ui.sidebarOpen);
+  useAppSelector((s) => s.ui.sidebarOpen);
   const dispatch = useAppDispatch();
   const location = useLocation();
   const navigate = useNavigate();

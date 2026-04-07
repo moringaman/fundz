@@ -841,3 +841,37 @@ async def clear_advisor_history():
     """Clear the advisor conversation history."""
     firm_advisor.clear_history()
     return {"status": "cleared"}
+
+
+# ==================== Trade Retrospective ====================
+
+@router.get("/trade-retrospective")
+async def get_trade_retrospective():
+    """Get the latest trade retrospective analysis — patterns, insights, adjustments."""
+    from app.services.trade_retrospective import trade_retrospective
+
+    result = trade_retrospective._cached_result
+    if result:
+        return result
+
+    # If no cached result, run a fresh analysis
+    from app.services.agent_scheduler import agent_scheduler
+    agents_list = []
+    try:
+        from app.database import get_async_session
+        from app.models import Agent as DBAgent
+        from sqlalchemy import select
+        async with get_async_session() as db:
+            rows = await db.execute(select(DBAgent))
+            for a in rows.scalars().all():
+                agents_list.append({
+                    "id": str(a.id),
+                    "name": a.name,
+                    "strategy_type": a.strategy_type,
+                    "is_enabled": a.is_enabled,
+                })
+    except Exception:
+        pass
+
+    fresh = await trade_retrospective.analyze_recent_trades(agents_list)
+    return fresh or {"trade_analyses": [], "agent_insights": {}, "parameter_adjustments": [], "summary": "No trades to analyse yet."}

@@ -254,7 +254,7 @@ class StrategyReviewService:
         market_condition: MarketCondition,
     ) -> Optional[StrategyActionProposal]:
         """Check if market conditions warrant creating a new agent."""
-        existing_strategies = {ev['strategy_type'] for ev in evaluations if ev['is_enabled']}
+        existing_strategies = {ev['strategy_type'] for ev in evaluations}
         all_strategies = ['momentum', 'mean_reversion', 'breakout']
         missing = [s for s in all_strategies if s not in existing_strategies]
 
@@ -265,12 +265,12 @@ class StrategyReviewService:
         best_strategy = None
         best_bt_result = None
         best_confluence = 0.0
+        best_symbol = 'BTCUSDT'
 
         for strategy in missing:
-            # Quick backtest to validate
+            # Quick backtest to validate on the best confluence symbol
             try:
                 symbol = 'BTCUSDT'
-                # Find the best confluence symbol
                 for sym, data in confluence_scores.items():
                     if data.get('score', 0) > best_confluence:
                         best_confluence = data['score']
@@ -290,18 +290,26 @@ class StrategyReviewService:
                     if best_bt_result is None or result.net_pnl > best_bt_result.net_pnl:
                         best_strategy = strategy
                         best_bt_result = result
+                        best_symbol = symbol
             except Exception as e:
                 logger.debug(f"New agent backtest for {strategy} failed: {e}")
                 continue
 
         if best_strategy and best_bt_result:
+            STRATEGY_NAMES = {
+                "momentum": "Momentum Rider",
+                "mean_reversion": "Mean Reverter",
+                "breakout": "Breakout Hunter",
+                "scalping": "Scalp Sniper",
+                "trend_following": "Trend Follower",
+            }
             return StrategyActionProposal(
                 action="create_agent",
                 target_agent_id=None,
-                target_agent_name=f"Auto-{best_strategy.title().replace('_', '')}",
+                target_agent_name=STRATEGY_NAMES.get(best_strategy, f"Auto-{best_strategy.title()}"),
                 strategy_type=best_strategy,
                 params={
-                    "symbol": "BTCUSDT",
+                    "symbol": best_symbol,
                     "backtest_win_rate": best_bt_result.win_rate,
                     "backtest_net_pnl": best_bt_result.net_pnl,
                     "backtest_sharpe": best_bt_result.sharpe_ratio,

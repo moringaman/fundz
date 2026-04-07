@@ -1,12 +1,19 @@
-"""Settings API routes – read / update application configuration."""
+"""Settings API routes – read / update application configuration.
+
+Risk limits and trading preferences are persisted to the database so
+they survive service restarts.
+"""
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from typing import Optional
+import logging
 
 from app.config import settings as app_settings
+from app.database import get_async_session
 
 router = APIRouter(prefix="/settings", tags=["settings"])
+logger = logging.getLogger(__name__)
 
 
 # ── Response / request schemas ────────────────────────────────────────────────
@@ -87,21 +94,96 @@ class LlmConfigUpdateRequest(BaseModel):
     openrouter_api_key: Optional[str] = None
 
 
-# ── In-memory settings store (persisted per server lifetime) ──────────────────
-# In production these would live in the DB; for MVP we keep them in memory,
-# seeded from environment variables on first access.
+# ── DB-backed settings store ──────────────────────────────────────────────────
+# Settings are loaded from the database on first access and cached in memory.
+# Writes go to both the in-memory cache and the database.
 
-_runtime_risk_limits = RiskLimits()
-_runtime_trading_prefs = TradingPreferences()
+_runtime_risk_limits: Optional[RiskLimits] = None
+_runtime_trading_prefs: Optional[TradingPreferences] = None
+_settings_loaded = False
+
+
+async def _ensure_settings_table():
+    """Create the app_settings table if it doesn't exist."""
+    from app.database import engine
+    from app.models import AppSetting
+    async with engine.begin() as conn:
+        await conn.run_sync(AppSetting.__table__.create, checkfirst=True)
+
+
+async def _load_setting(key: str) -> Optional[dict]:
+    """Load a setting from the database."""
+    try:
+        await _ensure_settings_table()
+        from app.models import AppSetting
+        from sqlalchemy import select
+        async with get_async_session() as db:
+            row = await db.get(AppSetting, key)
+            if row:
+                return row.value
+    except Exception as e:
+        logger.warning(f"Failed to load setting '{key}' from DB: {e}")
+    return None
+
+
+async def _save_setting(key: str, value: dict):
+    """Save a setting to the database."""
+    try:
+        await _ensure_settings_table()
+        from app.models import AppSetting
+        async with get_async_session() as db:
+            row = await db.get(AppSetting, key)
+            if row:
+                row.value = value
+            else:
+                row = AppSetting(key=key, value=value)
+                db.add(row)
+            await db.commit()
+    except Exception as e:
+        logger.error(f"Failed to save setting '{key}' to DB: {e}")
+
+
+async def _load_all_settings():
+    """Load risk limits and trading prefs from DB, fall back to defaults."""
+    global _runtime_risk_limits, _runtime_trading_prefs, _settings_loaded
+
+    if _settings_loaded:
+        return
+
+    risk_data = await _load_setting("risk_limits")
+    if risk_data:
+        try:
+            _runtime_risk_limits = RiskLimits(**risk_data)
+            logger.info(f"Loaded risk limits from DB: {risk_data}")
+        except Exception:
+            _runtime_risk_limits = RiskLimits()
+    else:
+        _runtime_risk_limits = RiskLimits()
+
+    trading_data = await _load_setting("trading_prefs")
+    if trading_data:
+        try:
+            _runtime_trading_prefs = TradingPreferences(**trading_data)
+            logger.info(f"Loaded trading prefs from DB: {trading_data}")
+        except Exception:
+            _runtime_trading_prefs = TradingPreferences()
+    else:
+        _runtime_trading_prefs = TradingPreferences()
+
+    _settings_loaded = True
 
 
 def get_risk_limits() -> RiskLimits:
-    """Access current risk limits from other modules."""
+    """Access current risk limits from other modules (sync)."""
+    if _runtime_risk_limits is None:
+        return RiskLimits()
     return _runtime_risk_limits
 
 
 def get_trading_prefs() -> TradingPreferences:
-    """Access current trading preferences from other modules."""
+    """Access current trading preferences from other modules (sync)."""
+    if _runtime_trading_prefs is None:
+        return TradingPreferences()
     return _runtime_trading_prefs
 
 
@@ -117,6 +199,7 @@ def _mask_key(key: Optional[str]) -> Optional[str]:
 @router.get("", response_model=SettingsResponse)
 async def get_settings():
     """Return all current settings (secrets are masked)."""
+    await _load_all_settings()
     return SettingsResponse(
         api_keys=ApiKeyStatus(
             has_phemex_key=bool(app_settings.phemex_api_key),
@@ -162,17 +245,19 @@ async def update_api_keys(req: ApiKeySaveRequest):
 
 @router.put("/risk-limits", response_model=RiskLimits)
 async def update_risk_limits(req: RiskLimitsUpdateRequest):
-    """Update risk management parameters."""
+    """Update risk management parameters (persisted to DB)."""
     global _runtime_risk_limits
     _runtime_risk_limits = RiskLimits(**req.model_dump())
+    await _save_setting("risk_limits", req.model_dump())
     return _runtime_risk_limits
 
 
 @router.put("/trading", response_model=TradingPreferences)
 async def update_trading_prefs(req: TradingPreferencesUpdateRequest):
-    """Update trading preferences."""
+    """Update trading preferences (persisted to DB)."""
     global _runtime_trading_prefs
     _runtime_trading_prefs = TradingPreferences(**req.model_dump())
+    await _save_setting("trading_prefs", req.model_dump())
     return _runtime_trading_prefs
 
 
@@ -224,4 +309,5 @@ async def send_test_email():
 @router.get("/trading-pairs")
 async def get_trading_pairs():
     """Return the configured trading pairs list."""
+    await _load_all_settings()
     return {"pairs": _runtime_trading_prefs.trading_pairs}

@@ -7,7 +7,6 @@ import {
   usePaperStatus,
   usePaperPnl,
   usePaperPortfolio,
-  useBalance,
   useAgents,
   useAutomationMetrics,
   useAutomationRuns,
@@ -33,7 +32,6 @@ export function DashboardPage() {
   const { data: paperStatus, refetch: refetchStatus } = usePaperStatus();
   const { data: paperPnl, refetch: refetchPnl } = usePaperPnl();
   const { data: portfolio } = usePaperPortfolio();
-  const { data: balancesRaw } = useBalance();
   const { data: agentsData = [] } = useAgents();
   const { data: metricsData = [] } = useAutomationMetrics();
   const { data: runsData = [] } = useAutomationRuns(undefined, 12);
@@ -43,10 +41,6 @@ export function DashboardPage() {
   const agents: any[] = Array.isArray(agentsData) ? agentsData : [];
   const metrics: any[] = Array.isArray(metricsData) ? metricsData : [];
   const runs: any[] = Array.isArray(runsData) ? runsData : [];
-
-  const balances = Array.isArray(balancesRaw?.data)
-    ? balancesRaw.data
-    : Array.isArray(balancesRaw) ? balancesRaw : [];
 
   const enabledAgents = agents.filter((a) => a.is_enabled);
   const totalPnl = metrics.reduce((s: number, m: any) => s + (m.total_pnl || 0), 0);

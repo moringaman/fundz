@@ -267,3 +267,55 @@ An AI-powered crypto trading application that uses technical indicators (RSI, Bo
 - [ ] Can execute trades via UI
 - [ ] Dashboard shows live P&L
 - [ ] Paper trading works before live money
+
+---
+
+## Phase 7: Multi-Trader Fund Architecture (Roadmap)
+
+Introduce a **Trader** layer between Fund Manager and Agents. Three competing traders, each backed by a different LLM, managing their own agents and strategies. The Fund Manager allocates capital to traders based on performance.
+
+```
+CIO (strategic oversight)
+  └─ Fund Manager (allocates capital to TRADERS)
+       ├─ Trader 1 "Alpha" (Claude)   — own agents, own capital pool
+       ├─ Trader 2 "Beta"  (GPT-4o)   — own agents, own capital pool
+       └─ Trader 3 "Gamma" (Gemini)   — own agents, own capital pool
+```
+
+### 7.1 DB Schema & Trader Model
+- [ ] `Trader` model (id, name, llm_provider, llm_model, allocation_pct, is_enabled, config, performance_metrics)
+- [ ] Add `trader_id` FK to `Agent` and `PaperOrder` models
+- [ ] Alembic migration
+- [ ] Seed 3 default traders (Alpha/Claude, Beta/GPT-4o, Gamma/Gemini)
+
+### 7.2 Trader Service
+- [ ] `trader_service.py` — each trader has own LLM instance
+- [ ] `manage_agents()` — trader's own strategy review cycle
+- [ ] `generate_signals()` — trader decides which agents to run and when
+- [ ] `get_performance()` — aggregate P&L, win rate, Sharpe per trader
+- [ ] Capital-aware position sizing from trader's allocated budget
+
+### 7.3 Fund Manager → Trader Allocation
+- [ ] Refactor `make_allocation_decision()` to allocate to traders (not agents)
+- [ ] Traders sub-allocate to their own agents within their budget
+- [ ] Min 15% / max 50% per trader; rebalancing every 20 min
+
+### 7.4 Scheduler Integration
+- [ ] Each trader runs own strategy review with own LLM
+- [ ] Agent execution uses trader's allocated capital
+- [ ] Trader-level risk checks before agent-level
+- [ ] `_enabled_agents` grouped by `trader_id`
+
+### 7.5 API & Frontend
+- [ ] CRUD endpoints: `/api/traders`
+- [ ] Trader performance endpoint
+- [ ] Dashboard: trader leaderboard card
+- [ ] Agents page: group agents by trader
+- [ ] Fund Team page: per-trader performance panel
+- [ ] Settings: trader config (LLM model, risk limits)
+
+### 7.6 Migration & Rollout
+- [ ] Existing agents assigned to Trader 1 (Alpha)
+- [ ] Traders 2 & 3 start empty, auto-create agents via strategy review
+- [ ] All existing endpoints backward compatible
+- [ ] Start with equal 33% allocation, let FM optimize

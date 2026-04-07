@@ -273,3 +273,12 @@ async def update_position_sl_tp(position_id: str, body: UpdatePositionRequest):
     if result is None:
         raise HTTPException(status_code=404, detail="Position not found")
     return result
+
+
+@router.post("/positions/{position_id}/close")
+async def close_position(position_id: str):
+    """Close an open position at the current market price."""
+    result = await paper_trading.close_position(position_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Position not found")
+    return result

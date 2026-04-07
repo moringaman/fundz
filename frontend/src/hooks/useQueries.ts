@@ -175,6 +175,20 @@ export function useUpdatePositionSlTp() {
   });
 }
 
+// ─── Close position ─────────────────────────────────────────────────────────
+export function useClosePosition() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (positionId: string) =>
+      paperApi.closePosition(positionId).then((r) => r.data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['paperPositions'] });
+      qc.invalidateQueries({ queryKey: ['closedTrades'] });
+      qc.invalidateQueries({ queryKey: ['paperPnl'] });
+    },
+  });
+}
+
 // ─── Paper closed trades ─────────────────────────────────────────────────────
 export function useClosedTrades(symbol?: string, limit = 100) {
   return useQuery({
@@ -316,6 +330,16 @@ export function useBacktestHistory(agentId?: string, limit = 20) {
       return fetch(`/api/backtest/history?${params}`).then(r => r.json());
     },
     staleTime: 120_000,
+  });
+}
+
+// ─── Trade Retrospective ─────────────────────────────────────────────────────
+export function useTradeRetrospective() {
+  return useQuery({
+    queryKey: ['tradeRetrospective'],
+    queryFn: () => fetch('/api/fund/trade-retrospective').then(r => r.json()),
+    staleTime: 300_000,
+    refetchInterval: 600_000,
   });
 }
 

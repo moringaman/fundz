@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(xargs ls:*)",
+      "Bash(npm run:*)",
+      "Bash(/usr/local/bin/npm run:*)",
+      "Read(//usr/local/bin/**)",
+      "Read(//Users/leonduffus/.nvm/versions/node/**)",
+      "Bash(/Users/leonduffus/.nvm/versions/node/v22.14.0/bin/npm run:*)",
+      "Bash(export PATH=\"/Users/leonduffus/.nvm/versions/node/v22.14.0/bin:$PATH\")",
+      "Bash(python -m py_compile app/services/llm.py)",
+      "Bash(docker-compose logs:*)",
+      "Bash(docker compose:*)",
+      "Bash(curl -s http://localhost:8000/api/automation/agent-recommendations)",
+      "Bash(python3 -c \"import app.services.llm; print\\(''OK''\\)\")",
+      "Bash(/usr/local/bin/docker compose:*)",
+      "Bash(curl -s http://localhost:8000/api/fund/allocation-decision?total_capital=10000)",
+      "Bash(python3 -m json.tool)",
+      "Bash(curl -s \"http://localhost:8000/api/fund/cio-report?period=daily\")",
+      "Bash(curl -s \"http://localhost:8000/api/fund/performance-attribution\")"
+    ]
+  }
+}

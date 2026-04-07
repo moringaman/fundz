@@ -1208,6 +1208,21 @@ class AgentScheduler:
             pnl = None
             
             if signal in ['buy', 'sell'] and confidence >= 0.3:
+                # Minimum profit gate: reject trades where TP doesn't cover round-trip fees
+                round_trip_fee_pct = 0.06 * 2  # 0.06% entry + 0.06% exit = 0.12%
+                net_tp_pct = take_profit_pct - round_trip_fee_pct
+                if net_tp_pct < 0.5:
+                    logger.warning(
+                        f"Trade skipped: TP {take_profit_pct}% minus fees {round_trip_fee_pct}% = "
+                        f"{net_tp_pct:.2f}% net — below 0.5% minimum"
+                    )
+                    self._record_run(agent_id, symbol, signal, confidence, current_price, False, error="TP too low after fees")
+                    return AgentRun(
+                        agent_id=agent_id, timestamp=datetime.now(), symbol=symbol,
+                        signal="hold", confidence=0, price=current_price,
+                        executed=False, error="TP too low after fees"
+                    )
+
                 balances = await paper_trading.get_all_balances()
                 usdt_balance = next((b.available for b in balances if b.asset == "USDT"), 10000.0)
                 quantity = (usdt_balance * allocation_pct / 100) / current_price

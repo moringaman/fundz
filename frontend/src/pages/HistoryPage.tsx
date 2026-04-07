@@ -8,6 +8,7 @@ import {
   useClosedTrades,
   useAgents,
   useUpdatePositionSlTp,
+  useClosePosition,
 } from '../hooks/useQueries';
 import { timeAgo } from '../utils/timeAgo';
 
@@ -25,7 +26,9 @@ export function HistoryPage() {
 
   // SL/TP inline editing
   const updateSlTp = useUpdatePositionSlTp();
+  const closePos = useClosePosition();
   const [editingPos, setEditingPos] = useState<string | null>(null);
+  const [closingPos, setClosingPos] = useState<string | null>(null);
   const [editSL, setEditSL] = useState('');
   const [editTP, setEditTP] = useState('');
 
@@ -73,7 +76,7 @@ export function HistoryPage() {
 
   return (
     <div className="space-y-6">
-      <h1 className="page-title">Trade History</h1>
+      <h1 className="page-title" style={{ marginTop: '2rem'}}>Trade History</h1>
 
       <div className="tab-row">
         <button type="button" className={`tab-btn ${tab === 'paper' ? 'active' : ''}`} onClick={() => setTab('paper')}>
@@ -130,14 +133,14 @@ export function HistoryPage() {
         <div className="card">
           <h2 className="card-title">Open Positions ({positions.length})</h2>
           <div className="trades-table">
-            <div className="trades-header" style={{ gridTemplateColumns: '1fr 0.5fr 0.7fr 0.9fr 0.9fr 1fr 1fr 0.9fr 0.7fr 0.7fr' }}>
+            <div className="trades-header" style={{ gridTemplateColumns: '1fr 0.5fr 0.7fr 0.9fr 0.9fr 1fr 1fr 0.9fr 0.7fr 0.7fr 0.6fr' }}>
               <span>Symbol</span><span>Side</span><span>Qty</span>
               <span>Entry Price</span><span>Current Price</span>
               <span>Stop Loss</span><span>Take Profit</span>
-              <span>Unrealized P&L</span><span>P&L %</span><span>Agent</span>
+              <span>Unrealized P&L</span><span>P&L %</span><span>Agent</span><span></span>
             </div>
             {positions.map((pos: any) => (
-              <div key={pos.id || pos.symbol} className="trades-row" style={{ gridTemplateColumns: '1fr 0.5fr 0.7fr 0.9fr 0.9fr 1fr 1fr 0.9fr 0.7fr 0.7fr' }}>
+              <div key={pos.id || pos.symbol} className="trades-row" style={{ gridTemplateColumns: '1fr 0.5fr 0.7fr 0.9fr 0.9fr 1fr 1fr 0.9fr 0.7fr 0.7fr 0.6fr' }}>
                 <span style={{ fontWeight: 600 }}>{pos.symbol}</span>
                 <span className={pos.side === 'buy' ? 'positive' : 'negative'}>{pos.side?.toUpperCase()}</span>
                 <span>{pos.quantity?.toFixed(6)}</span>
@@ -227,6 +230,29 @@ export function HistoryPage() {
                   {pos.unrealized_pnl_pct >= 0 ? '+' : ''}{pos.unrealized_pnl_pct?.toFixed(2)}%
                 </span>
                 <span className="text-gray-300" style={{ fontSize: '.72rem' }}>{agentName(pos.agent_id)}</span>
+                <span style={{ display: 'flex', justifyContent: 'center' }}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (closingPos === pos.id) return;
+                      setClosingPos(pos.id);
+                      closePos.mutate(pos.id, {
+                        onSettled: () => setClosingPos(null),
+                      });
+                    }}
+                    disabled={closingPos === pos.id}
+                    title="Close position at market price"
+                    style={{
+                      padding: '.2rem .5rem', borderRadius: 4, border: 'none',
+                      background: 'var(--red, #e74c3c)', color: '#fff', fontSize: '.65rem',
+                      fontWeight: 700, cursor: closingPos === pos.id ? 'wait' : 'pointer',
+                      opacity: closingPos === pos.id ? 0.5 : 1,
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    {closingPos === pos.id ? '…' : 'Close'}
+                  </button>
+                </span>
               </div>
             ))}
           </div>

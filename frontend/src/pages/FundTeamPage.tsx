@@ -10,6 +10,7 @@ import {
   useFundTechnicalAnalysisBatch,
   useAgents,
   useStrategyActions,
+  useTradeRetrospective,
 } from '../hooks/useQueries';
 import { DailyReportPanel } from '../components/DailyReportPanel';
 import { TeamChatPanel } from '../components/TeamChatPanel';
@@ -24,6 +25,7 @@ export function FundTeamPage() {
   const { data: teamRoster } = useFundTeamRoster();
   const { data: agents } = useAgents();
   const { data: strategyActions } = useStrategyActions();
+  const { data: retroData } = useTradeRetrospective();
   const [selectedTASymbol, setSelectedTASymbol] = useState<string | null>(null);
 
   const taReports: any[] = Array.isArray(technicalBatch) ? technicalBatch : [];
@@ -745,6 +747,95 @@ export function FundTeamPage() {
 
       {/* Daily Report Panel */}
       <DailyReportPanel />
+
+      {/* Trade Retrospective Panel */}
+      {retroData && retroData.trade_count > 0 && (
+        <div style={{ background: 'var(--bg-card)', borderRadius: '.75rem', border: '1px solid var(--border)', padding: '1.25rem' }}>
+          <h3 style={{ margin: '0 0 1rem', display: 'flex', alignItems: 'center', gap: '.5rem' }}>
+            <BarChart3 size={18} /> Trade Retrospective
+            <span style={{ fontSize: '.7rem', color: 'var(--text-dim)', fontWeight: 400 }}>
+              {retroData.trade_count} trades analysed
+            </span>
+          </h3>
+
+          {retroData.summary && (
+            <p style={{ fontSize: '.8rem', color: 'var(--text-secondary)', margin: '0 0 1rem', lineHeight: 1.5 }}>
+              {retroData.summary}
+            </p>
+          )}
+
+          {/* Per-agent insights */}
+          {retroData.agent_insights && Object.keys(retroData.agent_insights).length > 0 && (
+            <div style={{ display: 'grid', gap: '.75rem' }}>
+              {Object.entries(retroData.agent_insights).map(([agentId, insight]: [string, any]) => (
+                <div
+                  key={agentId}
+                  style={{
+                    background: 'var(--bg-primary)',
+                    borderRadius: '.5rem',
+                    padding: '.75rem 1rem',
+                    border: '1px solid var(--border)',
+                  }}
+                >
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '.5rem' }}>
+                    <span style={{ fontWeight: 600, fontSize: '.8rem' }}>{insight.agent_name}</span>
+                    <span style={{
+                      fontSize: '.7rem',
+                      color: insight.win_rate >= 0.5 ? '#4ade80' : '#f87171',
+                      fontWeight: 600,
+                    }}>
+                      {(insight.win_rate * 100).toFixed(0)}% WR ({insight.total_trades} trades)
+                    </span>
+                  </div>
+
+                  {insight.strengths?.length > 0 && (
+                    <div style={{ fontSize: '.75rem', color: '#4ade80', marginBottom: '.25rem' }}>
+                      ✅ {insight.strengths.join(' • ')}
+                    </div>
+                  )}
+                  {insight.weaknesses?.length > 0 && (
+                    <div style={{ fontSize: '.75rem', color: '#fbbf24', marginBottom: '.25rem' }}>
+                      ⚠️ {insight.weaknesses.join(' • ')}
+                    </div>
+                  )}
+
+                  <div style={{ display: 'flex', gap: '1rem', fontSize: '.7rem', color: 'var(--text-dim)', marginTop: '.5rem' }}>
+                    {insight.avg_exit_efficiency !== null && (
+                      <span>Exit Efficiency: {(insight.avg_exit_efficiency * 100).toFixed(0)}%</span>
+                    )}
+                    {insight.best_pattern && <span>Best: {insight.best_pattern}</span>}
+                    {insight.worst_pattern && <span>Worst: {insight.worst_pattern}</span>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Parameter adjustments */}
+          {retroData.parameter_adjustments?.length > 0 && (
+            <div style={{ marginTop: '1rem' }}>
+              <h4 style={{ fontSize: '.75rem', margin: '0 0 .5rem', color: 'var(--text-secondary)' }}>
+                🔧 Recommended Adjustments
+              </h4>
+              {retroData.parameter_adjustments.map((adj: any, i: number) => (
+                <div
+                  key={i}
+                  style={{
+                    fontSize: '.75rem',
+                    background: 'rgba(251, 191, 36, .08)',
+                    border: '1px solid rgba(251, 191, 36, .2)',
+                    borderRadius: '.4rem',
+                    padding: '.5rem .75rem',
+                    marginBottom: '.4rem',
+                  }}
+                >
+                  <strong>{adj.agent_name}</strong>: {adj.reason}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

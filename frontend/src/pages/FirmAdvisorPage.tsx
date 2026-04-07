@@ -7,7 +7,7 @@ export function FirmAdvisorPage() {
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
-  const { data: history = [], isLoading: historyLoading } = useAdvisorHistory();
+  const { data: history = [] } = useAdvisorHistory();
   const askMutation = useAskAdvisor();
   const clearMutation = useClearAdvisorHistory();
 

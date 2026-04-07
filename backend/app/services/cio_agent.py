@@ -311,7 +311,7 @@ Provide 2-3 strategic recommendations in JSON format.
 IMPORTANT: Respond with ONLY the JSON array, no markdown fences, no preamble text.
 [
   {{
-    "recommendation": "enable_agent|disable_agent|increase_allocation|reduce_risk|add_new_strategy|pause_strategy",
+    "recommendation": "enable_agent|disable_agent|increase_allocation|reduce_risk|add_new_strategy|diversify|pause_strategy",
     "target": "agent_id or portfolio",
     "confidence": 0.0-1.0,
     "rationale": "brief explanation",
