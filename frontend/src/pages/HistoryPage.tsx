@@ -11,6 +11,7 @@ import {
   useClosePosition,
 } from '../hooks/useQueries';
 import { timeAgo } from '../utils/timeAgo';
+import { formatPrice } from '../utils/formatPrice';
 
 export function HistoryPage() {
   const [tab, setTab] = useState<'paper' | 'live'>('paper');
@@ -144,8 +145,8 @@ export function HistoryPage() {
                 <span style={{ fontWeight: 600 }}>{pos.symbol}</span>
                 <span className={pos.side === 'buy' ? 'positive' : 'negative'}>{pos.side?.toUpperCase()}</span>
                 <span>{pos.quantity?.toFixed(6)}</span>
-                <span>${pos.entry_price?.toFixed(2)}</span>
-                <span>${pos.current_price?.toFixed(2)}</span>
+                <span>${formatPrice(pos.entry_price)}</span>
+                <span>${formatPrice(pos.current_price)}</span>
 
                 {/* ── Stop Loss (editable) ── */}
                 <span style={{ display: 'flex', alignItems: 'center', gap: '.25rem' }}>
@@ -168,7 +169,7 @@ export function HistoryPage() {
                       title="Click to edit SL/TP"
                       style={{ color: 'var(--red)', fontSize: '.75rem', fontFamily: 'var(--mono)', cursor: 'pointer', borderBottom: '1px dashed var(--red)', paddingBottom: 1 }}
                     >
-                      {pos.stop_loss_price ? `$${pos.stop_loss_price.toFixed(2)}` : '— set'}
+                      {pos.stop_loss_price ? `$${formatPrice(pos.stop_loss_price)}` : '— set'}
                     </span>
                   )}
                 </span>
@@ -218,7 +219,7 @@ export function HistoryPage() {
                       title="Click to edit SL/TP"
                       style={{ color: 'var(--green)', fontSize: '.75rem', fontFamily: 'var(--mono)', cursor: 'pointer', borderBottom: '1px dashed var(--green)', paddingBottom: 1 }}
                     >
-                      {pos.take_profit_price ? `$${pos.take_profit_price.toFixed(2)}` : '— set'}
+                      {pos.take_profit_price ? `$${formatPrice(pos.take_profit_price)}` : '— set'}
                     </span>
                   )}
                 </span>
@@ -337,8 +338,8 @@ export function HistoryPage() {
                     </span>
                     <span style={{ fontWeight: 600 }}>{t.symbol}</span>
                     <span>{t.quantity}</span>
-                    <span style={{ fontFamily: 'var(--mono)', fontSize: '0.78rem' }}>${t.entry_price?.toFixed(2)}</span>
-                    <span style={{ fontFamily: 'var(--mono)', fontSize: '0.78rem' }}>${t.exit_price?.toFixed(2)}</span>
+                    <span style={{ fontFamily: 'var(--mono)', fontSize: '0.78rem' }}>${formatPrice(t.entry_price)}</span>
+                    <span style={{ fontFamily: 'var(--mono)', fontSize: '0.78rem' }}>${formatPrice(t.exit_price)}</span>
                     <span className={t.net_pnl >= 0 ? 'positive' : 'negative'} style={{ fontWeight: 700 }}>
                       {t.net_pnl >= 0 ? '+' : ''}${t.net_pnl?.toFixed(2)}
                     </span>
@@ -369,7 +370,7 @@ export function HistoryPage() {
                     <span>{trade.symbol}</span>
                     <span className={trade.side === 'buy' ? 'positive' : 'negative'}>{trade.side?.toUpperCase()}</span>
                     <span>{trade.quantity}</span>
-                    <span>${trade.price?.toFixed(2)}</span>
+                    <span>${formatPrice(trade.price)}</span>
                     <span>${trade.total?.toFixed(2)}</span>
                     <span className="text-gray-400">${trade.fee?.toFixed(4) || '0.0000'}</span>
                     <span className="text-gray-300">{agentName(trade.agent_id)}</span>
@@ -402,7 +403,7 @@ export function HistoryPage() {
                   <span>{trade.symbol}</span>
                   <span className={trade.side === 'buy' ? 'positive' : 'negative'}>{trade.side?.toUpperCase()}</span>
                   <span>{trade.quantity}</span>
-                  <span>${trade.price?.toFixed(2)}</span>
+                  <span>${formatPrice(trade.price)}</span>
                   <span>${trade.total?.toFixed(2)}</span>
                   <span className="text-gray-400">${trade.fee?.toFixed(4) || '0.0000'}</span>
                   <span className="text-gray-300">{agentName(trade.agent_id)}</span>

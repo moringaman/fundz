@@ -3,6 +3,7 @@ import { ArrowUpRight, ArrowDownRight, Minus, HelpCircle, RotateCcw, Wallet, Use
 import { useAppSelector, useAppDispatch } from '../store/hooks';
 import { setSelectedSymbol } from '../store/slices/marketSlice';
 import { paperApi } from '../lib/api';
+import { formatPrice } from '../utils/formatPrice';
 import {
   usePaperStatus,
   usePaperPnl,
@@ -70,7 +71,7 @@ export function DashboardPage() {
       <div className="ticker-bar">
         <span className="ticker-symbol">{ticker?.symbol ?? selectedSymbol}</span>
         <span className="ticker-price">
-          ${ticker?.lastPrice?.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) ?? '—'}
+          ${formatPrice(ticker?.lastPrice)}
         </span>
         <span className={`ticker-change ${upChange ? 'up' : 'down'}`}>
           {upChange ? '+' : ''}{ticker?.priceChangePercent?.toFixed(2) ?? '0.00'}%
@@ -78,11 +79,11 @@ export function DashboardPage() {
         <div className="ticker-meta">
           <div className="ticker-meta-item">
             <span className="ticker-meta-label">24h High</span>
-            <span className="ticker-meta-value">${ticker?.high?.toLocaleString() ?? '—'}</span>
+            <span className="ticker-meta-value">${formatPrice(ticker?.high)}</span>
           </div>
           <div className="ticker-meta-item">
             <span className="ticker-meta-label">24h Low</span>
-            <span className="ticker-meta-value">${ticker?.low?.toLocaleString() ?? '—'}</span>
+            <span className="ticker-meta-value">${formatPrice(ticker?.low)}</span>
           </div>
           <div className="ticker-meta-item">
             <span className="ticker-meta-label">Volume</span>
@@ -114,7 +115,7 @@ export function DashboardPage() {
             >
               <span className="symbol-chip-name">{sym.replace('USDT', '')}</span>
               <span className="symbol-chip-price">
-                {symTicker ? `$${symTicker.lastPrice?.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : '—'}
+                {symTicker ? `$${formatPrice(symTicker.lastPrice)}` : '—'}
               </span>
               <span className={`symbol-chip-chg ${symUp ? 'up' : 'down'}`}>
                 {symUp ? '+' : ''}{symChange?.toFixed(2) ?? '0.00'}%
@@ -275,7 +276,7 @@ export function DashboardPage() {
                   <div className="activity-body">
                     <div className="activity-agent">{agent?.name ?? run.agent_id?.slice(0, 8)}</div>
                     <div className="activity-detail">
-                      {run.signal?.toUpperCase()} {run.symbol} @ ${run.price?.toFixed ? run.price.toFixed(2) : '—'}
+                      {run.signal?.toUpperCase()} {run.symbol} @ ${run.price != null ? formatPrice(run.price) : '—'}
                       {run.executed ? ' · executed' : ' · signal only'}
                       {run.error ? ` · ${run.error}` : ''}
                     </div>
