@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, APIRouter, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 import json
 import asyncio
 import logging
@@ -10,6 +11,15 @@ from app.api.routes import market, trading, agents, backtest, paper_trading, aut
 from app.api.routes import settings as settings_routes
 
 logger = logging.getLogger(__name__)
+
+
+async def _column_exists(conn, table: str, column: str) -> bool:
+    """Check if a column exists in a PostgreSQL table."""
+    result = await conn.execute(text(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_name = :table AND column_name = :column"
+    ), {"table": table, "column": column})
+    return result.fetchone() is not None
 
 api_router = APIRouter(prefix="/api")
 api_router.include_router(market.router)
@@ -104,26 +114,22 @@ async def _market_broadcast_loop():
                 ticker_resp = await phemex.get_ticker(symbol)
                 ticker_data = (ticker_resp or {}).get("result", {})
                 if ticker_data:
+                    close_price = float(ticker_data.get("closeRp", 0))
+                    open_price = float(ticker_data.get("openRp", 0))
                     await manager.broadcast(
                         {
                             "type": "ticker",
                             "symbol": symbol,
                             "data": {
-                                "lastPrice": float(ticker_data.get("closeRp", 0)) / 100000,
-                                "priceChange": (
-                                    float(ticker_data.get("closeRp", 0))
-                                    - float(ticker_data.get("openRp", 0))
-                                ) / 100000,
+                                "lastPrice": close_price,
+                                "priceChange": close_price - open_price,
                                 "priceChangePercent": (
-                                    (
-                                        float(ticker_data.get("closeRp", 0))
-                                        - float(ticker_data.get("openRp", 0))
-                                    )
-                                    / max(float(ticker_data.get("openRp", 1)), 1)
+                                    (close_price - open_price)
+                                    / max(open_price, 1)
                                 ) * 100,
-                                "high": float(ticker_data.get("highRp", 0)) / 100000,
-                                "low": float(ticker_data.get("lowRp", 0)) / 100000,
-                                "volume": float(ticker_data.get("turnoverRv", 0)) / 100000,
+                                "high": float(ticker_data.get("highRp", 0)),
+                                "low": float(ticker_data.get("lowRp", 0)),
+                                "volume": float(ticker_data.get("turnoverRv", 0)),
                             },
                         },
                         symbol=symbol,
@@ -260,6 +266,20 @@ async def lifespan(app: FastAPI):
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Add SL/TP columns to positions table if missing (safe migration)
+        await conn.execute(text(
+            "ALTER TABLE positions ADD COLUMN stop_loss_price FLOAT"
+        )) if not await _column_exists(conn, "positions", "stop_loss_price") else None
+        await conn.execute(text(
+            "ALTER TABLE positions ADD COLUMN take_profit_price FLOAT"
+        )) if not await _column_exists(conn, "positions", "take_profit_price") else None
+        # Add trailing stop columns to positions table if missing
+        await conn.execute(text(
+            "ALTER TABLE positions ADD COLUMN highest_price FLOAT"
+        )) if not await _column_exists(conn, "positions", "highest_price") else None
+        await conn.execute(text(
+            "ALTER TABLE positions ADD COLUMN trailing_stop_pct FLOAT"
+        )) if not await _column_exists(conn, "positions", "trailing_stop_pct") else None
 
     from app.services.llm import llm_service
     try:

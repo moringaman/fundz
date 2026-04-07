@@ -22,6 +22,7 @@ class AgentConfig(BaseModel):
     risk_limit: float = 2.0
     stop_loss_pct: float = 2.0
     take_profit_pct: float = 4.0
+    trailing_stop_pct: Optional[float] = None
     run_interval_seconds: int = 3600
     indicators_config: dict = {}
 
@@ -37,6 +38,7 @@ class Agent(BaseModel):
     risk_limit: float = 2.0
     stop_loss_pct: float = 2.0
     take_profit_pct: float = 4.0
+    trailing_stop_pct: Optional[float] = None
     run_interval_seconds: int = 3600
     indicators_config: dict = {}
     created_at: str
@@ -64,6 +66,7 @@ def agent_to_response(db_agent: DBAgent) -> Agent:
         risk_limit=db_agent.risk_limit,
         stop_loss_pct=db_agent.config.get("stop_loss_pct", 2.0),
         take_profit_pct=db_agent.config.get("take_profit_pct", 4.0),
+        trailing_stop_pct=db_agent.config.get("trailing_stop_pct"),
         run_interval_seconds=db_agent.run_interval_seconds,
         indicators_config=db_agent.config.get("indicators_config", {}),
         created_at=db_agent.created_at.isoformat() if db_agent.created_at else datetime.now().isoformat()
@@ -91,6 +94,7 @@ async def create_agent(config: AgentConfig, db: AsyncSession = Depends(get_db)):
             "indicators_config": config.indicators_config,
             "stop_loss_pct": config.stop_loss_pct,
             "take_profit_pct": config.take_profit_pct,
+            "trailing_stop_pct": config.trailing_stop_pct,
         },
         is_enabled=False,
         allocation_percentage=config.allocation_percentage,
@@ -124,7 +128,10 @@ async def update_agent(agent_id: str, config: AgentConfig, db: AsyncSession = De
     agent.strategy_type = config.strategy_type
     agent.config = {
         "trading_pairs": config.trading_pairs,
-        "indicators_config": config.indicators_config
+        "indicators_config": config.indicators_config,
+        "stop_loss_pct": config.stop_loss_pct,
+        "take_profit_pct": config.take_profit_pct,
+        "trailing_stop_pct": config.trailing_stop_pct,
     }
     agent.allocation_percentage = config.allocation_percentage
     agent.max_position_size = config.max_position_size
@@ -150,6 +157,8 @@ async def delete_agent(agent_id: str, db: AsyncSession = Depends(get_db)):
 
 @router.post("/{agent_id}/toggle")
 async def toggle_agent(agent_id: str, db: AsyncSession = Depends(get_db)):
+    from app.services.agent_scheduler import agent_scheduler
+
     result = await db.execute(select(DBAgent).where(DBAgent.id == agent_id))
     agent = result.scalar_one_or_none()
     if not agent:
@@ -157,6 +166,21 @@ async def toggle_agent(agent_id: str, db: AsyncSession = Depends(get_db)):
     
     agent.is_enabled = not agent.is_enabled
     await db.commit()
+
+    # Sync with scheduler
+    if agent.is_enabled:
+        agent_scheduler.register_agent({
+            "id": agent.id,
+            "name": agent.name,
+            "strategy_type": agent.strategy_type,
+            "trading_pairs": agent.config.get("trading_pairs", []) if isinstance(agent.config, dict) else [],
+            "is_enabled": True,
+            "allocation_percentage": agent.allocation_percentage,
+            "max_position_size": agent.max_position_size,
+        })
+    else:
+        agent_scheduler.unregister_agent(agent.id)
+
     return {"is_enabled": agent.is_enabled}
 
 
@@ -206,7 +230,42 @@ async def run_agent_backtest(
     )
     
     backtest_result = await backtest_engine.run_backtest(config)
-    
+
+    # Persist to DB
+    try:
+        from app.models import BacktestRecord
+        record = BacktestRecord(
+            agent_id=agent_id,
+            symbol=symbol,
+            strategy=agent.strategy_type,
+            interval=interval,
+            config_params={
+                "initial_balance": config.initial_balance,
+                "position_size_pct": config.position_size_pct,
+                "stop_loss_pct": config.stop_loss_pct,
+                "take_profit_pct": config.take_profit_pct,
+            },
+            total_trades=backtest_result.total_trades,
+            winning_trades=backtest_result.winning_trades,
+            losing_trades=backtest_result.losing_trades,
+            win_rate=backtest_result.win_rate,
+            total_pnl=backtest_result.total_pnl,
+            net_pnl=backtest_result.net_pnl,
+            total_fees=backtest_result.total_fees,
+            max_drawdown=backtest_result.max_drawdown,
+            sharpe_ratio=backtest_result.sharpe_ratio,
+            avg_trade_pnl=backtest_result.avg_trade_pnl,
+            profit_factor=backtest_result.profit_factor,
+            equity_curve=backtest_result.equity_curve[-200:],
+            trades_data=backtest_result.trades[-50:],
+            source="manual",
+            candle_count=len(backtest_result.equity_curve),
+        )
+        db.add(record)
+        await db.commit()
+    except Exception:
+        pass  # non-critical
+
     return {
         "agent_id": agent_id,
         "config": {
@@ -220,11 +279,17 @@ async def run_agent_backtest(
             "losing_trades": backtest_result.losing_trades,
             "win_rate": backtest_result.win_rate,
             "total_pnl": backtest_result.total_pnl,
+            "net_pnl": backtest_result.net_pnl,
+            "total_fees": backtest_result.total_fees,
             "max_drawdown": backtest_result.max_drawdown,
             "sharpe_ratio": backtest_result.sharpe_ratio,
             "avg_trade_pnl": backtest_result.avg_trade_pnl,
+            "profit_factor": backtest_result.profit_factor,
+            "avg_win": backtest_result.avg_win,
+            "avg_loss": backtest_result.avg_loss,
         },
         "trades": backtest_result.trades[-10:],
+        "equity_curve": backtest_result.equity_curve,
     }
 
 

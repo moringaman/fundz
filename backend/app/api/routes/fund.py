@@ -261,45 +261,84 @@ async def get_technical_analysis(symbol: str = "BTCUSDT"):
 
         report = await technical_analyst.analyze(symbol)
 
-        return TechnicalAnalysisResponse(
-            timestamp=report.timestamp,
-            symbol=report.symbol,
-            current_price=report.current_price,
-            price_levels=PriceLevelResponse(
-                support=report.price_levels.support,
-                resistance=report.price_levels.resistance,
-                pivot_points=report.price_levels.pivot_points,
-                fibonacci_retracements=report.price_levels.fibonacci_retracements,
-                fibonacci_extensions=report.price_levels.fibonacci_extensions
-            ),
-            patterns=[
-                PatternSignalResponse(
-                    pattern_type=p.pattern_type,
-                    direction=p.direction,
-                    confidence=p.confidence,
-                    entry_price=p.entry_price,
-                    stop_loss=p.stop_loss,
-                    take_profit_1=p.take_profit_1,
-                    take_profit_2=p.take_profit_2,
-                    risk_reward=p.risk_reward,
-                    reasoning=p.reasoning
-                )
-                for p in report.patterns
-            ],
-            multi_timeframe=MultiTimeframeResponse(
-                timeframe_1h=report.multi_timeframe.timeframe_1h,
-                timeframe_4h=report.multi_timeframe.timeframe_4h,
-                timeframe_1d=report.multi_timeframe.timeframe_1d,
-                alignment=report.multi_timeframe.alignment,
-                trend_confirmation=report.multi_timeframe.trend_confirmation,
-                confluence_score=report.multi_timeframe.confluence_score
-            ) if report.multi_timeframe else None,
-            overall_signal=report.overall_signal,
-            confidence=report.confidence,
-            key_observations=report.key_observations
-        )
+        return _report_to_response(report)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Technical analysis failed: {str(e)}")
+
+
+def _report_to_response(report) -> TechnicalAnalysisResponse:
+    """Convert a TechnicalAnalystReport to API response."""
+    return TechnicalAnalysisResponse(
+        timestamp=report.timestamp,
+        symbol=report.symbol,
+        current_price=report.current_price,
+        price_levels=PriceLevelResponse(
+            support=report.price_levels.support,
+            resistance=report.price_levels.resistance,
+            pivot_points=report.price_levels.pivot_points,
+            fibonacci_retracements=report.price_levels.fibonacci_retracements,
+            fibonacci_extensions=report.price_levels.fibonacci_extensions
+        ),
+        patterns=[
+            PatternSignalResponse(
+                pattern_type=p.pattern_type,
+                direction=p.direction,
+                confidence=p.confidence,
+                entry_price=p.entry_price,
+                stop_loss=p.stop_loss,
+                take_profit_1=p.take_profit_1,
+                take_profit_2=p.take_profit_2,
+                risk_reward=p.risk_reward,
+                reasoning=p.reasoning
+            )
+            for p in report.patterns
+        ],
+        multi_timeframe=MultiTimeframeResponse(
+            timeframe_1h=report.multi_timeframe.timeframe_1h,
+            timeframe_4h=report.multi_timeframe.timeframe_4h,
+            timeframe_1d=report.multi_timeframe.timeframe_1d,
+            alignment=report.multi_timeframe.alignment,
+            trend_confirmation=report.multi_timeframe.trend_confirmation,
+            confluence_score=report.multi_timeframe.confluence_score
+        ) if report.multi_timeframe else None,
+        overall_signal=report.overall_signal,
+        confidence=report.confidence,
+        key_observations=report.key_observations
+    )
+
+
+@router.get("/technical-analysis/batch", response_model=List[TechnicalAnalysisResponse])
+async def get_technical_analysis_batch():
+    """
+    Get technical analysis for all unique trading pairs across active agents.
+    Falls back to BTCUSDT if no agents have trading pairs configured.
+    """
+    import asyncio
+    from app.services.technical_analyst import technical_analyst
+    from app.api.routes.agents import get_agents_from_db
+
+    try:
+        agents = await get_agents_from_db()
+
+        symbols = set()
+        for agent in agents:
+            pairs = agent.get("trading_pairs") or ["BTCUSDT"]
+            if isinstance(pairs, str):
+                pairs = [pairs]
+            symbols.update(pairs)
+        symbols = list(symbols) or ["BTCUSDT"]
+
+        async def analyze_safe(sym: str):
+            try:
+                return await technical_analyst.analyze(sym)
+            except Exception:
+                return None
+
+        reports = await asyncio.gather(*[analyze_safe(s) for s in symbols])
+        results = [_report_to_response(r) for r in reports if r is not None]
+        return results
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Batch technical analysis failed: {str(e)}")
 
 
 # ==================== Portfolio Manager Endpoints ====================
@@ -307,41 +346,70 @@ async def get_technical_analysis(symbol: str = "BTCUSDT"):
 @router.get("/allocation-decision", response_model=AllocationDecisionResponse)
 async def get_allocation_decision(total_capital: float = 10000):
     """
-    Get portfolio manager's capital allocation recommendation
+    Get portfolio manager's capital allocation recommendation.
+    Returns the scheduler's live allocation if available (computed every 5 min),
+    otherwise computes a performance-weighted allocation without LLM dependency.
     """
     try:
         from app.api.routes.agents import get_agents_from_db
 
         agents = await get_agents_from_db()
-        metrics_data = await agent_scheduler.get_all_metrics()
+        if not agents:
+            raise HTTPException(status_code=404, detail="No agents found")
 
-        # Create agent_id to name mapping
-        agent_name_map = {agent['id']: agent['name'] for agent in agents}
-
-        agent_metrics = [
-            {
-                'agent_id': m.agent_id,
-                'agent_name': agent_name_map.get(m.agent_id, m.agent_id),
-                'total_runs': m.total_runs,
-                'successful_runs': m.successful_runs,
-                'total_pnl': m.total_pnl,
-                'win_rate': m.win_rate,
-                'last_run': m.last_run.isoformat() if m.last_run else None,
-                'strategy_type': 'unknown'
+        # Prefer the live scheduler allocation (already computed by FM with LLM)
+        live_alloc = agent_scheduler.get_current_allocation()
+        if live_alloc and len(live_alloc) > 0:
+            allocation_dollars = {
+                aid: total_capital * pct / 100
+                for aid, pct in live_alloc.items()
             }
-            for m in metrics_data
-        ]
+            return AllocationDecisionResponse(
+                timestamp=datetime.utcnow(),
+                allocation=allocation_dollars,
+                allocation_pct=live_alloc,
+                reasoning=agent_scheduler._current_allocation_reasoning or "Live allocation from Portfolio Manager",
+                expected_return_pct=0.0
+            )
 
-        market = await fund_manager.analyze_market()
-        decision = await fund_manager.make_allocation_decision(agents, agent_metrics, market, total_capital)
+        # Fallback: performance-weighted allocation (no LLM needed)
+        metrics_data = await agent_scheduler.get_all_metrics()
+        metrics_by_id = {m.agent_id: m for m in metrics_data}
+
+        scores = {}
+        for agent in agents:
+            aid = agent['id']
+            m = metrics_by_id.get(aid)
+            if m and m.total_runs > 0:
+                # Score = win_rate * 0.6 + pnl_factor * 0.4, floored at 0.1
+                win_rate = m.win_rate or 0
+                pnl_factor = min(max((m.total_pnl or 0) / 1000 + 0.5, 0), 1)
+                scores[aid] = max(win_rate * 0.6 + pnl_factor * 0.4, 0.1)
+            else:
+                scores[aid] = 0.5  # New agents get neutral score
+
+        total_score = sum(scores.values()) or 1
+        alloc_pct = {}
+        for aid, score in scores.items():
+            raw_pct = (score / total_score) * 100
+            alloc_pct[aid] = max(raw_pct, 5.0)  # Floor: 5%
+
+        # Re-normalize
+        total_pct = sum(alloc_pct.values())
+        if total_pct > 0:
+            alloc_pct = {aid: pct / total_pct * 100 for aid, pct in alloc_pct.items()}
+
+        allocation_dollars = {aid: total_capital * pct / 100 for aid, pct in alloc_pct.items()}
 
         return AllocationDecisionResponse(
-            timestamp=decision.timestamp,
-            allocation=decision.allocation,
-            allocation_pct=decision.allocation_pct,
-            reasoning=decision.reasoning,
-            expected_return_pct=decision.expected_return_pct
+            timestamp=datetime.utcnow(),
+            allocation=allocation_dollars,
+            allocation_pct=alloc_pct,
+            reasoning="Performance-weighted allocation (Portfolio Manager not yet initialized)",
+            expected_return_pct=0.0
         )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Allocation decision failed: {str(e)}")
 
@@ -393,15 +461,46 @@ async def get_performance_attribution():
 @router.get("/risk-assessment", response_model=RiskAssessmentResponse)
 async def get_risk_assessment(total_capital: float = 10000):
     """
-    Get current portfolio risk assessment
+    Get current portfolio risk assessment.
+    Serves the scheduler's cached assessment (computed every 5 min with real positions).
+    Falls back to a live computation if no cached data exists yet.
     """
     try:
+        # Prefer the scheduler's cached assessment (has real position data)
+        cached = agent_scheduler.get_current_risk_assessment()
+        if cached:
+            return RiskAssessmentResponse(
+                timestamp=cached.timestamp,
+                risk_level=cached.risk_level,
+                daily_pnl=cached.daily_pnl,
+                portfolio_exposure=cached.portfolio_exposure,
+                exposure_pct_of_capital=cached.exposure_pct_of_capital,
+                largest_position_symbol=cached.largest_position_symbol,
+                largest_position_size=cached.largest_position_size,
+                concentration_risk=cached.concentration_risk,
+                recommendations=cached.recommendations or [],
+                reasoning=cached.reasoning or "",
+            )
+
+        # Fallback: compute live with real positions from paper trading
+        from app.services.paper_trading import paper_trading
         daily_pnl = risk_manager.get_daily_pnl()
+        positions_live = await paper_trading.get_positions_live()
+        current_positions = [
+            {
+                "symbol": p["symbol"],
+                "quantity": p["quantity"],
+                "entry_price": p["entry_price"],
+                "current_price": p.get("current_price", p["entry_price"]),
+                "unrealized_pnl": p.get("unrealized_pnl", 0.0),
+            }
+            for p in positions_live
+        ]
 
         assessment = await risk_manager.generate_risk_assessment(
-            current_positions=[],
+            current_positions=current_positions,
             daily_pnl=daily_pnl,
-            total_capital=total_capital
+            total_capital=total_capital,
         )
 
         return RiskAssessmentResponse(
@@ -413,8 +512,8 @@ async def get_risk_assessment(total_capital: float = 10000):
             largest_position_symbol=assessment.largest_position_symbol,
             largest_position_size=assessment.largest_position_size,
             concentration_risk=assessment.concentration_risk,
-            recommendations=assessment.recommendations,
-            reasoning=assessment.reasoning
+            recommendations=assessment.recommendations or [],
+            reasoning=assessment.reasoning or "",
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Risk assessment failed: {str(e)}")
@@ -649,3 +748,36 @@ async def get_team_status():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Status check failed: {str(e)}")
+
+
+@router.get("/strategy-actions")
+async def get_strategy_actions(limit: int = 20):
+    """Retrieve history of automated strategy actions (create/disable/enable/adjust)."""
+    try:
+        from sqlalchemy import select, desc
+        from app.database import get_async_session
+        from app.models import StrategyAction
+        async with get_async_session() as session:
+            query = select(StrategyAction).order_by(desc(StrategyAction.created_at)).limit(limit)
+            result = await session.execute(query)
+            records = result.scalars().all()
+            return [
+                {
+                    "id": r.id,
+                    "action": r.action,
+                    "target_agent_id": r.target_agent_id,
+                    "target_agent_name": r.target_agent_name,
+                    "strategy_type": r.strategy_type,
+                    "params": r.params,
+                    "rationale": r.rationale,
+                    "initiated_by": r.initiated_by,
+                    "confluence_score": r.confluence_score,
+                    "backtest_net_pnl": r.backtest_net_pnl,
+                    "executed": r.executed,
+                    "execution_result": r.execution_result,
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                }
+                for r in records
+            ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch strategy actions: {str(e)}")

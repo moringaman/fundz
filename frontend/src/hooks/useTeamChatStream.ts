@@ -1,24 +1,25 @@
 import { useEffect } from 'react';
 import { wsClient } from '../lib/websocket';
-import { useAppStore } from '../lib/store';
-import type { TeamChatMessage } from '../lib/store';
+import { useAppDispatch } from '../store/hooks';
+import { addToast } from '../store/slices/teamChatSlice';
+import type { TeamChatMessage } from '../store/types';
 
 /**
  * Listens for `team_chat` WebSocket events and pushes them
- * into the Zustand toast queue for display.
+ * into the Redux toast queue for display.
  */
 export function useTeamChatStream() {
-  const addTeamChatToast = useAppStore((s) => s.addTeamChatToast);
+  const dispatch = useAppDispatch();
 
   useEffect(() => {
     const onTeamChat = (msg: unknown) => {
       const { data } = msg as { data: TeamChatMessage };
-      if (data) addTeamChatToast(data);
+      if (data) dispatch(addToast(data));
     };
 
     wsClient.on('team_chat', onTeamChat);
     return () => {
       wsClient.off('team_chat', onTeamChat);
     };
-  }, [addTeamChatToast]);
+  }, [dispatch]);
 }

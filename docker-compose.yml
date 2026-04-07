@@ -39,6 +39,10 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/phemex_ai_trader
       REDIS_URL: redis://redis:6379/0
+      MAIL_SERVER_DOMAIN: wx-microservice-email.herokuapp.com
+      MAIL_SERVER_API_KEY: 1ab2c3d4e5f61ab2c3d4e5f6
+      MAIL_TO_ADDRESS: trading@webnostix.co.uk
+      MAIL_FROM_ADDRESS: trading@phemex-ai-trader.com
     depends_on:
       db:
         condition: service_healthy

@@ -163,6 +163,10 @@ class Position(Base):
     current_price = Column(Float, nullable=True)
     unrealized_pnl = Column(Float, default=0.0)
     realized_pnl = Column(Float, default=0.0)
+    stop_loss_price = Column(Float, nullable=True)
+    take_profit_price = Column(Float, nullable=True)
+    highest_price = Column(Float, nullable=True)
+    trailing_stop_pct = Column(Float, nullable=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
@@ -431,8 +435,76 @@ class DailyReport(Base):
     )
 
 
+class BacktestRecord(Base):
+    """Persisted backtest results for historical tracking and strategy evaluation."""
+    __tablename__ = "backtest_records"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    agent_id = Column(String(36), ForeignKey("agents.id", ondelete="SET NULL"), nullable=True)
+    symbol = Column(String(20), nullable=False)
+    strategy = Column(String(50), nullable=False)
+    interval = Column(String(10), default="1h")
+
+    # Config params
+    config_params = Column(JSON, default=dict)  # {initial_balance, position_size_pct, stop_loss_pct, ...}
+
+    # Results
+    total_trades = Column(Integer, default=0)
+    winning_trades = Column(Integer, default=0)
+    losing_trades = Column(Integer, default=0)
+    win_rate = Column(Float, default=0.0)
+    total_pnl = Column(Float, default=0.0)
+    net_pnl = Column(Float, default=0.0)
+    total_fees = Column(Float, default=0.0)
+    max_drawdown = Column(Float, default=0.0)
+    sharpe_ratio = Column(Float, default=0.0)
+    avg_trade_pnl = Column(Float, default=0.0)
+    profit_factor = Column(Float, default=0.0)
+
+    # Extended data (stored as JSON for flexibility)
+    equity_curve = Column(JSON, default=list)
+    trades_data = Column(JSON, default=list)  # individual trade records
+
+    # Source context
+    source = Column(String(30), default="manual")  # manual, bootstrap, optimization, strategy_review
+    candle_count = Column(Integer, default=0)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("idx_backtest_agent_id", "agent_id"),
+        Index("idx_backtest_strategy", "strategy"),
+        Index("idx_backtest_created_at", "created_at"),
+    )
+
+
+class StrategyAction(Base):
+    """Log of automated strategy actions taken by fund manager + technical analyst cooperation."""
+    __tablename__ = "strategy_actions"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    action = Column(String(30), nullable=False)  # create_agent, disable_agent, enable_agent, adjust_params
+    target_agent_id = Column(String(36), nullable=True)
+    target_agent_name = Column(String(100), nullable=True)
+    strategy_type = Column(String(50), nullable=True)
+    params = Column(JSON, default=dict)
+    rationale = Column(Text, nullable=True)
+    initiated_by = Column(String(50), default="fund_manager")  # fund_manager, technical_analyst, cio
+    confluence_score = Column(Float, nullable=True)
+    backtest_net_pnl = Column(Float, nullable=True)
+    executed = Column(Boolean, default=False)
+    execution_result = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("idx_strategy_action_created_at", "created_at"),
+        Index("idx_strategy_action_action", "action"),
+    )
+
+
 from app.models import User, ApiKey, TradingPair, Agent, AgentPair, AgentSignal, Trade, Position, Balance, Kline
 from app.models import SignalType, OrderSide, OrderStatus
 from app.models import AgentRunRecord, AgentMetricRecord
 from app.models import AnalystReport, PortfolioDecision, RiskAssessmentRecord, ExecutionPlan, CIOReport, AgentDecision
 from app.models import TeamChatMessageRecord, DailyReport
+from app.models import BacktestRecord, StrategyAction

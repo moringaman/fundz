@@ -189,9 +189,9 @@ class FundManagerAgent:
             strategy_type = agent.get('strategy_type', 'momentum')
             metrics = metrics_by_id.get(agent_id, {})
             
-            win_rate = metrics.get('win_rate', 0)
-            total_pnl = metrics.get('total_pnl', 0)
-            total_runs = metrics.get('total_runs', 0)
+            win_rate = metrics.get('win_rate', 0) or 0
+            total_pnl = metrics.get('total_pnl', 0) or 0
+            total_runs = metrics.get('total_runs', 0) or 0
             last_run = metrics.get('last_run')
             
             score = 0
@@ -268,19 +268,33 @@ class FundManagerAgent:
         agents: List[Dict],
         agent_metrics: List[Dict],
         market_condition: MarketCondition,
-        total_capital: float = 10000
+        total_capital: float = 10000,
+        confluence_scores: Optional[Dict[str, Dict]] = None,
     ) -> AllocationDecision:
         """
         Use LLM to make intelligent capital allocation decisions
-        based on agent performance and market conditions
+        based on agent performance, market conditions, and technical confluence.
         """
         try:
             metrics_by_id = {m['agent_id']: m for m in agent_metrics}
 
             # Build context for LLM
             context = self._build_allocation_context(
-                agents, metrics_by_id, market_condition, total_capital
+                agents, metrics_by_id, market_condition, total_capital,
+                confluence_scores=confluence_scores,
             )
+
+            confluence_section = ""
+            if confluence_scores:
+                conf_lines = []
+                for sym, data in confluence_scores.items():
+                    conf_lines.append(
+                        f"  {sym}: signal={data.get('signal','?')}, "
+                        f"confluence={data.get('score',0):.0%}, "
+                        f"alignment={data.get('alignment','?')}, "
+                        f"patterns={data.get('patterns',0)}"
+                    )
+                confluence_section = "\nTECHNICAL CONFLUENCE (from Technical Analyst):\n" + "\n".join(conf_lines) + "\n"
 
             prompt = f"""You are a professional portfolio manager allocating capital across trading agents.
 
@@ -289,19 +303,21 @@ AVAILABLE CAPITAL: ${total_capital:,.0f}
 MARKET CONDITIONS:
 Trend: {market_condition.trend}
 Volatility: {market_condition.volatility}
-RSI: {market_condition.rsi:.1f}
+RSI: {(market_condition.rsi or 50):.1f}
 Momentum: {market_condition.momentum}
 Recommendation: {market_condition.recommendation}
-
+{confluence_section}
 AGENT PERFORMANCE DATA:
 {context}
 
 ALLOCATION RULES:
 1. Allocate more capital to agents that perform well in current market
-2. Reduce allocation to underperforming agents
+2. Reduce allocation to underperforming agents, but never below 5%
 3. Consider market regime (bullish/bearish/sideways)
 4. Diversify across strategies
-5. Minimum 5% for enabled agents, maximum 40% per agent
+5. Minimum 5% for every enabled agent (new agents need trades to build history)
+6. Maximum 40% per agent
+7. Prefer agents whose strategy aligns with technical confluence (high confluence = favorable)
 
 Determine optimal capital allocation. Return JSON:
 {{
@@ -316,21 +332,54 @@ Determine optimal capital allocation. Return JSON:
 
             try:
                 data = json.loads(response.content)
+                alloc_pct = data.get('allocation_pct', {})
+
+                # Enforce minimum 5% floor — LLMs sometimes ignore the instruction
+                min_pct = 5.0
+                agent_ids = [a['id'] for a in agents]
+                for aid in agent_ids:
+                    if alloc_pct.get(aid, 0) < min_pct:
+                        alloc_pct[aid] = min_pct
+                # Re-normalise so they sum to ~100
+                total_pct = sum(alloc_pct.get(aid, 0) for aid in agent_ids)
+                if total_pct > 0:
+                    scale = 100 / total_pct
+                    alloc_pct = {aid: alloc_pct.get(aid, 0) * scale for aid in agent_ids}
+
+                allocation = {aid: total_capital * alloc_pct.get(aid, 0) / 100 for aid in agent_ids}
+
                 return AllocationDecision(
                     timestamp=datetime.utcnow(),
-                    allocation=data.get('allocation', {}),
-                    allocation_pct=data.get('allocation_pct', {}),
+                    allocation=allocation,
+                    allocation_pct=alloc_pct,
                     reasoning=data.get('reasoning', ''),
                     based_on_market_condition=market_condition,
                     expected_return_pct=float(data.get('expected_return_pct', 0))
                 )
             except (json.JSONDecodeError, ValueError):
-                # Fallback to simple allocation
+                # Fallback: performance-weighted allocation without LLM
+                logger.warning("LLM allocation parse failed, using performance-weighted fallback")
+                scores = {}
+                for a in agents:
+                    aid = a['id']
+                    m = metrics_by_id.get(aid, {})
+                    wr = m.get('win_rate', 0.5) or 0.5
+                    pnl = m.get('total_pnl', 0) or 0
+                    pnl_factor = min(max(pnl / 1000 + 0.5, 0), 1.0)
+                    scores[aid] = max(wr * 0.6 + pnl_factor * 0.4, 0.1)
+
+                total_score = sum(scores.values()) or 1
+                alloc_pct = {aid: max((s / total_score) * 100, 5.0) for aid, s in scores.items()}
+                norm = sum(alloc_pct.values())
+                if norm > 0:
+                    alloc_pct = {aid: p / norm * 100 for aid, p in alloc_pct.items()}
+                allocation = {aid: total_capital * alloc_pct.get(aid, 0) / 100 for aid in alloc_pct}
+
                 return AllocationDecision(
                     timestamp=datetime.utcnow(),
-                    allocation={a['id']: total_capital / len(agents) for a in agents},
-                    allocation_pct={a['id']: 100 / len(agents) for a in agents},
-                    reasoning="LLM decision failed, using equal allocation",
+                    allocation=allocation,
+                    allocation_pct=alloc_pct,
+                    reasoning="Performance-weighted allocation (LLM response parsing failed)",
                     based_on_market_condition=market_condition
                 )
 
@@ -499,7 +548,8 @@ Determine optimal capital allocation. Return JSON:
         agents: List[Dict],
         metrics_by_id: Dict,
         market_condition: MarketCondition,
-        total_capital: float
+        total_capital: float,
+        confluence_scores: Optional[Dict[str, Dict]] = None,
     ) -> str:
         """Build context string for LLM allocation decision"""
         lines = []
@@ -507,13 +557,28 @@ Determine optimal capital allocation. Return JSON:
         for agent in agents:
             agent_id = agent['id']
             metrics = metrics_by_id.get(agent_id, {})
+            total_runs = metrics.get('total_runs', 0)
+            pairs = agent.get('trading_pairs', agent.get('config', {}).get('trading_pairs', []))
+            primary_symbol = pairs[0] if pairs else 'BTCUSDT'
 
             lines.append(f"\n{agent.get('name', agent_id)}:")
             lines.append(f"  Strategy: {agent.get('strategy_type', 'unknown')}")
-            lines.append(f"  Win Rate: {metrics.get('win_rate', 0):.1%}")
-            lines.append(f"  Total P&L: ${metrics.get('total_pnl', 0):.2f}")
-            lines.append(f"  Runs: {metrics.get('total_runs', 0)}")
-            lines.append(f"  Current Allocation: {agent.get('allocation_percentage', 10):.1f}%")
+            lines.append(f"  Symbol: {primary_symbol}")
+            if total_runs == 0:
+                lines.append(f"  Status: NEW AGENT (no live trades yet — metrics from backtest)")
+            lines.append(f"  Win Rate: {(metrics.get('win_rate', 0.5) or 0):.1%}")
+            lines.append(f"  Total P&L: ${(metrics.get('total_pnl', 0) or 0):.2f}")
+            lines.append(f"  Runs: {total_runs}")
+            lines.append(f"  Current Allocation: {(agent.get('allocation_percentage', 10) or 0):.1f}%")
+
+            # Add confluence info if available
+            if confluence_scores and primary_symbol in confluence_scores:
+                conf = confluence_scores[primary_symbol]
+                lines.append(
+                    f"  Technical Confluence: {conf.get('score', 0):.0%} "
+                    f"({conf.get('alignment', '?')} alignment, "
+                    f"{conf.get('patterns', 0)} patterns)"
+                )
 
         return "\n".join(lines)
 
@@ -556,11 +621,12 @@ Determine optimal capital allocation. Return JSON:
             total_runs = metrics.get('total_runs', 0)
             allocation_pct = agent.get('allocation_percentage', 10)
             
-            score = win_rate * 100
+            # New agents default to 50 (neutral). Never multiply by 0.
+            score = max(win_rate, 0.3) * 100
             if total_runs > 10:
                 score *= 1.2
             elif total_runs < 3:
-                score *= 0.8
+                score = max(score, 30)  # floor at 30 so new agents get allocation
             
             scores.append((agent_id, score, allocation_pct))
         

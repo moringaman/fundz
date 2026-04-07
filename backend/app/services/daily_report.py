@@ -71,6 +71,11 @@ class DailyReportService:
         worst = leaderboard[-1] if leaderboard else None
 
         portfolio_value = sum(b.get("value_usd", 0) for b in balance_data)
+        # Include unrealized P&L from open positions
+        unrealized_from_positions = sum(
+            p.get("unrealized_pnl", 0) or 0 for p in position_data
+        )
+        portfolio_value += unrealized_from_positions
 
         report = {
             "report_date": date_str,
@@ -157,14 +162,14 @@ class DailyReportService:
     async def _gather_positions(self) -> list:
         try:
             from app.services.paper_trading import paper_trading
-            positions = await paper_trading.get_positions()
+            positions = await paper_trading.get_positions_live()
             return [
                 {
-                    "symbol": getattr(p, "symbol", ""),
-                    "side": str(getattr(p, "side", "")),
-                    "quantity": float(getattr(p, "quantity", 0)),
-                    "entry_price": float(getattr(p, "entry_price", 0)),
-                    "unrealized_pnl": float(getattr(p, "unrealized_pnl", 0)),
+                    "symbol": p.get("symbol", ""),
+                    "side": p.get("side", ""),
+                    "quantity": p.get("quantity", 0),
+                    "entry_price": p.get("entry_price", 0),
+                    "unrealized_pnl": p.get("unrealized_pnl", 0),
                 }
                 for p in positions
             ]
@@ -176,15 +181,33 @@ class DailyReportService:
         try:
             from app.services.paper_trading import paper_trading
             balances = await paper_trading.get_all_balances()
-            return [
-                {
-                    "asset": getattr(b, "asset", ""),
-                    "available": float(getattr(b, "available", 0)),
-                    "locked": float(getattr(b, "locked", 0)),
-                    "value_usd": float(getattr(b, "available", 0)),  # simplified
-                }
-                for b in balances
-            ]
+
+            results = []
+            for b in balances:
+                asset = getattr(b, "asset", "")
+                available = float(getattr(b, "available", 0))
+                locked = float(getattr(b, "locked", 0))
+                total_held = available + locked
+
+                if asset == "USDT":
+                    value_usd = total_held
+                elif total_held > 0:
+                    # Convert to USD using live price
+                    try:
+                        price = await paper_trading.fetch_current_price(f"{asset}USDT")
+                        value_usd = total_held * price if price > 0 else 0.0
+                    except Exception:
+                        value_usd = 0.0
+                else:
+                    value_usd = 0.0
+
+                results.append({
+                    "asset": asset,
+                    "available": available,
+                    "locked": locked,
+                    "value_usd": value_usd,
+                })
+            return results
         except Exception as e:
             logger.error(f"Daily report – balances gather failed: {e}")
             return []
@@ -264,6 +287,7 @@ class DailyReportService:
                     warnings += 1
 
             lines = [f"{count} team messages exchanged today."]
+            _ensure_profiles_loaded()
             for role, msgs in by_role.items():
                 profile = AGENT_PROFILES.get(role, {"title": role})
                 title = profile.get("title", role)
@@ -384,7 +408,7 @@ class DailyReportService:
 
 
 # Import agent profiles for discussion summary
-from app.services.team_chat import AGENT_PROFILES
+from app.services.team_chat import AGENT_PROFILES, _ensure_profiles_loaded
 
 # Singleton
 daily_report_service = DailyReportService()

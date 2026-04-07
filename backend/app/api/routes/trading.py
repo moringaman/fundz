@@ -162,7 +162,7 @@ async def get_positions(db: AsyncSession = Depends(get_db)):
         current_prices = {}
         for symbol in ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']:  # Add your tracked symbols
             ticker = await phemex_client.get_ticker(symbol)
-            current_prices[symbol] = float(ticker.get('result', {}).get('closeRp', 0)) / 100000
+            current_prices[symbol] = float(ticker.get('result', {}).get('closeRp', 0))
     except Exception as e:
         current_prices = {}
         print(f"Error fetching current prices: {e}")

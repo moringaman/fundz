@@ -346,7 +346,7 @@ Return JSON: {{"regime": "...", "regime_confidence": 0.0-1.0, "sentiment": "..."
     ) -> str:
         """Build detailed reasoning for analysis"""
         lines = [
-            f"Market Regime: {regime.regime} (confidence: {regime.regime_confidence:.1%})",
+            f"Market Regime: {regime.regime} (confidence: {(regime.regime_confidence or 0):.1%})",
             f"Sentiment: {regime.sentiment}",
             f"Volatility: {regime.volatility_regime}",
             f"Correlations: {regime.correlation_status}",
@@ -373,11 +373,11 @@ Return JSON: {{"regime": "...", "regime_confidence": 0.0-1.0, "sentiment": "..."
             price_change = data.get('price_change_24h', 0)
 
             context_lines.append(f"\n{symbol}:")
-            context_lines.append(f"  Price: ${data['current_price']:.2f}")
-            context_lines.append(f"  24h Change: {price_change:.2f}%")
-            context_lines.append(f"  RSI(14): {indicators.get('rsi', 50):.1f}")
-            context_lines.append(f"  SMA20: ${indicators.get('sma_20', 0):.2f}")
-            context_lines.append(f"  SMA50: ${indicators.get('sma_50', 0):.2f}")
+            context_lines.append(f"  Price: ${(data.get('current_price', 0) or 0):.2f}")
+            context_lines.append(f"  24h Change: {(price_change or 0):.2f}%")
+            context_lines.append(f"  RSI(14): {(indicators.get('rsi', 50) or 50):.1f}")
+            context_lines.append(f"  SMA20: ${(indicators.get('sma_20', 0) or 0):.2f}")
+            context_lines.append(f"  SMA50: ${(indicators.get('sma_50', 0) or 0):.2f}")
 
         return "\n".join(context_lines)
 

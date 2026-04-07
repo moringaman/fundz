@@ -126,76 +126,212 @@ class IndicatorService:
                 reasoning="Insufficient data for indicators"
             )
 
-        signals = []
-        confidences = []
-
+        strategy = config.get('strategy', 'momentum')
         rsi = indicators["rsi"]
         price = df["close"].iloc[-1]
-        
-        if rsi < 30:
-            signals.append(Signal.BUY)
-            confidences.append(0.8)
-            reasoning = f"RSI oversold at {rsi:.2f}"
-        elif rsi > 70:
-            signals.append(Signal.SELL)
-            confidences.append(0.8)
-            reasoning = f"RSI overbought at {rsi:.2f}"
+        bb_lower = indicators.get("bb_lower")
+        bb_upper = indicators.get("bb_upper")
+        bb_middle = indicators.get("bb_middle")
+        sma_20 = indicators.get("sma_20")
+        sma_50 = indicators.get("sma_50")
+        sma_200 = indicators.get("sma_200")
+        macd = indicators.get("macd")
+        macd_signal_val = indicators.get("macd_signal")
+        atr = indicators.get("atr")
 
-        bb_lower = indicators["bb_lower"]
-        bb_upper = indicators["bb_upper"]
-        
-        if bb_lower and price <= bb_lower:
-            signals.append(Signal.BUY)
-            confidences.append(0.7)
-            reasoning = f"Price at lower Bollinger Band"
-        elif bb_upper and price >= bb_upper:
-            signals.append(Signal.SELL)
-            confidences.append(0.7)
-            reasoning = f"Price at upper Bollinger Band"
+        signals: List[tuple] = []  # (Signal, weight, reasoning)
 
-        sma_20 = indicators["sma_20"]
-        sma_50 = indicators["sma_50"]
-        sma_200 = indicators["sma_200"]
-        
-        if sma_20 and sma_50:
-            if sma_20 > sma_50 and (not sma_200 or sma_50 > sma_200):
-                signals.append(Signal.BUY)
-                confidences.append(0.6)
-                reasoning = "Golden cross (SMA 20 > SMA 50)"
-            elif sma_20 < sma_50 and (not sma_200 or sma_50 < sma_200):
-                signals.append(Signal.SELL)
-                confidences.append(0.6)
-                reasoning = "Death cross (SMA 20 < SMA 50)"
-
-        macd = indicators["macd"]
-        macd_signal = indicators["macd_signal"]
-        
-        if macd and macd_signal:
-            if macd > macd_signal:
-                signals.append(Signal.BUY)
-                confidences.append(0.5)
-                reasoning = "MACD above signal line"
-            elif macd < macd_signal:
-                signals.append(Signal.SELL)
-                confidences.append(0.5)
-                reasoning = "MACD below signal line"
-
-        buy_count = signals.count(Signal.BUY)
-        sell_count = signals.count(Signal.SELL)
-        
-        if buy_count > sell_count:
-            final_signal = Signal.BUY
-        elif sell_count > buy_count:
-            final_signal = Signal.SELL
+        if strategy == "momentum":
+            signals = self._momentum_signals(
+                rsi, price, sma_20, sma_50, sma_200, macd, macd_signal_val, atr
+            )
+        elif strategy == "mean_reversion":
+            signals = self._mean_reversion_signals(
+                rsi, price, bb_lower, bb_upper, bb_middle, sma_20
+            )
+        elif strategy == "breakout":
+            signals = self._breakout_signals(
+                rsi, price, bb_lower, bb_upper, sma_20, sma_50, atr, macd, macd_signal_val
+            )
         else:
-            final_signal = Signal.HOLD
+            signals = self._default_signals(
+                rsi, price, bb_lower, bb_upper, sma_20, sma_50, macd, macd_signal_val
+            )
 
-        confidence = max(confidences) if confidences else 0.0
+        if not signals:
+            return TradingSignal(
+                signal=Signal.HOLD,
+                confidence=0.0,
+                price=price,
+                indicators=indicators,
+                reasoning=f"No clear {strategy} signal"
+            )
+
+        buy_weight = sum(w for s, w, _ in signals if s == Signal.BUY)
+        sell_weight = sum(w for s, w, _ in signals if s == Signal.SELL)
+        total_weight = buy_weight + sell_weight
+
+        if total_weight == 0:
+            final_signal = Signal.HOLD
+            confidence = 0.0
+            reasoning = "No weighted signals"
+        elif buy_weight > sell_weight:
+            final_signal = Signal.BUY
+            confidence = min(buy_weight / max(total_weight, 1), 1.0)
+            reasoning = "; ".join(r for s, _, r in signals if s == Signal.BUY)
+        elif sell_weight > buy_weight:
+            final_signal = Signal.SELL
+            confidence = min(sell_weight / max(total_weight, 1), 1.0)
+            reasoning = "; ".join(r for s, _, r in signals if s == Signal.SELL)
+        else:
+            # Tie-break: use RSI direction
+            if rsi and rsi < 50:
+                final_signal = Signal.BUY
+                confidence = 0.35
+                reasoning = "Tie-broken by RSI < 50 (slight bullish lean)"
+            elif rsi and rsi > 50:
+                final_signal = Signal.SELL
+                confidence = 0.35
+                reasoning = "Tie-broken by RSI > 50 (slight bearish lean)"
+            else:
+                final_signal = Signal.HOLD
+                confidence = 0.0
+                reasoning = "Perfect signal tie, staying neutral"
 
         return TradingSignal(
             signal=final_signal,
-            confidence=confidence,
+            confidence=round(confidence, 3),
             price=price,
             indicators=indicators,
             reasoning=reasoning
         )
+
+    def _momentum_signals(self, rsi, price, sma_20, sma_50, sma_200, macd, macd_signal_val, atr):
+        """Momentum: follow the trend, wider RSI bands, heavier SMA weighting."""
+        signals = []
+
+        # Trend direction via SMAs (primary momentum indicator)
+        if sma_20 and sma_50:
+            if price > sma_20 > sma_50:
+                signals.append((Signal.BUY, 0.4, "Strong uptrend: price > SMA20 > SMA50"))
+            elif price > sma_20 and sma_20 > sma_50 * 0.99:
+                signals.append((Signal.BUY, 0.25, "Uptrend forming: price above SMA20"))
+            elif price < sma_20 < sma_50:
+                signals.append((Signal.SELL, 0.4, "Strong downtrend: price < SMA20 < SMA50"))
+            elif price < sma_20 and sma_20 < sma_50 * 1.01:
+                signals.append((Signal.SELL, 0.25, "Downtrend forming: price below SMA20"))
+
+        # RSI momentum (not just extremes)
+        if rsi is not None:
+            if rsi < 40:
+                signals.append((Signal.BUY, 0.3 if rsi < 30 else 0.15, f"RSI momentum buy ({rsi:.1f})"))
+            elif rsi > 60:
+                signals.append((Signal.SELL, 0.3 if rsi > 70 else 0.15, f"RSI momentum sell ({rsi:.1f})"))
+
+        # MACD crossover
+        if macd is not None and macd_signal_val is not None:
+            diff = macd - macd_signal_val
+            if diff > 0:
+                signals.append((Signal.BUY, 0.2, "MACD bullish"))
+            elif diff < 0:
+                signals.append((Signal.SELL, 0.2, "MACD bearish"))
+
+        return signals
+
+    def _mean_reversion_signals(self, rsi, price, bb_lower, bb_upper, bb_middle, sma_20):
+        """Mean reversion: buy oversold, sell overbought, wider trigger zones."""
+        signals = []
+
+        # RSI mean reversion (wider bands than momentum)
+        if rsi is not None:
+            if rsi < 35:
+                signals.append((Signal.BUY, 0.4 if rsi < 25 else 0.3, f"RSI oversold for reversion ({rsi:.1f})"))
+            elif rsi > 65:
+                signals.append((Signal.SELL, 0.4 if rsi > 75 else 0.3, f"RSI overbought for reversion ({rsi:.1f})"))
+
+        # Bollinger Band reversion (proximity, not just touching)
+        if bb_lower and bb_upper and bb_middle:
+            bb_range = bb_upper - bb_lower
+            if bb_range > 0:
+                position_in_band = (price - bb_lower) / bb_range
+                if position_in_band < 0.15:
+                    signals.append((Signal.BUY, 0.35, f"Price near lower BB ({position_in_band:.0%} of range)"))
+                elif position_in_band < 0.30:
+                    signals.append((Signal.BUY, 0.15, f"Price in lower BB zone ({position_in_band:.0%})"))
+                elif position_in_band > 0.85:
+                    signals.append((Signal.SELL, 0.35, f"Price near upper BB ({position_in_band:.0%} of range)"))
+                elif position_in_band > 0.70:
+                    signals.append((Signal.SELL, 0.15, f"Price in upper BB zone ({position_in_band:.0%})"))
+
+        # Price vs SMA20 deviation
+        if sma_20 and sma_20 > 0:
+            deviation = (price - sma_20) / sma_20
+            if deviation < -0.02:
+                signals.append((Signal.BUY, 0.2, f"Price {abs(deviation):.1%} below SMA20"))
+            elif deviation > 0.02:
+                signals.append((Signal.SELL, 0.2, f"Price {deviation:.1%} above SMA20"))
+
+        return signals
+
+    def _breakout_signals(self, rsi, price, bb_lower, bb_upper, sma_20, sma_50, atr, macd, macd_signal_val):
+        """Breakout: detect range breaks with volume/volatility confirmation."""
+        signals = []
+
+        # Bollinger Band breakout (price outside bands = breakout)
+        if bb_upper and price > bb_upper:
+            signals.append((Signal.BUY, 0.35, "Price broke above upper BB — bullish breakout"))
+        elif bb_lower and price < bb_lower:
+            signals.append((Signal.SELL, 0.35, "Price broke below lower BB — bearish breakout"))
+
+        # SMA crossover breakout
+        if sma_20 and sma_50:
+            ratio = sma_20 / sma_50 if sma_50 else 1
+            if ratio > 1.01:
+                signals.append((Signal.BUY, 0.3, "SMA20 crossed above SMA50 — bullish breakout"))
+            elif ratio < 0.99:
+                signals.append((Signal.SELL, 0.3, "SMA20 crossed below SMA50 — bearish breakout"))
+
+        # RSI momentum confirmation
+        if rsi is not None:
+            if rsi > 55:
+                signals.append((Signal.BUY, 0.15, f"RSI confirms bullish momentum ({rsi:.1f})"))
+            elif rsi < 45:
+                signals.append((Signal.SELL, 0.15, f"RSI confirms bearish momentum ({rsi:.1f})"))
+
+        # MACD momentum
+        if macd is not None and macd_signal_val is not None:
+            if macd > macd_signal_val and macd > 0:
+                signals.append((Signal.BUY, 0.2, "MACD positive and above signal"))
+            elif macd < macd_signal_val and macd < 0:
+                signals.append((Signal.SELL, 0.2, "MACD negative and below signal"))
+
+        return signals
+
+    def _default_signals(self, rsi, price, bb_lower, bb_upper, sma_20, sma_50, macd, macd_signal_val):
+        """Balanced default strategy combining multiple signals."""
+        signals = []
+
+        if rsi is not None:
+            if rsi < 35:
+                signals.append((Signal.BUY, 0.3, f"RSI oversold ({rsi:.1f})"))
+            elif rsi > 65:
+                signals.append((Signal.SELL, 0.3, f"RSI overbought ({rsi:.1f})"))
+
+        if bb_lower and price <= bb_lower:
+            signals.append((Signal.BUY, 0.25, "Price at lower Bollinger Band"))
+        elif bb_upper and price >= bb_upper:
+            signals.append((Signal.SELL, 0.25, "Price at upper Bollinger Band"))
+
+        if sma_20 and sma_50:
+            if sma_20 > sma_50:
+                signals.append((Signal.BUY, 0.2, "SMA20 > SMA50 (bullish)"))
+            else:
+                signals.append((Signal.SELL, 0.2, "SMA20 < SMA50 (bearish)"))
+
+        if macd is not None and macd_signal_val is not None:
+            if macd > macd_signal_val:
+                signals.append((Signal.BUY, 0.15, "MACD bullish"))
+            else:
+                signals.append((Signal.SELL, 0.15, "MACD bearish"))
+
+        return signals

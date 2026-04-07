@@ -155,6 +155,8 @@ async def get_paper_orders(symbol: Optional[str] = None, limit: int = 50):
             "side": o.side.value,
             "quantity": o.quantity,
             "price": o.price,
+            "total": o.total,
+            "fee": o.fee or 0,
             "status": o.status.value,
             "created_at": o.created_at.isoformat(),
             "agent_id": o.agent_id,
@@ -165,20 +167,7 @@ async def get_paper_orders(symbol: Optional[str] = None, limit: int = 50):
 
 @router.get("/positions")
 async def get_paper_positions(symbol: Optional[str] = None):
-    positions = await paper_trading.get_positions(symbol)
-    return [
-        {
-            "symbol": pos.symbol,
-            "side": pos.side.value,
-            "quantity": pos.quantity,
-            "entry_price": pos.entry_price,
-            "current_price": pos.current_price,
-            "unrealized_pnl": pos.unrealized_pnl or 0,
-            "updated_at": pos.updated_at.isoformat() if pos.updated_at else None,
-            "agent_id": pos.agent_id,
-        }
-        for pos in positions
-    ]
+    return await paper_trading.get_positions_live(symbol)
 
 
 @router.get("/pnl")

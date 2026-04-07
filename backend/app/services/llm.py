@@ -263,14 +263,14 @@ Provide your analysis in JSON format:
 
     def _build_market_analysis_prompt(self, market_data: Dict[str, Any]) -> str:
         symbol = market_data.get('symbol', 'N/A')
-        price = market_data.get('price', 0)
-        change = market_data.get('price_change_percent', 0)
-        volume = market_data.get('volume', 0)
-        rsi = market_data.get('rsi')
-        macd = market_data.get('macd')
-        macd_signal = market_data.get('macd_signal')
-        sma20 = market_data.get('sma_20')
-        sma50 = market_data.get('sma_50')
+        price = market_data.get('price', 0) or 0
+        change = market_data.get('price_change_percent', 0) or 0
+        volume = market_data.get('volume', 0) or 0
+        rsi = market_data.get('rsi', 50) or 50
+        macd = market_data.get('macd', 0) or 0
+        macd_signal = market_data.get('macd_signal', 0) or 0
+        sma20 = market_data.get('sma_20', 0) or 0
+        sma50 = market_data.get('sma_50', 0) or 0
 
         return f"""Professional market structure analysis for {symbol}.
 
@@ -311,13 +311,13 @@ Return JSON: {{"trend": "strong_bullish|bullish|neutral|bearish|strong_bearish",
 """
 
     def _build_signal_prompt(self, indicators: Dict[str, Any], price_data: Dict[str, Any]) -> str:
-        rsi = indicators.get('rsi')
-        macd = indicators.get('macd')
-        macd_signal = indicators.get('macd_signal')
-        bb_upper = indicators.get('bb_upper')
-        bb_middle = indicators.get('bb_middle')
-        bb_lower = indicators.get('bb_lower')
-        atr = indicators.get('atr')
+        rsi = indicators.get('rsi', 50) or 50
+        macd = indicators.get('macd', 0) or 0
+        macd_signal = indicators.get('macd_signal', 0) or 0
+        bb_upper = indicators.get('bb_upper', 0) or 0
+        bb_middle = indicators.get('bb_middle', 0) or 0
+        bb_lower = indicators.get('bb_lower', 0) or 0
+        atr = indicators.get('atr', 0) or 0
 
         return f"""You are a professional cryptocurrency trading analyst. Generate a precise trading signal using technical analysis.
 
@@ -358,12 +358,12 @@ Return JSON: {{"action": "buy|sell|hold", "confidence": 0.0-1.0, "reasoning": "b
 """
 
     def _build_strategy_evaluation_prompt(self, strategy_config: Dict[str, Any], performance: Dict[str, Any]) -> str:
-        total_trades = performance.get('total_trades', 0)
-        win_rate = performance.get('win_rate', 0)
-        total_pnl = performance.get('total_pnl', 0)
-        avg_win = performance.get('avg_win', 0)
-        avg_loss = performance.get('avg_loss', 0)
-        profit_factor = performance.get('profit_factor', 0)
+        total_trades = performance.get('total_trades', 0) or 0
+        win_rate = performance.get('win_rate', 0) or 0
+        total_pnl = performance.get('total_pnl', 0) or 0
+        avg_win = performance.get('avg_win', 0) or 0
+        avg_loss = performance.get('avg_loss', 0) or 0
+        profit_factor = performance.get('profit_factor', 0) or 0
 
         return f"""Evaluate this trading strategy's performance using professional metrics.
 

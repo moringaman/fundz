@@ -112,8 +112,18 @@ export function Chart({ data, symbol, timeframe = '1h', onTimeframeChange }: Cha
       const lastVol = volumeData[volumeData.length - 1];
       candleSeriesRef.current.update(last);
       volumeSeriesRef.current.update(lastVol);
+    } else if (prevLen > 0 && newLen === prevLen + 1) {
+      // One new bar appended — update the previous last bar then add the new one.
+      const prev = candleData[candleData.length - 2];
+      const last = candleData[candleData.length - 1];
+      const prevVol = volumeData[volumeData.length - 2];
+      const lastVol = volumeData[volumeData.length - 1];
+      candleSeriesRef.current.update(prev);
+      candleSeriesRef.current.update(last);
+      volumeSeriesRef.current.update(prevVol);
+      volumeSeriesRef.current.update(lastVol);
     } else {
-      // New dataset or different length — full reload.
+      // New dataset or major length change — full reload.
       candleSeriesRef.current.setData(candleData);
       volumeSeriesRef.current.setData(volumeData);
       if (chartRef.current) {

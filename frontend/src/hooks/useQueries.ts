@@ -223,6 +223,38 @@ export function useFundTechnicalAnalysis(symbol = 'BTCUSDT') {
   });
 }
 
+export function useFundTechnicalAnalysisBatch() {
+  return useQuery({
+    queryKey: ['fundTechnicalAnalysisBatch'],
+    queryFn: () => fetch('/api/fund/technical-analysis/batch').then(r => r.json()),
+    staleTime: 60_000,
+    refetchInterval: 300_000,
+  });
+}
+
+// ─── Strategy Actions (FM + TA cooperation) ──────────────────────────────────
+export function useStrategyActions(limit = 20) {
+  return useQuery({
+    queryKey: ['strategyActions', limit],
+    queryFn: () => fetch(`/api/fund/strategy-actions?limit=${limit}`).then(r => r.json()),
+    staleTime: 60_000,
+    refetchInterval: 300_000,
+  });
+}
+
+// ─── Backtest History ────────────────────────────────────────────────────────
+export function useBacktestHistory(agentId?: string, limit = 20) {
+  return useQuery({
+    queryKey: ['backtestHistory', agentId, limit],
+    queryFn: () => {
+      const params = new URLSearchParams({ limit: String(limit) });
+      if (agentId) params.set('agent_id', agentId);
+      return fetch(`/api/backtest/history?${params}`).then(r => r.json());
+    },
+    staleTime: 120_000,
+  });
+}
+
 // ─── Settings ────────────────────────────────────────────────────────────────
 export function useSettings() {
   return useQuery({

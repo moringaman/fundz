@@ -38,45 +38,51 @@ class ChatMessage:
         return asdict(self)
 
 
-# Agent profile lookup
-AGENT_PROFILES: Dict[str, Dict[str, str]] = {
-    "research_analyst": {
-        "name": "Alex Chen",
-        "role": "research_analyst",
-        "title": "Research Analyst",
-        "avatar": "📊",
-    },
-    "portfolio_manager": {
-        "name": "Sarah Kim",
-        "role": "portfolio_manager",
-        "title": "Portfolio Manager",
-        "avatar": "💼",
-    },
-    "risk_manager": {
-        "name": "Marcus Webb",
-        "role": "risk_manager",
-        "title": "Risk Manager",
-        "avatar": "🛡️",
-    },
-    "execution_coordinator": {
-        "name": "Priya Patel",
-        "role": "execution_coordinator",
-        "title": "Execution Coordinator",
-        "avatar": "⚡",
-    },
-    "cio": {
-        "name": "David Nakamura",
-        "role": "cio",
-        "title": "Chief Investment Officer",
-        "avatar": "🎯",
-    },
-    "technical_analyst": {
-        "name": "Olivia Torres",
-        "role": "technical_analyst",
-        "title": "Technical Analyst",
-        "avatar": "📈",
-    },
+# Map chat role keys to LLMRegistry keys (they differ for CIO)
+_ROLE_TO_REGISTRY: Dict[str, str] = {
+    "research_analyst": "research_analyst",
+    "portfolio_manager": "portfolio_manager",
+    "risk_manager": "risk_manager",
+    "execution_coordinator": "execution_coordinator",
+    "cio": "cio_agent",
+    "cio_agent": "cio_agent",
+    "technical_analyst": "technical_analyst",
 }
+
+# Emoji fallbacks keyed by registry role
+_ROLE_EMOJI: Dict[str, str] = {
+    "research_analyst": "🔬",
+    "technical_analyst": "📈",
+    "portfolio_manager": "💼",
+    "risk_manager": "🛡️",
+    "execution_coordinator": "⚡",
+    "cio_agent": "🎯",
+}
+
+
+def _get_agent_profile(agent_role: str) -> Dict[str, str]:
+    """Resolve agent profile from LLMRegistry (single source of truth)."""
+    from app.services.llm import LLMRegistry
+
+    registry_key = _ROLE_TO_REGISTRY.get(agent_role, agent_role)
+    info = LLMRegistry.get_agent_info(registry_key)
+    return {
+        "name": info.get("name", agent_role),
+        "role": agent_role,
+        "title": info.get("title", agent_role),
+        "avatar": _ROLE_EMOJI.get(registry_key, "🤖"),
+    }
+
+
+# Keep AGENT_PROFILES as a lazy cache so existing imports still work
+AGENT_PROFILES: Dict[str, Dict[str, str]] = {}
+
+
+def _ensure_profiles_loaded() -> None:
+    if AGENT_PROFILES:
+        return
+    for role in _ROLE_TO_REGISTRY:
+        AGENT_PROFILES[role] = _get_agent_profile(role)
 
 
 class TeamChatService:
@@ -103,9 +109,8 @@ class TeamChatService:
         mentions: Optional[List[str]] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> ChatMessage:
-        profile = AGENT_PROFILES.get(agent_role, {
-            "name": agent_role, "role": agent_role, "title": agent_role, "avatar": "🤖"
-        })
+        _ensure_profiles_loaded()
+        profile = AGENT_PROFILES.get(agent_role) or _get_agent_profile(agent_role)
         msg = ChatMessage(
             id=self._next_id(),
             agent_id=agent_role,
@@ -211,13 +216,13 @@ class TeamChatService:
 
             parts = [
                 f"Team, I've completed my market scan across {len(report.symbols_analyzed)} symbols.",
-                f"Market regime: **{regime.regime}** (confidence {regime.regime_confidence:.0%}).",
+                f"Market regime: **{regime.regime}** (confidence {(regime.regime_confidence or 0):.0%}).",
                 f"Sentiment is **{regime.sentiment}**, volatility is **{regime.volatility_regime}**.",
             ]
             if top_opp:
                 parts.append(
                     f"Top opportunity: **{top_opp.symbol}** — {top_opp.opportunity_type} setup "
-                    f"(confidence {top_opp.confidence:.0%}). {top_opp.reasoning[:100]}"
+                    f"(confidence {(top_opp.confidence or 0):.0%}). {top_opp.reasoning[:100]}"
                 )
             parts.append(f"My recommendation: **{report.analyst_recommendation}**.")
 
@@ -274,7 +279,7 @@ class TeamChatService:
                 tone = "All clear from risk — portfolio is within safe parameters."
 
             parts = [tone]
-            parts.append(f"Daily P&L: **${pnl:+.2f}**. Exposure: {exposure:.1f}% of capital.")
+            parts.append(f"Daily P&L: **${(pnl or 0):+.2f}**. Exposure: {(exposure or 0):.1f}% of capital.")
 
             recs = getattr(assessment, "recommendations", []) or []
             if recs:
@@ -305,7 +310,7 @@ class TeamChatService:
                 content = (
                     f"I have **{pending}** pending orders queued. "
                     f"Recommended action: **{action.replace('_', ' ')}**. "
-                    f"Estimated slippage: {plan.aggregate_slippage_estimate:.3f}%."
+                    f"Estimated slippage: {(plan.aggregate_slippage_estimate or 0):.3f}%."
                 )
 
             await self.add_message(
@@ -350,6 +355,69 @@ class TeamChatService:
             message_type="warning",
             metadata={"blocked_agent": agent_name, "reason": reason},
         )
+
+    async def log_strategy_review(self, review: Any) -> None:
+        """Log the FM + TA strategy review results in team chat."""
+        # Technical analyst speaks first about confluence
+        if review.confluence_scores:
+            symbols = list(review.confluence_scores.keys())[:3]
+            confluence_lines = []
+            for sym in symbols:
+                data = review.confluence_scores[sym]
+                confluence_lines.append(
+                    f"{sym}: {data.get('signal', 'hold')} "
+                    f"(confluence {data.get('score', 0):.0%}, "
+                    f"{data.get('patterns', 0)} patterns, "
+                    f"alignment: {data.get('alignment', '?')})"
+                )
+            await self.add_message(
+                agent_role="technical_analyst",
+                content=(
+                    "Strategy review — technical confluence report:\n"
+                    + "\n".join(confluence_lines)
+                ),
+                message_type="analysis",
+                mentions=["@portfolio_manager"],
+                metadata={"confluence_scores": review.confluence_scores},
+            )
+
+        # Portfolio manager speaks about evaluations and proposed actions
+        if review.agent_evaluations:
+            eval_lines = []
+            for ev in sorted(review.agent_evaluations, key=lambda e: e.get('combined_score', 0) or 0, reverse=True):
+                cs = ev.get('combined_score', 0) or 0
+                emoji = "🟢" if cs >= 0.6 else "🟡" if cs >= 0.35 else "🔴"
+                eval_lines.append(
+                    f"{emoji} {ev['agent_name']}: score {cs:.2f} "
+                    f"(perf {(ev.get('perf_score', 0) or 0):.2f}, fit {(ev.get('fit_score', 0) or 0):.2f}, "
+                    f"confluence {(ev.get('confluence', 0) or 0):.2f})"
+                )
+
+            actions_text = ""
+            if review.proposed_actions:
+                action_lines = []
+                for a in review.proposed_actions:
+                    name = a.target_agent_name or "new agent"
+                    action_lines.append(f"→ **{a.action}** {name}: {a.rationale[:100]}")
+                actions_text = "\n\nProposed actions:\n" + "\n".join(action_lines)
+
+            await self.add_message(
+                agent_role="portfolio_manager",
+                content=(
+                    "Strategy review — agent effectiveness:\n"
+                    + "\n".join(eval_lines[:6])
+                    + actions_text
+                ),
+                message_type="decision",
+                mentions=["@technical_analyst", "@cio"],
+                metadata={
+                    "evaluations": review.agent_evaluations,
+                    "proposed_actions": [
+                        {"action": a.action, "target": a.target_agent_name, "rationale": a.rationale}
+                        for a in review.proposed_actions
+                    ],
+                },
+            )
 
 
 # Singleton

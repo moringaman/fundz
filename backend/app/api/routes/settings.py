@@ -186,3 +186,22 @@ async def update_llm_config(req: LlmConfigUpdateRequest):
         "provider": app_settings.llm_provider,
         "model": app_settings.llm_model,
     }
+
+
+# ── Email test ────────────────────────────────────────────────────────────────
+
+@router.post("/test-email")
+async def send_test_email():
+    """Send a test daily summary email to verify the email pipeline."""
+    from app.services.email_service import email_service
+
+    if not app_settings.mail_server_api_key:
+        raise HTTPException(
+            status_code=400,
+            detail="MAIL_SERVER_API_KEY not configured",
+        )
+
+    ok = await email_service.send_test_email()
+    if ok:
+        return {"status": "ok", "message": f"Test email sent to {app_settings.mail_to_address}"}
+    raise HTTPException(status_code=502, detail="Email delivery failed — check server logs")

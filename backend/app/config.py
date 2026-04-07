@@ -41,5 +41,12 @@ class Settings(BaseSettings):
 
     rate_limit_per_minute: int = 120
 
+    # Email
+    mail_server_domain: str = "wx-microservice-email.herokuapp.com"
+    mail_server_api_key: Optional[str] = None
+    mail_to_address: str = "trading@webnostix.co.uk"
+    mail_from_address: str = "trading@phemex-ai-trader.com"
+    mail_daily_hour: int = 17  # 5pm
+
 
 settings = Settings()

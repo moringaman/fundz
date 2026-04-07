@@ -1,13 +1,22 @@
 import { useEffect, useRef } from 'react';
 import { wsClient } from '../lib/websocket';
-import { useAppStore } from '../lib/store';
 import { marketApi } from '../lib/api';
+import { useAppSelector, useAppDispatch } from '../store/hooks';
+import {
+  setKlines,
+  upsertKline,
+  setTicker,
+  setTickerForSymbol,
+  setIndicators,
+  setSignal,
+} from '../store/slices/marketSlice';
+import { store } from '../store';
 
-const FALLBACK_POLL_MS = 10_000;
-const FALLBACK_TIMEOUT_MS = 5_000;
+const FALLBACK_POLL_MS = 60_000;   // 60s (was 10s — too aggressive, causes redraws)
+const FALLBACK_TIMEOUT_MS = 10_000; // Wait 10s before starting fallback
 
 /**
- * Drives all market data into the Zustand store.
+ * Drives all market data into the Redux store.
  *
  * Strategy:
  *  1. On mount / symbol / timeframe change: fetch REST immediately as baseline.
@@ -16,18 +25,10 @@ const FALLBACK_TIMEOUT_MS = 5_000;
  *  4. When WS reconnects the polling stops.
  */
 export function useMarketStream(timeframe: string) {
-  const {
-    selectedSymbol,
-    wsStatus,
-    setKlines,
-    upsertKline,
-    setTicker,
-    setTickerForSymbol,
-    setIndicators,
-    setSignal,
-  } = useAppStore();
+  const selectedSymbol = useAppSelector((s) => s.market.selectedSymbol);
+  const wsStatus = useAppSelector((s) => s.ui.wsStatus);
+  const dispatch = useAppDispatch();
 
-  // ─── Initial REST fetch ───────────────────────────────────────────────────
   const restFetch = async () => {
     try {
       const klinesRes = await marketApi.getKlines(selectedSymbol, timeframe, 200);
@@ -42,7 +43,7 @@ export function useMarketStream(timeframe: string) {
           volume: parseFloat(k[7] as string) || 0,
         }))
         .sort((a, b) => a.time - b.time);
-      setKlines(klines);
+      dispatch(setKlines(klines));
     } catch {
       /* keep existing data */
     }
@@ -50,18 +51,18 @@ export function useMarketStream(timeframe: string) {
     try {
       const tickerRes = await marketApi.getTicker(selectedSymbol);
       const t = tickerRes.data?.result ?? {};
-      setTicker({
+      dispatch(setTicker({
         symbol: selectedSymbol,
-        lastPrice: parseFloat(t.closeRp ?? '0') / 100000,
-        priceChange: (parseFloat(t.closeRp ?? '0') - parseFloat(t.openRp ?? '0')) / 100000,
+        lastPrice: parseFloat(t.closeRp ?? '0'),
+        priceChange: parseFloat(t.closeRp ?? '0') - parseFloat(t.openRp ?? '0'),
         priceChangePercent:
           ((parseFloat(t.closeRp ?? '0') - parseFloat(t.openRp ?? '0')) /
             Math.max(parseFloat(t.openRp ?? '1'), 1)) *
           100,
-        high: parseFloat(t.highRp ?? '0') / 100000,
-        low: parseFloat(t.lowRp ?? '0') / 100000,
-        volume: parseFloat(t.turnoverRv ?? '0') / 100000,
-      });
+        high: parseFloat(t.highRp ?? '0'),
+        low: parseFloat(t.lowRp ?? '0'),
+        volume: parseFloat(t.turnoverRv ?? '0'),
+      }));
     } catch {
       /* keep existing data */
     }
@@ -69,48 +70,45 @@ export function useMarketStream(timeframe: string) {
     try {
       const indRes = await marketApi.getIndicators(selectedSymbol, timeframe, 200);
       if (indRes.data?.indicators) {
-        setIndicators(indRes.data.indicators);
-        setSignal(indRes.data.signal);
+        dispatch(setIndicators(indRes.data.indicators));
+        dispatch(setSignal(indRes.data.signal));
       }
     } catch {
       /* keep existing data */
     }
   };
 
-  // ─── Initial fetch on symbol / timeframe change ───────────────────────────
   useEffect(() => {
     restFetch();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedSymbol, timeframe]);
 
-  // ─── WebSocket message handlers ───────────────────────────────────────────
   useEffect(() => {
     const onKline = (msg: unknown) => {
-      const { data } = msg as { data: { time: number; open: number; high: number; low: number; close: number; volume: number } };
-      if (data) upsertKline(data);
+      const { symbol, data } = msg as { symbol?: string; data: { time: number; open: number; high: number; low: number; close: number; volume: number } };
+      // Only apply kline updates for the currently selected symbol
+      if (data && (!symbol || symbol === selectedSymbol)) dispatch(upsertKline(data));
     };
 
     const onTicker = (msg: unknown) => {
       const { symbol, data } = msg as { symbol: string; data: { lastPrice: number; priceChange: number; priceChangePercent: number; high: number; low: number; volume: number } };
       if (data) {
         const ticker = { symbol, ...data };
-        // Update all-symbols ticker map
-        setTickerForSymbol(symbol, ticker);
-        // Keep the single ticker for backward compatibility (selected symbol)
+        dispatch(setTickerForSymbol({ symbol, ticker }));
         if (symbol === selectedSymbol) {
-          setTicker(ticker);
+          dispatch(setTicker(ticker));
         }
       }
     };
 
     const onIndicators = (msg: unknown) => {
-      const { data } = msg as { data: Record<string, number | null> };
-      if (data) setIndicators(data as unknown as Parameters<typeof setIndicators>[0]);
+      const { symbol, data } = msg as { symbol?: string; data: Record<string, number | null> };
+      if (data && (!symbol || symbol === selectedSymbol)) dispatch(setIndicators(data as any));
     };
 
     const onSignal = (msg: unknown) => {
-      const { data } = msg as { data: { action: 'buy' | 'sell' | 'hold'; confidence: number; reasoning: string } };
-      if (data) setSignal(data);
+      const { symbol, data } = msg as { symbol?: string; data: { action: 'buy' | 'sell' | 'hold'; confidence: number; reasoning: string } };
+      if (data && (!symbol || symbol === selectedSymbol)) dispatch(setSignal(data));
     };
 
     wsClient.on('kline', onKline);
@@ -124,9 +122,8 @@ export function useMarketStream(timeframe: string) {
       wsClient.off('indicators', onIndicators);
       wsClient.off('signal', onSignal);
     };
-  }, [upsertKline, setTicker, setIndicators, setSignal]);
+  }, [dispatch, selectedSymbol]);
 
-  // ─── Fallback polling when WS is not connected ────────────────────────────
   const fallbackRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const fallbackTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -145,11 +142,10 @@ export function useMarketStream(timeframe: string) {
     if (wsStatus === 'connected') {
       clearFallback();
     } else {
-      // Start polling after a grace period if WS hasn't connected
       if (!fallbackTimeoutRef.current && !fallbackRef.current) {
         fallbackTimeoutRef.current = setTimeout(() => {
           fallbackTimeoutRef.current = null;
-          if (useAppStore.getState().wsStatus !== 'connected') {
+          if (store.getState().ui.wsStatus !== 'connected') {
             fallbackRef.current = setInterval(restFetch, FALLBACK_POLL_MS);
           }
         }, FALLBACK_TIMEOUT_MS);

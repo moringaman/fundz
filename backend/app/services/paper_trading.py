@@ -64,6 +64,9 @@ class PaperTradingService:
         quantity: float,
         price: Optional[float] = None,
         agent_id: Optional[str] = None,
+        stop_loss_price: Optional[float] = None,
+        take_profit_price: Optional[float] = None,
+        trailing_stop_pct: Optional[float] = None,
     ):
         """Place a paper trading order using real market price when price is omitted."""
         if not self._enabled:
@@ -72,7 +75,7 @@ class PaperTradingService:
         if price is None:
             try:
                 ticker = await self.phemex_client.get_ticker(symbol)
-                price = float(ticker.get("result", {}).get("closeRp", 0)) / 100000
+                price = float(ticker.get("result", {}).get("closeRp", 0))
             except Exception as e:
                 self.logger.error(f"Failed to fetch market price: {e}")
                 raise ValueError("Unable to fetch current market price")
@@ -144,6 +147,15 @@ class PaperTradingService:
                     ) / total_qty
                     position.quantity = total_qty
                     position.current_price = price
+                    # Update highest_price watermark
+                    if position.highest_price is None or price > position.highest_price:
+                        position.highest_price = price
+                    if stop_loss_price is not None:
+                        position.stop_loss_price = stop_loss_price
+                    if take_profit_price is not None:
+                        position.take_profit_price = take_profit_price
+                    if trailing_stop_pct is not None:
+                        position.trailing_stop_pct = trailing_stop_pct
                 else:
                     position = PaperPosition(
                         user_id="default-user",
@@ -155,6 +167,10 @@ class PaperTradingService:
                         current_price=price,
                         unrealized_pnl=0.0,
                         realized_pnl=0.0,
+                        stop_loss_price=stop_loss_price,
+                        take_profit_price=take_profit_price,
+                        highest_price=price,
+                        trailing_stop_pct=trailing_stop_pct,
                     )
                     db.add(position)
 
@@ -223,6 +239,44 @@ class PaperTradingService:
             result = await db.execute(query)
             return result.scalars().all()
 
+    async def get_positions_live(self, symbol: Optional[str] = None) -> list:
+        """Return open positions with live market prices and unrealized P&L."""
+        positions = await self.get_positions(symbol)
+        live_positions = []
+        for pos in positions:
+            try:
+                current_price = await self.fetch_current_price(pos.symbol)
+            except Exception:
+                current_price = pos.current_price or pos.entry_price or 0.0
+            entry = pos.entry_price or 0.0
+            unrealized = (current_price - entry) * (pos.quantity or 0)
+            unrealized_pct = ((current_price - entry) / entry * 100) if entry > 0 else 0.0
+            live_positions.append({
+                "symbol": pos.symbol,
+                "side": pos.side.value if hasattr(pos.side, 'value') else str(pos.side),
+                "quantity": pos.quantity,
+                "entry_price": entry,
+                "current_price": current_price,
+                "unrealized_pnl": round(unrealized, 4),
+                "unrealized_pnl_pct": round(unrealized_pct, 2),
+                "stop_loss_price": getattr(pos, 'stop_loss_price', None),
+                "take_profit_price": getattr(pos, 'take_profit_price', None),
+                "highest_price": getattr(pos, 'highest_price', None),
+                "trailing_stop_pct": getattr(pos, 'trailing_stop_pct', None),
+                "updated_at": pos.updated_at.isoformat() if pos.updated_at else None,
+                "agent_id": pos.agent_id,
+            })
+        return live_positions
+
+    async def update_highest_price(self, position_id: str, current_price: float):
+        """Update the highest price watermark for trailing stop tracking."""
+        async with get_async_session() as db:
+            pos = await db.get(PaperPosition, position_id)
+            if pos:
+                if pos.highest_price is None or current_price > pos.highest_price:
+                    pos.highest_price = current_price
+                    await db.commit()
+
     # ------------------------------------------------------------------
     # P&L
     # ------------------------------------------------------------------
@@ -246,6 +300,37 @@ class PaperTradingService:
         buy_volume = sum(o.quantity * o.price for o in orders if o.side == OrderSide.BUY)
         sell_volume = sum(o.quantity * o.price for o in orders if o.side == OrderSide.SELL)
 
+        # Realized P&L: sum of realized_pnl recorded when positions are closed
+        # Each sell records realized_pnl = (sell_price - avg_entry) * qty
+        realized_pnl = sum(pos.realized_pnl or 0 for pos in positions)
+        # Also count fully closed positions (no longer in DB) via sell orders
+        # matched against corresponding buys per symbol
+        symbol_buys: dict = {}
+        symbol_sells: dict = {}
+        for o in sorted(orders, key=lambda x: x.created_at or datetime.min):
+            sym = o.symbol
+            if o.side == OrderSide.BUY:
+                symbol_buys.setdefault(sym, []).append((o.quantity, o.price))
+            else:
+                symbol_sells.setdefault(sym, []).append((o.quantity, o.price))
+
+        closed_pnl = 0.0
+        for sym, sells in symbol_sells.items():
+            buys = list(symbol_buys.get(sym, []))
+            buy_idx = 0
+            buy_remaining = buys[0][0] if buys else 0
+            for sell_qty, sell_price in sells:
+                remaining = sell_qty
+                while remaining > 0 and buy_idx < len(buys):
+                    fill = min(remaining, buy_remaining)
+                    buy_price = buys[buy_idx][1]
+                    closed_pnl += fill * (sell_price - buy_price)
+                    remaining -= fill
+                    buy_remaining -= fill
+                    if buy_remaining <= 1e-12:
+                        buy_idx += 1
+                        buy_remaining = buys[buy_idx][0] if buy_idx < len(buys) else 0
+
         # Fetch live prices for unrealized PnL
         current_prices: dict = {}
         for pos in positions:
@@ -261,11 +346,9 @@ class PaperTradingService:
             for pos in positions
         )
 
-        realized_pnl = sell_volume - buy_volume
-
         return {
-            "total_pnl": realized_pnl + unrealized_pnl,
-            "realized_pnl": realized_pnl,
+            "total_pnl": closed_pnl + unrealized_pnl,
+            "realized_pnl": closed_pnl,
             "unrealized_pnl": unrealized_pnl,
             "buy_volume": buy_volume,
             "sell_volume": sell_volume,
@@ -277,7 +360,7 @@ class PaperTradingService:
         """Fetch live market price for a symbol."""
         try:
             ticker = await self.phemex_client.get_ticker(symbol)
-            return float(ticker.get("result", {}).get("closeRp", 0)) / 100000
+            return float(ticker.get("result", {}).get("closeRp", 0))
         except Exception as e:
             self.logger.error(f"Failed to fetch price for {symbol}: {e}")
             return 0.0

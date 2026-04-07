@@ -77,14 +77,16 @@ class TechnicalAnalyst:
             data_4h = self._parse_klines(klines_4h)
             data_1d = self._parse_klines(klines_1d)
 
-            if not data_1h or len(data_1h) < 50:
+            if data_1h is None or (isinstance(data_1h, pd.DataFrame) and data_1h.empty) or (not isinstance(data_1h, pd.DataFrame) and not data_1h):
+                return self._empty_report(symbol)
+            if len(data_1h) < 50:
                 return self._empty_report(symbol)
 
             current_price = data_1h['close'].iloc[-1]
 
             price_levels = self._calculate_price_levels(data_1h)
             patterns = self._identify_patterns(data_1h, current_price)
-            multi_tf = self._analyze_multitimeframe(data_1h, data_4h, data_1d, current_price)
+            multi_tf = self._analyze_multitimeframe(data_1h, data_4h, data_1d, current_price, symbol)
 
             signal, confidence = self._generate_overall_signal(
                 patterns, multi_tf, price_levels, current_price
@@ -280,7 +282,8 @@ class TechnicalAnalyst:
         df_1h: pd.DataFrame, 
         df_4h: pd.DataFrame, 
         df_1d: pd.DataFrame,
-        current_price: float
+        current_price: float,
+        symbol: str = "BTCUSDT"
     ) -> Optional[MultiTimeframeAnalysis]:
         if df_4h.empty or df_1d.empty:
             return None
@@ -318,7 +321,7 @@ class TechnicalAnalyst:
             confidence = 0.4
 
         return MultiTimeframeAnalysis(
-            symbol="BTCUSDT",
+            symbol=symbol,
             timeframe_1h={"trend": tf_1h},
             timeframe_4h={"trend": tf_4h},
             timeframe_1d={"trend": tf_1d},
@@ -403,6 +406,127 @@ class TechnicalAnalyst:
             confidence=0,
             key_observations=[]
         )
+
+    async def get_confluence_scores(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+        """
+        For each symbol, compute a confluence score combining:
+        - Multi-timeframe alignment (bullish/bearish/mixed)
+        - Pattern count and average confidence
+        - Overall signal strength
+
+        Returns: {symbol: {score: float, signal: str, patterns: int, alignment: str, details: str}}
+        """
+        results = {}
+        for symbol in symbols:
+            try:
+                report = await self.analyze(symbol)
+
+                # Base: multi-timeframe confluence (0-1)
+                mtf_score = 0.4
+                alignment = "mixed"
+                if report.multi_timeframe:
+                    mtf_score = report.multi_timeframe.confluence_score
+                    alignment = report.multi_timeframe.alignment
+
+                # Pattern bonus: more patterns with higher confidence = higher score
+                pattern_count = len(report.patterns)
+                avg_pattern_conf = 0.0
+                if report.patterns:
+                    avg_pattern_conf = sum(p.confidence for p in report.patterns) / pattern_count
+                pattern_score = min(pattern_count * 0.1 + avg_pattern_conf * 0.3, 0.4)
+
+                # Signal strength (0-0.2)
+                signal_score = report.confidence * 0.2
+
+                total = mtf_score * 0.5 + pattern_score + signal_score
+                total = round(min(total, 1.0), 3)
+
+                results[symbol] = {
+                    "score": total,
+                    "signal": report.overall_signal,
+                    "confidence": report.confidence,
+                    "patterns": pattern_count,
+                    "alignment": alignment,
+                    "details": "; ".join(report.key_observations[:3]),
+                }
+            except Exception as e:
+                logger.warning(f"Confluence score failed for {symbol}: {e}")
+                results[symbol] = {
+                    "score": 0.3,
+                    "signal": "hold",
+                    "confidence": 0.0,
+                    "patterns": 0,
+                    "alignment": "unknown",
+                    "details": f"Analysis failed: {str(e)[:60]}",
+                }
+        return results
+
+    def evaluate_strategy_fit(
+        self,
+        strategy_type: str,
+        report: TechnicalAnalystReport,
+    ) -> Dict[str, Any]:
+        """
+        Evaluate how well a strategy type fits current technical conditions.
+        Returns: {fit_score: float, reasoning: str, recommended_action: str}
+        """
+        signal = report.overall_signal
+        confidence = report.confidence
+        alignment = report.multi_timeframe.alignment if report.multi_timeframe else "mixed"
+        patterns = report.patterns
+
+        fit_score = 0.5  # neutral default
+
+        if strategy_type == "momentum":
+            if alignment in ["bullish", "bearish"] and confidence > 0.5:
+                fit_score = 0.8
+                reasoning = f"Strong {alignment} trend with {confidence:.0%} confidence — momentum suits this"
+            elif alignment == "mixed":
+                fit_score = 0.3
+                reasoning = "Mixed timeframe alignment — momentum may whipsaw"
+            else:
+                fit_score = 0.5
+                reasoning = "Neutral conditions for momentum"
+
+        elif strategy_type == "mean_reversion":
+            oversold = any(p.pattern_type == "oversold_bounce" for p in patterns)
+            overbought = any(p.pattern_type == "overbought_reversal" for p in patterns)
+            if oversold or overbought:
+                fit_score = 0.85
+                reasoning = f"{'Oversold bounce' if oversold else 'Overbought reversal'} detected — ideal for mean reversion"
+            elif alignment == "mixed" and confidence < 0.5:
+                fit_score = 0.7
+                reasoning = "Range-bound market — good for mean reversion"
+            else:
+                fit_score = 0.35
+                reasoning = f"Trending {alignment} market — risky for mean reversion"
+
+        elif strategy_type == "breakout":
+            if len(patterns) >= 2 and confidence > 0.6:
+                fit_score = 0.8
+                reasoning = f"{len(patterns)} patterns with high confidence — breakout conditions"
+            elif alignment in ["bullish", "bearish"]:
+                fit_score = 0.6
+                reasoning = f"{alignment.title()} trend may support breakout continuation"
+            else:
+                fit_score = 0.4
+                reasoning = "No clear breakout setup detected"
+        else:
+            fit_score = 0.5
+            reasoning = f"Unknown strategy '{strategy_type}' — neutral fit"
+
+        if fit_score >= 0.7:
+            action = "increase_allocation"
+        elif fit_score <= 0.3:
+            action = "decrease_allocation"
+        else:
+            action = "maintain"
+
+        return {
+            "fit_score": round(fit_score, 2),
+            "reasoning": reasoning,
+            "recommended_action": action,
+        }
 
 
 technical_analyst = TechnicalAnalyst()

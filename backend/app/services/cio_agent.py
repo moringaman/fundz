@@ -2,11 +2,45 @@ from typing import Dict, List, Optional, Any
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 import json
+import re
 import logging
 
 from app.services.llm import LLMService
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_json(text: str) -> Any:
+    """Extract JSON from LLM output that may contain markdown fences or preamble."""
+    # Try raw parse first
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    # Strip markdown code fences
+    m = re.search(r'```(?:json)?\s*([\s\S]*?)```', text)
+    if m:
+        try:
+            return json.loads(m.group(1).strip())
+        except json.JSONDecodeError:
+            pass
+    # Find first [ ... ] or { ... } block
+    for start_char, end_char in [('[', ']'), ('{', '}')]:
+        start = text.find(start_char)
+        if start == -1:
+            continue
+        depth = 0
+        for i in range(start, len(text)):
+            if text[i] == start_char:
+                depth += 1
+            elif text[i] == end_char:
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start:i + 1])
+                    except json.JSONDecodeError:
+                        break
+    raise json.JSONDecodeError("No valid JSON found", text, 0)
 
 
 @dataclass
@@ -256,10 +290,10 @@ class CIOAgent:
 Based on this comprehensive fund status, provide strategic recommendations:
 
 FUND PERFORMANCE:
-Total P&L: ${fund_perf.get('total_pnl', 0):.2f}
-Win Rate: {fund_perf.get('win_rate', 0):.1%}
-Sharpe Ratio: {fund_perf.get('sharpe_ratio', 0):.2f}
-Max Drawdown: {fund_perf.get('max_drawdown_pct', 0):.2f}%
+Total P&L: ${(fund_perf.get('total_pnl', 0) or 0):.2f}
+Win Rate: {(fund_perf.get('win_rate', 0) or 0):.1%}
+Sharpe Ratio: {(fund_perf.get('sharpe_ratio', 0) or 0):.2f}
+Max Drawdown: {(fund_perf.get('max_drawdown_pct', 0) or 0):.2f}%
 
 AGENT LEADERBOARD (Top 3):
 {self._format_leaderboard(leaderboard[:3])}
@@ -273,7 +307,8 @@ RISK STATUS:
 MARKET CONTEXT:
 {context}
 
-Provide 2-3 strategic recommendations in JSON format:
+Provide 2-3 strategic recommendations in JSON format.
+IMPORTANT: Respond with ONLY the JSON array, no markdown fences, no preamble text.
 [
   {{
     "recommendation": "enable_agent|disable_agent|increase_allocation|reduce_risk|add_new_strategy|pause_strategy",
@@ -289,8 +324,15 @@ Provide 2-3 strategic recommendations in JSON format:
             response = await self.llm_service._call_llm(prompt)
 
             try:
-                recs_data = json.loads(response.content)
+                recs_data = _extract_json(response.content)
+                # Handle LLM wrapping the list in a dict like {"recommendations": [...]}
+                if isinstance(recs_data, dict):
+                    recs_data = recs_data.get('recommendations', list(recs_data.values())[0] if recs_data else [])
+                if not isinstance(recs_data, list):
+                    recs_data = [recs_data]
                 for rec_dict in recs_data:
+                    if not isinstance(rec_dict, dict):
+                        continue
                     recommendations.append(StrategicRecommendation(
                         recommendation=rec_dict.get('recommendation', ''),
                         target=rec_dict.get('target', ''),
@@ -298,8 +340,8 @@ Provide 2-3 strategic recommendations in JSON format:
                         rationale=rec_dict.get('rationale', ''),
                         expected_impact=rec_dict.get('expected_impact', '')
                     ))
-            except (json.JSONDecodeError, ValueError, KeyError):
-                logger.warning("Failed to parse LLM recommendations, using defaults")
+            except (json.JSONDecodeError, ValueError, KeyError, AttributeError, TypeError) as e:
+                logger.warning(f"Failed to parse LLM recommendations ({e}), raw: {response.content[:200]}")
                 recommendations = self._default_recommendations(fund_perf, leaderboard)
 
         except Exception as e:
@@ -368,8 +410,8 @@ Provide 2-3 strategic recommendations in JSON format:
         lines = []
 
         # Performance summary
-        pnl = fund_perf.get('total_pnl', 0)
-        wr = fund_perf.get('win_rate', 0)
+        pnl = fund_perf.get('total_pnl', 0) or 0
+        wr = fund_perf.get('win_rate', 0) or 0
         lines.append(f"**{period.capitalize()} Summary**")
         lines.append(f"P&L: ${pnl:+.2f} | Win Rate: {wr:.1%} | Total Runs: {fund_perf.get('total_runs', 0)}")
 
@@ -392,8 +434,8 @@ Provide 2-3 strategic recommendations in JSON format:
         recommendations: List[StrategicRecommendation]
     ) -> str:
         """Assess CIO sentiment based on performance and recommendations"""
-        pnl = fund_perf.get('total_pnl', 0)
-        wr = fund_perf.get('win_rate', 0)
+        pnl = fund_perf.get('total_pnl', 0) or 0
+        wr = fund_perf.get('win_rate', 0) or 0
 
         if pnl > 1000 and wr > 0.65:
             return "very_bullish"
@@ -415,8 +457,8 @@ Provide 2-3 strategic recommendations in JSON format:
     ) -> str:
         """Build detailed CIO reasoning"""
         lines = [
-            f"Fund Performance: P&L ${fund_perf.get('total_pnl', 0):+.2f}, "
-            f"WR {fund_perf.get('win_rate', 0):.1%}, "
+            f"Fund Performance: P&L ${(fund_perf.get('total_pnl', 0) or 0):+.2f}, "
+            f"WR {(fund_perf.get('win_rate', 0) or 0):.1%}, "
             f"Runs {fund_perf.get('total_runs', 0)}"
         ]
 
