@@ -120,6 +120,7 @@ async def place_order(order: OrderRequest, db: AsyncSession = Depends(get_db)):
         fee=total * 0.001,
         status=OrderStatus.PENDING,
         phemex_order_id=result.get("orderID"),
+        is_paper=False,
     )
     db.add(db_trade)
     await db.commit()
@@ -160,15 +161,18 @@ async def get_positions(db: AsyncSession = Depends(get_db)):
     # First, get current price from Phemex
     try:
         current_prices = {}
-        for symbol in ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']:  # Add your tracked symbols
+        for symbol in ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT', 'ADAUSDT', 'AVAXUSDT']:  # Add your tracked symbols
             ticker = await phemex_client.get_ticker(symbol)
             current_prices[symbol] = float(ticker.get('result', {}).get('closeRp', 0))
     except Exception as e:
         current_prices = {}
         print(f"Error fetching current prices: {e}")
     
-    # Fetch positions from database first
-    query = select(DBPosition).where(DBPosition.user_id == "default-user")
+    # Fetch live positions only from database
+    query = select(DBPosition).where(
+        DBPosition.user_id == "default-user",
+        DBPosition.is_paper == False,  # noqa: E712
+    )
     result = await db.execute(query)
     db_positions = result.scalars().all()
     
@@ -265,7 +269,12 @@ async def get_trade_history(
     limit: int = 50,
     db: AsyncSession = Depends(get_db)
 ):
-    query = select(DBTrade).order_by(desc(DBTrade.created_at)).limit(limit)
+    query = (
+        select(DBTrade)
+        .where(DBTrade.is_paper == False)  # noqa: E712
+        .order_by(desc(DBTrade.created_at))
+        .limit(limit)
+    )
     if symbol:
         query = query.where(DBTrade.symbol == symbol)
     
@@ -277,15 +286,21 @@ async def get_trade_history(
 
 @router.get("/pnl")
 async def get_pnl(db: AsyncSession = Depends(get_db)):
-    # Calculate PNL from positions
-    query = select(DBPosition).where(DBPosition.user_id == "default-user")
+    # Calculate PNL from live positions only
+    query = select(DBPosition).where(
+        DBPosition.user_id == "default-user",
+        DBPosition.is_paper == False,  # noqa: E712
+    )
     result = await db.execute(query)
     positions = result.scalars().all()
     
     total_unrealized_pnl = sum(pos.unrealized_pnl or 0 for pos in positions)
     
-    # Calculate total trades PNL
-    trade_query = select(DBTrade).where(DBTrade.status == OrderStatus.FILLED)
+    # Calculate total trades PNL from live trades only
+    trade_query = select(DBTrade).where(
+        DBTrade.status == OrderStatus.FILLED,
+        DBTrade.is_paper == False,  # noqa: E712
+    )
     trade_result = await db.execute(trade_query)
     trades = trade_result.scalars().all()
     

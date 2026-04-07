@@ -1,9 +1,10 @@
-import { useState, useEffect } from 'react';
-import { Key, Brain, Save, Eye, EyeOff, Check, RefreshCw, Info, AlertTriangle, TrendingUp, Shield, Mail, Send } from 'lucide-react';
+import { useState, useEffect, useCallback } from 'react';
+import { Key, Brain, Save, Eye, EyeOff, Check, RefreshCw, Info, AlertTriangle, TrendingUp, Shield, Mail, Send, Bell, Wallet, Plus, Minus } from 'lucide-react';
 import { useSettings } from '../hooks/useQueries';
-import { settingsApi } from '../lib/api';
+import { settingsApi, paperApi } from '../lib/api';
+import { notificationService, type NotificationPreferences } from '../lib/notifications';
 
-type SettingsTab = 'api' | 'risk' | 'trading' | 'llm' | 'email';
+type SettingsTab = 'api' | 'risk' | 'trading' | 'llm' | 'email' | 'notifications';
 
 export function SettingsPage() {
   const { data: settingsData, refetch: refetchSettings } = useSettings();
@@ -28,6 +29,7 @@ export function SettingsPage() {
     default_stop_loss_pct: 2,
     default_take_profit_pct: 4,
     max_leverage: 1,
+    exposure_threshold_pct: 80,
   });
 
   // ── Trading Preferences state ──
@@ -37,7 +39,9 @@ export function SettingsPage() {
     paper_trading_default: true,
     auto_confirm_orders: false,
     default_order_type: 'limit',
+    trading_pairs: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'ADAUSDT'] as string[],
   });
+  const [newPairInput, setNewPairInput] = useState('');
 
   // ── LLM Config state ──
   const [llmForm, setLlmForm] = useState({
@@ -66,6 +70,75 @@ export function SettingsPage() {
       }));
     }
   }, [settingsData]);
+
+  // ── Notification Preferences state ──
+  const [notifPrefs, setNotifPrefs] = useState<NotificationPreferences>(
+    notificationService.getPreferences()
+  );
+  const [notifPermission, setNotifPermission] = useState<NotificationPermission>(
+    notificationService.permission
+  );
+
+  const updateNotifPref = (key: keyof NotificationPreferences, value: boolean) => {
+    const updated = { ...notifPrefs, [key]: value };
+    setNotifPrefs(updated);
+    notificationService.savePreferences(updated);
+  };
+
+  // ── Paper Wallet state ──
+  const [walletBalances, setWalletBalances] = useState<{ asset: string; available: number; locked: number }[]>([]);
+  const [walletLoading, setWalletLoading] = useState(false);
+  const [depositAsset, setDepositAsset] = useState('USDT');
+  const [depositAmount, setDepositAmount] = useState('');
+
+  const fetchWalletBalances = useCallback(async () => {
+    try {
+      setWalletLoading(true);
+      const res = await paperApi.getBalance();
+      const data = Array.isArray(res.data) ? res.data : (Array.isArray(res) ? res : []);
+      setWalletBalances(data);
+    } catch (e) {
+      console.warn('Failed to fetch wallet balances:', e);
+    }
+    finally { setWalletLoading(false); }
+  }, []);
+
+  useEffect(() => {
+    if (activeTab === 'trading') fetchWalletBalances();
+  }, [activeTab, fetchWalletBalances]);
+
+  const handleAdjustBalance = async (amount: number) => {
+    if (!depositAmount && amount === 0) return;
+    const finalAmount = amount || parseFloat(depositAmount);
+    if (isNaN(finalAmount) || finalAmount === 0) {
+      showToast('Enter a valid amount', 'error');
+      return;
+    }
+    try {
+      await paperApi.adjustBalance(depositAsset, finalAmount);
+      showToast(`${finalAmount > 0 ? 'Deposited' : 'Withdrew'} ${Math.abs(finalAmount)} ${depositAsset}`, 'success');
+      setDepositAmount('');
+      fetchWalletBalances();
+    } catch (e: unknown) {
+      const msg = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail || 'Failed to adjust balance';
+      showToast(msg, 'error');
+    }
+  };
+
+  const requestNotifPermission = async () => {
+    const perm = await notificationService.requestPermission();
+    setNotifPermission(perm);
+    if (perm === 'granted') {
+      showToast('Notifications enabled!', 'success');
+      // Send a test notification
+      notificationService.notify('PX·AI Notifications Enabled', {
+        body: 'You will now receive alerts for trades, risk events, and more.',
+        tag: 'test',
+      });
+    } else {
+      showToast('Notification permission denied', 'error');
+    }
+  };
 
   const showToast = (message: string, type: 'success' | 'error') => {
     setToast({ message, type });
@@ -145,6 +218,7 @@ export function SettingsPage() {
     { id: 'trading', label: 'Trading', icon: <TrendingUp size={14} /> },
     { id: 'llm', label: 'AI / LLM', icon: <Brain size={14} /> },
     { id: 'email', label: 'Email', icon: <Mail size={14} /> },
+    { id: 'notifications', label: 'Notifications', icon: <Bell size={14} /> },
   ];
 
   const symbols = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT', 'ADAUSDT', 'AVAXUSDT'];
@@ -392,6 +466,23 @@ export function SettingsPage() {
             </div>
           </div>
 
+          {/* Exposure Threshold */}
+          <div style={{ marginTop: '.25rem' }}>
+            <label className="settings-label">
+              Exposure Threshold — <span style={{ fontWeight: 700, color: riskForm.exposure_threshold_pct > 90 ? 'var(--red)' : riskForm.exposure_threshold_pct > 75 ? 'var(--amber)' : 'var(--green)' }}>{riskForm.exposure_threshold_pct}%</span>
+            </label>
+            <p style={{ fontSize: '.68rem', color: 'var(--text-secondary)', margin: '0 0 .35rem' }}>
+              Elena flags "caution" when portfolio exposure exceeds this level
+            </p>
+            <input
+              type="range" min="20" max="100" step="5"
+              className="slider"
+              value={riskForm.exposure_threshold_pct}
+              onChange={e => setRiskForm({ ...riskForm, exposure_threshold_pct: parseFloat(e.target.value) })}
+            />
+            <div className="slider-labels"><span>20%</span><span>100%</span></div>
+          </div>
+
           {/* Risk summary */}
           <div style={{
             marginTop: '.5rem', padding: '.75rem 1rem', borderRadius: 8,
@@ -545,6 +636,175 @@ export function SettingsPage() {
               <span>Auto-confirm is enabled. Agent signals will be executed automatically without review.</span>
             </div>
           )}
+
+          {/* Paper Wallet */}
+          <div style={{ marginTop: '.75rem', borderTop: '1px solid var(--border)', paddingTop: '.75rem' }}>
+            <label className="settings-label" style={{ marginBottom: '.5rem', display: 'flex', alignItems: 'center', gap: '.35rem' }}>
+              <Wallet size={14} /> Paper Trading Wallet
+            </label>
+            <div style={{ fontSize: '.7rem', color: 'var(--text-secondary)', marginBottom: '.5rem' }}>
+              Add or withdraw funds to test how the fund behaves at different capital levels. Live account funds are managed on Phemex.
+            </div>
+
+            {walletLoading ? (
+              <div style={{ fontSize: '.75rem', color: 'var(--text-secondary)' }}>Loading balances…</div>
+            ) : (
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '.5rem', marginBottom: '.5rem' }}>
+                {walletBalances.map(b => (
+                  <div key={b.asset} style={{
+                    background: 'var(--bg-secondary)',
+                    borderRadius: 6,
+                    padding: '.4rem .65rem',
+                    fontSize: '.75rem',
+                    minWidth: 100,
+                  }}>
+                    <div style={{ color: 'var(--text-secondary)', fontSize: '.65rem' }}>{b.asset}</div>
+                    <div style={{ fontWeight: 600, fontFamily: 'monospace', color: 'var(--text-primary)' }}>
+                      {b.asset === 'USDT' ? `$${b.available.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : b.available.toLocaleString(undefined, { maximumFractionDigits: 8 })}
+                    </div>
+                    {b.locked > 0 && (
+                      <div style={{ color: 'var(--text-tertiary)', fontSize: '.6rem' }}>Locked: {b.locked}</div>
+                    )}
+                  </div>
+                ))}
+                {walletBalances.length === 0 && (
+                  <div style={{ fontSize: '.75rem', color: 'var(--text-secondary)' }}>No balances yet — deposit to get started.</div>
+                )}
+              </div>
+            )}
+
+            <div style={{ display: 'flex', gap: '.35rem', alignItems: 'center', flexWrap: 'wrap' }}>
+              <select
+                value={depositAsset}
+                onChange={e => setDepositAsset(e.target.value)}
+                style={{
+                  padding: '.35rem .5rem',
+                  borderRadius: 6,
+                  border: '1px solid var(--border)',
+                  background: 'var(--bg-secondary)',
+                  color: 'var(--text-primary)',
+                  fontSize: '.75rem',
+                }}
+              >
+                <option value="USDT">USDT</option>
+                {Array.from(new Set(
+                  tradingForm.trading_pairs.map(p => p.replace('USDT', ''))
+                )).sort().map(asset => (
+                  <option key={asset} value={asset}>{asset}</option>
+                ))}
+              </select>
+              <input
+                type="number"
+                placeholder="Amount"
+                value={depositAmount}
+                onChange={e => setDepositAmount(e.target.value)}
+                style={{
+                  padding: '.35rem .5rem',
+                  borderRadius: 6,
+                  border: '1px solid var(--border)',
+                  background: 'var(--bg-secondary)',
+                  color: 'var(--text-primary)',
+                  fontSize: '.75rem',
+                  width: 120,
+                }}
+                onKeyDown={e => { if (e.key === 'Enter') handleAdjustBalance(parseFloat(depositAmount)); }}
+              />
+              <button
+                type="button"
+                className="settings-btn"
+                style={{ display: 'flex', alignItems: 'center', gap: '.25rem', fontSize: '.72rem' }}
+                onClick={() => handleAdjustBalance(parseFloat(depositAmount))}
+                disabled={!depositAmount || parseFloat(depositAmount) <= 0}
+              >
+                <Plus size={12} /> Deposit
+              </button>
+              <button
+                type="button"
+                className="settings-btn"
+                style={{ display: 'flex', alignItems: 'center', gap: '.25rem', fontSize: '.72rem' }}
+                onClick={() => handleAdjustBalance(-Math.abs(parseFloat(depositAmount)))}
+                disabled={!depositAmount || parseFloat(depositAmount) <= 0}
+              >
+                <Minus size={12} /> Withdraw
+              </button>
+              <button
+                type="button"
+                className="settings-btn"
+                style={{ display: 'flex', alignItems: 'center', gap: '.25rem', fontSize: '.72rem', marginLeft: 'auto' }}
+                onClick={fetchWalletBalances}
+              >
+                <RefreshCw size={12} /> Refresh
+              </button>
+            </div>
+          </div>
+
+          {/* Trading Pairs Config */}
+          <div style={{ marginTop: '.75rem', borderTop: '1px solid var(--border)', paddingTop: '.75rem' }}>
+            <label className="settings-label" style={{ marginBottom: '.35rem', display: 'block' }}>
+              Trading Pairs — <span style={{ color: 'var(--text-secondary)', fontWeight: 400 }}>{tradingForm.trading_pairs.length} pairs</span>
+            </label>
+            <p style={{ fontSize: '.68rem', color: 'var(--text-secondary)', margin: '0 0 .5rem' }}>
+              Marcus runs technical analysis on all pairs. Agents and the ticker strip also use this list.
+            </p>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '.35rem', marginBottom: '.5rem' }}>
+              {tradingForm.trading_pairs.map((pair) => (
+                <span key={pair} style={{
+                  display: 'inline-flex', alignItems: 'center', gap: '.3rem',
+                  padding: '.25rem .55rem', borderRadius: '14px', fontSize: '.72rem', fontWeight: 600,
+                  background: 'var(--accent-dim)', color: 'var(--accent)',
+                  border: '1px solid rgba(99,102,241,.25)',
+                }}>
+                  {pair}
+                  <button
+                    type="button"
+                    onClick={() => setTradingForm({
+                      ...tradingForm,
+                      trading_pairs: tradingForm.trading_pairs.filter(p => p !== pair)
+                    })}
+                    style={{
+                      background: 'none', border: 'none', color: 'var(--text-dim)',
+                      cursor: 'pointer', fontSize: '.85rem', lineHeight: 1, padding: 0,
+                    }}
+                    title={`Remove ${pair}`}
+                  >×</button>
+                </span>
+              ))}
+            </div>
+            <div style={{ display: 'flex', gap: '.35rem' }}>
+              <input
+                type="text"
+                className="settings-input"
+                placeholder="e.g. DOGEUSDT"
+                value={newPairInput}
+                onChange={(e) => setNewPairInput(e.target.value.toUpperCase())}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    const p = newPairInput.trim();
+                    if (p && !tradingForm.trading_pairs.includes(p)) {
+                      setTradingForm({ ...tradingForm, trading_pairs: [...tradingForm.trading_pairs, p] });
+                      setNewPairInput('');
+                    }
+                  }
+                }}
+                style={{ flex: 1, marginBottom: 0 }}
+              />
+              <button
+                type="button"
+                className="settings-btn"
+                onClick={() => {
+                  const p = newPairInput.trim();
+                  if (p && !tradingForm.trading_pairs.includes(p)) {
+                    setTradingForm({ ...tradingForm, trading_pairs: [...tradingForm.trading_pairs, p] });
+                    setNewPairInput('');
+                  }
+                }}
+                style={{ padding: '.4rem .75rem', fontSize: '.75rem' }}
+              >
+                Add
+              </button>
+            </div>
+          </div>
 
           <button
             type="button"
@@ -766,6 +1026,144 @@ export function SettingsPage() {
           >
             <Send size={13} /> {sendingEmail ? 'Sending…' : 'Send Test Email'}
           </button>
+        </div>
+      )}
+
+      {/* ── Notifications Tab ── */}
+      {activeTab === 'notifications' && (
+        <div className="settings-panel" style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
+          <h3 className="settings-section-title"><Bell size={15} /> Browser Notifications</h3>
+
+          {/* Permission status */}
+          <div style={{
+            padding: '.75rem 1rem', borderRadius: 8,
+            background: notifPermission === 'granted' ? 'rgba(0,230,118,.08)' : 'rgba(255,193,7,.08)',
+            border: `1px solid ${notifPermission === 'granted' ? 'rgba(0,230,118,.25)' : 'rgba(255,193,7,.25)'}`,
+            display: 'flex', alignItems: 'center', gap: '.75rem',
+          }}>
+            <Bell size={18} style={{ color: notifPermission === 'granted' ? 'var(--green)' : 'var(--amber)' }} />
+            <div style={{ flex: 1 }}>
+              <div style={{ fontWeight: 600, fontSize: '.82rem' }}>
+                {notifPermission === 'granted' ? 'Notifications Enabled' :
+                 notifPermission === 'denied' ? 'Notifications Blocked' :
+                 'Notifications Not Yet Enabled'}
+              </div>
+              <div style={{ fontSize: '.72rem', color: 'var(--text-secondary)' }}>
+                {notifPermission === 'granted'
+                  ? 'You will receive desktop notifications when the tab is in the background.'
+                  : notifPermission === 'denied'
+                  ? 'Please enable notifications in your browser settings for this site.'
+                  : 'Click the button to enable desktop notifications for trade alerts and risk events.'}
+              </div>
+            </div>
+            {notifPermission !== 'granted' && notifPermission !== 'denied' && (
+              <button
+                type="button"
+                className="settings-btn"
+                onClick={requestNotifPermission}
+                style={{ display: 'flex', alignItems: 'center', gap: '.35rem', whiteSpace: 'nowrap' }}
+              >
+                <Bell size={13} /> Enable Notifications
+              </button>
+            )}
+          </div>
+
+          {/* Master toggle */}
+          <div style={{
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            padding: '.6rem 0', borderBottom: '1px solid var(--border)',
+          }}>
+            <div>
+              <div style={{ fontWeight: 600, fontSize: '.82rem' }}>Enable All Notifications</div>
+              <div style={{ fontSize: '.7rem', color: 'var(--text-secondary)' }}>
+                Master switch for all browser notification types
+              </div>
+            </div>
+            <label style={{ position: 'relative', display: 'inline-block', width: 44, height: 24, cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={notifPrefs.enabled}
+                onChange={(e) => updateNotifPref('enabled', e.target.checked)}
+                style={{ opacity: 0, width: 0, height: 0 }}
+              />
+              <span style={{
+                position: 'absolute', inset: 0, borderRadius: 12,
+                background: notifPrefs.enabled ? 'var(--accent)' : 'var(--surface-2, #3a3d45)',
+                transition: 'background .2s',
+              }}>
+                <span style={{
+                  position: 'absolute', top: 2, left: notifPrefs.enabled ? 22 : 2,
+                  width: 20, height: 20, borderRadius: '50%',
+                  background: '#fff', transition: 'left .2s',
+                }} />
+              </span>
+            </label>
+          </div>
+
+          {/* Individual toggles */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '.1rem', opacity: notifPrefs.enabled ? 1 : 0.4, pointerEvents: notifPrefs.enabled ? 'auto' : 'none' }}>
+            {([
+              { key: 'tradeExecuted' as const, label: 'Trade Executed', desc: 'When an agent opens a new position', icon: '📈' },
+              { key: 'positionClosed' as const, label: 'Position Closed (SL/TP)', desc: 'When stop-loss, take-profit, or trailing stop triggers', icon: '🔔' },
+              { key: 'riskAlert' as const, label: 'Risk Alerts', desc: 'When Elena flags danger or high exposure', icon: '⚠️' },
+              { key: 'allocation' as const, label: 'Portfolio Rebalance', desc: 'When James reallocates between agents', icon: '⚖️' },
+              { key: 'dailyReport' as const, label: 'Daily Report', desc: 'When the daily fund summary is ready', icon: '📊' },
+              { key: 'agentError' as const, label: 'Agent Errors', desc: 'When an agent fails or goes offline', icon: '🚨' },
+            ]).map(item => (
+              <div
+                key={item.key}
+                style={{
+                  display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                  padding: '.6rem .25rem', borderBottom: '1px solid var(--border)',
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: '.6rem' }}>
+                  <span style={{ fontSize: '1.1rem' }}>{item.icon}</span>
+                  <div>
+                    <div style={{ fontWeight: 600, fontSize: '.8rem' }}>{item.label}</div>
+                    <div style={{ fontSize: '.68rem', color: 'var(--text-secondary)' }}>{item.desc}</div>
+                  </div>
+                </div>
+                <label style={{ position: 'relative', display: 'inline-block', width: 40, height: 22, cursor: 'pointer', flexShrink: 0 }}>
+                  <input
+                    type="checkbox"
+                    checked={notifPrefs[item.key]}
+                    onChange={(e) => updateNotifPref(item.key, e.target.checked)}
+                    style={{ opacity: 0, width: 0, height: 0 }}
+                  />
+                  <span style={{
+                    position: 'absolute', inset: 0, borderRadius: 11,
+                    background: notifPrefs[item.key] ? 'var(--accent)' : 'var(--surface-2, #3a3d45)',
+                    transition: 'background .2s',
+                  }}>
+                    <span style={{
+                      position: 'absolute', top: 2, left: notifPrefs[item.key] ? 20 : 2,
+                      width: 18, height: 18, borderRadius: '50%',
+                      background: '#fff', transition: 'left .2s',
+                    }} />
+                  </span>
+                </label>
+              </div>
+            ))}
+          </div>
+
+          {/* Test notification */}
+          {notifPermission === 'granted' && (
+            <button
+              type="button"
+              className="settings-btn"
+              onClick={() => {
+                notificationService.notify('🧪 Test Notification', {
+                  body: 'If you see this, browser notifications are working correctly!',
+                  tag: 'test',
+                });
+                showToast('Test notification sent!', 'success');
+              }}
+              style={{ display: 'flex', alignItems: 'center', gap: '.35rem', marginTop: '.25rem', alignSelf: 'flex-start' }}
+            >
+              <Send size={13} /> Send Test Notification
+            </button>
+          )}
         </div>
       )}
     </div>

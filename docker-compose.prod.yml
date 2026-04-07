@@ -1,0 +1,29 @@
+# docker-compose.prod.yml — production overrides
+# Usage: docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+
+services:
+  backend:
+    restart: always
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2
+    volumes: []
+    environment:
+      DEBUG: "false"
+      DATABASE_URL: postgresql+asyncpg://postgres:${POSTGRES_PASSWORD:-postgres}@db:5432/phemex_ai_trader
+      REDIS_URL: redis://redis:6379/0
+
+  frontend:
+    restart: always
+    ports:
+      - "3001:3000"
+    volumes:
+      - ./frontend/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+
+  db:
+    restart: always
+    ports: []
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+
+  redis:
+    restart: always
+    ports: []

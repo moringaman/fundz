@@ -53,6 +53,42 @@ class PaperTradingService:
             )
             return result.scalars().all()
 
+    async def adjust_balance(self, asset: str, amount: float) -> dict:
+        """Add or subtract funds from a paper-trading balance.
+
+        *amount* is signed: positive = deposit, negative = withdraw.
+        Returns the updated balance dict.
+        """
+        asset = asset.upper()
+        async with get_async_session() as db:
+            result = await db.execute(
+                select(PaperBalance).where(
+                    PaperBalance.user_id == "default-user",
+                    PaperBalance.asset == asset,
+                )
+            )
+            bal = result.scalar_one_or_none()
+            if bal is None:
+                if amount < 0:
+                    raise ValueError(f"No {asset} balance exists to withdraw from")
+                bal = PaperBalance(
+                    user_id="default-user",
+                    asset=asset,
+                    available=amount,
+                    locked=0.0,
+                )
+                db.add(bal)
+            else:
+                if bal.available + amount < 0:
+                    raise ValueError(
+                        f"Insufficient {asset} balance: have {bal.available}, "
+                        f"tried to withdraw {abs(amount)}"
+                    )
+                bal.available += amount
+            await db.commit()
+            await db.refresh(bal)
+            return {"asset": bal.asset, "available": bal.available, "locked": bal.locked}
+
     # ------------------------------------------------------------------
     # Orders
     # ------------------------------------------------------------------
@@ -121,78 +157,220 @@ class PaperTradingService:
                 total=quantity * price,
                 fee=quantity * price * 0.001,
                 status=OrderStatus.FILLED,
+                is_paper=True,
                 created_at=datetime.now(),
                 filled_at=datetime.now(),
             )
             db.add(order)
 
             if side == OrderSide.BUY:
-                cost = quantity * price
-                if usdt_balance.available < cost:
-                    raise ValueError(
-                        f"Insufficient USDT balance: need {cost:.2f}, have {usdt_balance.available:.2f}"
-                    )
-                usdt_balance.available -= cost
-
-                position = await db.scalar(
+                # Check if closing an existing SHORT position first
+                short_position = await db.scalar(
                     select(PaperPosition).where(
                         PaperPosition.user_id == "default-user",
                         PaperPosition.symbol == symbol,
+                        PaperPosition.agent_id == agent_id,
+                        PaperPosition.side == OrderSide.SELL,
                     )
                 )
-                if position:
-                    total_qty = position.quantity + quantity
-                    position.entry_price = (
-                        position.entry_price * position.quantity + price * quantity
-                    ) / total_qty
-                    position.quantity = total_qty
-                    position.current_price = price
-                    # Update highest_price watermark
-                    if position.highest_price is None or price > position.highest_price:
-                        position.highest_price = price
-                    if stop_loss_price is not None:
-                        position.stop_loss_price = stop_loss_price
-                    if take_profit_price is not None:
-                        position.take_profit_price = take_profit_price
-                    if trailing_stop_pct is not None:
-                        position.trailing_stop_pct = trailing_stop_pct
+                if short_position:
+                    # Closing (covering) a short position
+                    close_qty = min(quantity, short_position.quantity)
+                    cost = close_qty * price
+                    if usdt_balance.available < cost:
+                        raise ValueError(
+                            f"Insufficient USDT balance to cover short: need {cost:.2f}, have {usdt_balance.available:.2f}"
+                        )
+                    # Short P&L: entry(sell) - exit(buy)
+                    realized = (short_position.entry_price - price) * close_qty
+                    usdt_balance.available -= cost
+                    # Return the original margin
+                    usdt_balance.available += close_qty * short_position.entry_price
+
+                    if short_position.quantity <= close_qty + 1e-12:
+                        await db.delete(short_position)
+                    else:
+                        short_position.quantity -= close_qty
+                        short_position.realized_pnl = (short_position.realized_pnl or 0.0) + realized
+                        short_position.current_price = price
+
+                    try:
+                        from app.services.risk_manager import risk_manager
+                        risk_manager.record_pnl(realized)
+                    except Exception:
+                        pass
+
+                    # If buy quantity exceeds short, open a long with remainder
+                    remainder = quantity - close_qty
+                    if remainder > 1e-12:
+                        extra_cost = remainder * price
+                        if usdt_balance.available < extra_cost:
+                            # Just close the short, skip remainder
+                            await db.commit()
+                            return order
+                        usdt_balance.available -= extra_cost
+                        new_pos = PaperPosition(
+                            user_id="default-user",
+                            agent_id=agent_id,
+                            symbol=symbol,
+                            side=OrderSide.BUY,
+                            quantity=remainder,
+                            entry_price=price,
+                            current_price=price,
+                            unrealized_pnl=0.0,
+                            realized_pnl=0.0,
+                            stop_loss_price=stop_loss_price,
+                            take_profit_price=take_profit_price,
+                            highest_price=price,
+                            trailing_stop_pct=trailing_stop_pct,
+                            is_paper=True,
+                        )
+                        db.add(new_pos)
                 else:
-                    position = PaperPosition(
-                        user_id="default-user",
-                        agent_id=agent_id,
-                        symbol=symbol,
-                        side=OrderSide.BUY,
-                        quantity=quantity,
-                        entry_price=price,
-                        current_price=price,
-                        unrealized_pnl=0.0,
-                        realized_pnl=0.0,
-                        stop_loss_price=stop_loss_price,
-                        take_profit_price=take_profit_price,
-                        highest_price=price,
-                        trailing_stop_pct=trailing_stop_pct,
+                    # Opening / adding to a LONG position
+                    cost = quantity * price
+                    if usdt_balance.available < cost:
+                        raise ValueError(
+                            f"Insufficient USDT balance: need {cost:.2f}, have {usdt_balance.available:.2f}"
+                        )
+                    usdt_balance.available -= cost
+
+                    position = await db.scalar(
+                        select(PaperPosition).where(
+                            PaperPosition.user_id == "default-user",
+                            PaperPosition.symbol == symbol,
+                            PaperPosition.agent_id == agent_id,
+                            PaperPosition.side == OrderSide.BUY,
+                        )
                     )
-                    db.add(position)
+                    if position:
+                        total_qty = position.quantity + quantity
+                        position.entry_price = (
+                            position.entry_price * position.quantity + price * quantity
+                        ) / total_qty
+                        position.quantity = total_qty
+                        position.current_price = price
+                        if position.highest_price is None or price > position.highest_price:
+                            position.highest_price = price
+                        if stop_loss_price is not None:
+                            position.stop_loss_price = stop_loss_price
+                        if take_profit_price is not None:
+                            position.take_profit_price = take_profit_price
+                        if trailing_stop_pct is not None:
+                            position.trailing_stop_pct = trailing_stop_pct
+                    else:
+                        position = PaperPosition(
+                            user_id="default-user",
+                            agent_id=agent_id,
+                            symbol=symbol,
+                            side=OrderSide.BUY,
+                            quantity=quantity,
+                            entry_price=price,
+                            current_price=price,
+                            unrealized_pnl=0.0,
+                            realized_pnl=0.0,
+                            stop_loss_price=stop_loss_price,
+                            take_profit_price=take_profit_price,
+                            highest_price=price,
+                            trailing_stop_pct=trailing_stop_pct,
+                            is_paper=True,
+                        )
+                        db.add(position)
 
             elif side == OrderSide.SELL:
-                position = await db.scalar(
+                # Check if closing an existing LONG position first
+                long_position = await db.scalar(
                     select(PaperPosition).where(
                         PaperPosition.user_id == "default-user",
                         PaperPosition.symbol == symbol,
+                        PaperPosition.agent_id == agent_id,
+                        PaperPosition.side == OrderSide.BUY,
                     )
                 )
-                if not position or position.quantity < quantity:
-                    raise ValueError("Insufficient position to sell")
+                if long_position and long_position.quantity >= quantity - 1e-12:
+                    # Closing a long position
+                    realized = (price - long_position.entry_price) * quantity
+                    usdt_balance.available += quantity * price
 
-                realized = (price - position.entry_price) * quantity
-                usdt_balance.available += quantity * price
+                    if long_position.quantity <= quantity + 1e-12:
+                        await db.delete(long_position)
+                    else:
+                        long_position.quantity -= quantity
+                        long_position.realized_pnl = (long_position.realized_pnl or 0.0) + realized
+                        long_position.current_price = price
 
-                if position.quantity == quantity:
-                    await db.delete(position)
+                    try:
+                        from app.services.risk_manager import risk_manager
+                        risk_manager.record_pnl(realized)
+                    except Exception:
+                        pass
                 else:
-                    position.quantity -= quantity
-                    position.realized_pnl = (position.realized_pnl or 0.0) + realized
-                    position.current_price = price
+                    # Opening / adding to a SHORT position
+                    # Margin requirement: lock USDT equal to position value
+                    margin = quantity * price
+                    if usdt_balance.available < margin:
+                        raise ValueError(
+                            f"Insufficient USDT margin for short: need {margin:.2f}, have {usdt_balance.available:.2f}"
+                        )
+                    usdt_balance.available -= margin
+
+                    # Close any remaining long first
+                    if long_position and long_position.quantity > 0:
+                        realized = (price - long_position.entry_price) * long_position.quantity
+                        usdt_balance.available += long_position.quantity * price
+                        remaining_short_qty = quantity - long_position.quantity
+                        await db.delete(long_position)
+                        try:
+                            from app.services.risk_manager import risk_manager
+                            risk_manager.record_pnl(realized)
+                        except Exception:
+                            pass
+                    else:
+                        remaining_short_qty = quantity
+
+                    if remaining_short_qty > 1e-12:
+                        short_pos = await db.scalar(
+                            select(PaperPosition).where(
+                                PaperPosition.user_id == "default-user",
+                                PaperPosition.symbol == symbol,
+                                PaperPosition.agent_id == agent_id,
+                                PaperPosition.side == OrderSide.SELL,
+                            )
+                        )
+                        if short_pos:
+                            total_qty = short_pos.quantity + remaining_short_qty
+                            short_pos.entry_price = (
+                                short_pos.entry_price * short_pos.quantity + price * remaining_short_qty
+                            ) / total_qty
+                            short_pos.quantity = total_qty
+                            short_pos.current_price = price
+                            # For shorts, lowest_price is the watermark (stored in highest_price field)
+                            if short_pos.highest_price is None or price < short_pos.highest_price:
+                                short_pos.highest_price = price
+                            if stop_loss_price is not None:
+                                short_pos.stop_loss_price = stop_loss_price
+                            if take_profit_price is not None:
+                                short_pos.take_profit_price = take_profit_price
+                            if trailing_stop_pct is not None:
+                                short_pos.trailing_stop_pct = trailing_stop_pct
+                        else:
+                            short_pos = PaperPosition(
+                                user_id="default-user",
+                                agent_id=agent_id,
+                                symbol=symbol,
+                                side=OrderSide.SELL,
+                                quantity=remaining_short_qty,
+                                entry_price=price,
+                                current_price=price,
+                                unrealized_pnl=0.0,
+                                realized_pnl=0.0,
+                                stop_loss_price=stop_loss_price,
+                                take_profit_price=take_profit_price,
+                                highest_price=price,  # lowest price watermark for shorts
+                                trailing_stop_pct=trailing_stop_pct,
+                                is_paper=True,
+                            )
+                            db.add(short_pos)
 
             await db.commit()
             return order
@@ -230,12 +408,14 @@ class PaperTradingService:
     # Positions
     # ------------------------------------------------------------------
 
-    async def get_positions(self, symbol: Optional[str] = None) -> List[PaperPosition]:
-        """Return open paper trading positions."""
+    async def get_positions(self, symbol: Optional[str] = None, agent_id: Optional[str] = None) -> List[PaperPosition]:
+        """Return open paper trading positions, optionally filtered by symbol and/or agent."""
         async with get_async_session() as db:
             query = select(PaperPosition).where(PaperPosition.user_id == "default-user")
             if symbol:
                 query = query.where(PaperPosition.symbol == symbol)
+            if agent_id:
+                query = query.where(PaperPosition.agent_id == agent_id)
             result = await db.execute(query)
             return result.scalars().all()
 
@@ -249,9 +429,16 @@ class PaperTradingService:
             except Exception:
                 current_price = pos.current_price or pos.entry_price or 0.0
             entry = pos.entry_price or 0.0
-            unrealized = (current_price - entry) * (pos.quantity or 0)
-            unrealized_pct = ((current_price - entry) / entry * 100) if entry > 0 else 0.0
+            pos_side = pos.side.value if hasattr(pos.side, 'value') else str(pos.side)
+            is_short = pos_side.lower() == 'sell'
+            if is_short:
+                unrealized = (entry - current_price) * (pos.quantity or 0)
+                unrealized_pct = ((entry - current_price) / entry * 100) if entry > 0 else 0.0
+            else:
+                unrealized = (current_price - entry) * (pos.quantity or 0)
+                unrealized_pct = ((current_price - entry) / entry * 100) if entry > 0 else 0.0
             live_positions.append({
+                "id": pos.id,
                 "symbol": pos.symbol,
                 "side": pos.side.value if hasattr(pos.side, 'value') else str(pos.side),
                 "quantity": pos.quantity,
@@ -265,8 +452,49 @@ class PaperTradingService:
                 "trailing_stop_pct": getattr(pos, 'trailing_stop_pct', None),
                 "updated_at": pos.updated_at.isoformat() if pos.updated_at else None,
                 "agent_id": pos.agent_id,
+                "is_paper": getattr(pos, 'is_paper', True),
             })
         return live_positions
+
+    async def update_position_sl_tp(
+        self,
+        position_id: str,
+        stop_loss_price: Optional[float] = ...,
+        take_profit_price: Optional[float] = ...,
+        trailing_stop_pct: Optional[float] = ...,
+    ) -> Optional[dict]:
+        """Update stop-loss, take-profit, or trailing-stop on an open position.
+
+        Pass ``None`` to clear a field. Omit (leave as ``...``) to leave unchanged.
+        """
+        async with get_async_session() as db:
+            pos = await db.get(PaperPosition, position_id)
+            if not pos or pos.user_id != "default-user":
+                return None
+
+            if stop_loss_price is not ...:
+                pos.stop_loss_price = stop_loss_price
+            if take_profit_price is not ...:
+                pos.take_profit_price = take_profit_price
+            if trailing_stop_pct is not ...:
+                pos.trailing_stop_pct = trailing_stop_pct
+
+            await db.commit()
+            await db.refresh(pos)
+
+            self.logger.info(
+                "Position %s (%s) SL/TP updated → SL=%s  TP=%s  trail=%s",
+                pos.symbol, position_id[:8],
+                pos.stop_loss_price, pos.take_profit_price, pos.trailing_stop_pct,
+            )
+
+            return {
+                "id": pos.id,
+                "symbol": pos.symbol,
+                "stop_loss_price": pos.stop_loss_price,
+                "take_profit_price": pos.take_profit_price,
+                "trailing_stop_pct": pos.trailing_stop_pct,
+            }
 
     async def update_highest_price(self, position_id: str, current_price: float):
         """Update the highest price watermark for trailing stop tracking."""
@@ -276,6 +504,144 @@ class PaperTradingService:
                 if pos.highest_price is None or current_price > pos.highest_price:
                     pos.highest_price = current_price
                     await db.commit()
+
+    # ------------------------------------------------------------------
+    # Closed Trades (FIFO-matched buy→sell pairs with realised P&L)
+    # ------------------------------------------------------------------
+
+    async def get_closed_trades(self, symbol: Optional[str] = None, limit: int = 100) -> List[dict]:
+        """Return completed round-trip trades with realised P&L.
+
+        Uses FIFO matching: for longs, each sell is matched against earliest
+        unfilled buy. For shorts, each buy is matched against earliest
+        unfilled sell.
+        """
+        async with get_async_session() as db:
+            query = (
+                select(PaperOrder)
+                .where(
+                    PaperOrder.user_id == "default-user",
+                    PaperOrder.status == OrderStatus.FILLED,
+                )
+                .order_by(PaperOrder.created_at.asc())
+            )
+            if symbol:
+                query = query.where(PaperOrder.symbol == symbol)
+            result = await db.execute(query)
+            orders = result.scalars().all()
+
+        # Group by (symbol, agent_id) for per-agent isolation
+        groups: dict[tuple, dict] = {}
+        for o in orders:
+            key = (o.symbol, o.agent_id or "__none__")
+            groups.setdefault(key, {"buys": [], "sells": []})
+            if o.side == OrderSide.BUY:
+                groups[key]["buys"].append(o)
+            else:
+                groups[key]["sells"].append(o)
+
+        closed: list[dict] = []
+        for (sym, agent_id), sides in groups.items():
+            # --- LONG trades: buy→sell FIFO ---
+            buys = list(sides["buys"])
+            buy_idx = 0
+            buy_remaining = buys[0].quantity if buys else 0
+
+            for sell in sides["sells"]:
+                remaining = sell.quantity
+                while remaining > 1e-12 and buy_idx < len(buys):
+                    fill = min(remaining, buy_remaining)
+                    buy = buys[buy_idx]
+                    pnl = fill * (sell.price - buy.price)
+                    pnl_pct = ((sell.price - buy.price) / buy.price * 100) if buy.price else 0
+                    fee = (buy.fee or 0) * (fill / buy.quantity) + (sell.fee or 0) * (fill / sell.quantity)
+                    net_pnl = pnl - fee
+
+                    closed.append({
+                        "symbol": sym,
+                        "agent_id": agent_id if agent_id != "__none__" else None,
+                        "side": "long",
+                        "quantity": round(fill, 8),
+                        "entry_price": buy.price,
+                        "exit_price": sell.price,
+                        "entry_time": buy.created_at.isoformat() if buy.created_at else None,
+                        "exit_time": sell.created_at.isoformat() if sell.created_at else None,
+                        "gross_pnl": round(pnl, 4),
+                        "fee": round(fee, 4),
+                        "net_pnl": round(net_pnl, 4),
+                        "pnl_pct": round(pnl_pct, 2),
+                        "result": "win" if net_pnl > 0 else ("loss" if net_pnl < 0 else "breakeven"),
+                    })
+
+                    remaining -= fill
+                    buy_remaining -= fill
+                    if buy_remaining <= 1e-12:
+                        buy_idx += 1
+                        buy_remaining = buys[buy_idx].quantity if buy_idx < len(buys) else 0
+
+            # --- SHORT trades: sell→buy FIFO ---
+            # Unmatched sells (after long matching) are short entries
+            # Match remaining sells against buys that follow them chronologically
+            unmatched_sells = []
+            for s in sides["sells"]:
+                unmatched_sells.append({"order": s, "remaining": s.quantity})
+            # Subtract fills already used by long matching
+            for entry in unmatched_sells:
+                entry["remaining"] = 0  # reset — we'll rebuild from scratch
+
+            # Rebuild: sells that come BEFORE any matching buy = short entries
+            sell_list = list(sides["sells"])
+            buy_list = list(sides["buys"])
+            # Short detection: sells that weren't preceded by enough buys
+            cum_bought = 0.0
+            cum_sold = 0.0
+            all_orders = sorted(
+                [(o, "buy") for o in buy_list] + [(o, "sell") for o in sell_list],
+                key=lambda x: x[0].created_at
+            )
+            short_entries: list = []  # (order, qty)
+            short_remaining: list = []
+
+            for o, side_str in all_orders:
+                if side_str == "buy":
+                    cum_bought += o.quantity
+                    # Check if this buy covers any open shorts
+                    for sr in short_remaining:
+                        if sr["remaining"] <= 1e-12:
+                            continue
+                        cover = min(o.quantity, sr["remaining"])
+                        if cover > 1e-12:
+                            entry_order = sr["order"]
+                            pnl = cover * (entry_order.price - o.price)  # short P&L
+                            pnl_pct = ((entry_order.price - o.price) / entry_order.price * 100) if entry_order.price else 0
+                            fee = (entry_order.fee or 0) * (cover / entry_order.quantity) + (o.fee or 0) * (cover / o.quantity)
+                            net_pnl = pnl - fee
+
+                            closed.append({
+                                "symbol": sym,
+                                "agent_id": agent_id if agent_id != "__none__" else None,
+                                "side": "short",
+                                "quantity": round(cover, 8),
+                                "entry_price": entry_order.price,
+                                "exit_price": o.price,
+                                "entry_time": entry_order.created_at.isoformat() if entry_order.created_at else None,
+                                "exit_time": o.created_at.isoformat() if o.created_at else None,
+                                "gross_pnl": round(pnl, 4),
+                                "fee": round(fee, 4),
+                                "net_pnl": round(net_pnl, 4),
+                                "pnl_pct": round(pnl_pct, 2),
+                                "result": "win" if net_pnl > 0 else ("loss" if net_pnl < 0 else "breakeven"),
+                            })
+                            sr["remaining"] -= cover
+                else:
+                    cum_sold += o.quantity
+                    if cum_sold > cum_bought + 1e-12:
+                        short_qty = min(o.quantity, cum_sold - cum_bought)
+                        short_remaining.append({"order": o, "remaining": short_qty})
+
+        # Sort by exit time descending (most recent first) and limit
+        closed.sort(key=lambda t: t["exit_time"] or "", reverse=True)
+        return closed[:limit]
 
     # ------------------------------------------------------------------
     # P&L

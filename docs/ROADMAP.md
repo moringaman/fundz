@@ -31,7 +31,7 @@ The Settings UI already has a leverage slider (1–50x, default 1x), but the val
 ## Per-Agent Position Isolation
 
 **Priority:** High  
-**Status:** Planned  
+**Status:** ✅ Implemented  
 **Complexity:** Medium — primarily paper trading engine + scheduler
 
 Currently, positions are tracked **per symbol only**. When multiple agents trade the same pair (e.g. BTCUSDT), their buys merge into a single blended position. This makes individual agent P&L attribution unreliable and distorts win rate, allocation decisions, and performance metrics.
@@ -127,47 +127,41 @@ CryptocurrencyAlerting.com provides:
 ## Browser Push Notifications
 
 **Priority:** Medium  
-**Status:** Planned  
+**Status:** ✅ Implemented (Phase 1 — Web Notifications API)  
 **Complexity:** Medium
 
-Real-time browser push notifications so users are alerted to key fund events even when the dashboard tab isn't in focus or the browser is minimised.
+Real-time browser notifications so users are alerted to key fund events even when the dashboard tab isn't in focus.
 
-### Events to notify
+### Phase 1 (Implemented)
 
-| Event | Priority | Example |
-|-------|----------|---------|
-| Trade executed | Normal | "Marcus bought 0.05 BTC @ $64,230" |
-| Position closed (SL/TP hit) | High | "⚠️ Stop loss triggered on ETHUSDT — sold @ $3,180 (−2.4%)" |
-| Large P&L swing | High | "Portfolio up +5.2% in the last hour" |
-| Agent allocation rebalance | Normal | "James reallocated: BTC 35% → 28%, ETH 20% → 27%" |
-| Daily summary ready | Low | "📊 Daily report for Apr 6 is ready" |
-| Whale alert (if integrated) | Normal | "🐋 12,000 BTC moved to Binance — potential sell pressure" |
-| Agent error / downtime | High | "⚠️ Agent Marcus failed 3 consecutive runs" |
+Uses the **Web Notifications API** triggered via existing WebSocket events. Notifications appear when the tab is in the background.
 
-### What needs to happen
+**Components built:**
+- `frontend/src/lib/notifications.ts` — NotificationService: permission handling, preference storage (localStorage), event classification, browser notification dispatch
+- `frontend/src/hooks/useBrowserNotifications.ts` — WS event listener that triggers notifications when tab is hidden
+- Settings page "Notifications" tab — per-event toggle UI with master switch, permission request, test notification button
 
-1. **Service Worker** — Register a service worker in the frontend for push event handling; required for notifications when tab is not focused
-2. **Push subscription** — Use the browser Push API (`PushManager.subscribe()`) with VAPID keys; store subscription endpoint + keys in backend
-3. **Backend notification service** — New `notification_service.py` that sends push messages via Web Push protocol (`pywebpush` library)
-4. **Event hooks** — Wire notifications into key moments: trade execution in scheduler, SL/TP exits in position monitor, allocation changes, daily email trigger
-5. **Notification preferences** — Settings UI toggle per event type (trade executed, SL hit, rebalance, etc.) so users control what they receive
-6. **Frontend toast + history** — In-app notification bell with unread count + dropdown history, alongside the browser push
+**Supported event types:**
+| Event | Default | Notification |
+|-------|---------|-------------|
+| Trade executed | ✅ ON | "Trade Executed: Agent bought 0.05 BTC..." |
+| Position closed (SL/TP) | ✅ ON | "Position Closed: Stop-loss ETHUSDT..." (persistent) |
+| Risk alert | ✅ ON | "⚠️ Risk Alert: Elena flags danger..." (persistent) |
+| Portfolio rebalance | ❌ OFF | "Portfolio Rebalanced: James reallocated..." |
+| Daily report ready | ✅ ON | "📊 Daily Report Ready" |
+| Agent error | ✅ ON | "⚠️ Agent Issue: Agent failed..." |
 
-### Configuration
+**Preferences:** Stored in `localStorage` key `px_notification_prefs`. Each event type can be independently toggled.
 
-| Variable | Description |
-|----------|-------------|
-| `VAPID_PUBLIC_KEY` | Web Push VAPID public key |
-| `VAPID_PRIVATE_KEY` | Web Push VAPID private key |
-| `VAPID_CONTACT_EMAIL` | Contact email for VAPID (required by spec) |
+### Phase 2 (Future — Full Push via Service Worker)
 
-### Considerations
+For notifications even when the browser is closed:
 
-- VAPID keys generated once via `pywebpush` CLI or `web-push generate-vapid-keys`
-- Service workers require HTTPS in production (localhost is exempt for dev)
-- Subscription can expire — backend should handle `410 Gone` and clean up stale subscriptions
-- Rate-limit notifications to avoid spamming (e.g. batch trade notifications within a 1-min window)
-- Consider a notification queue (Redis) to decouple event producers from push delivery
+1. **Service Worker** — Register for push event handling
+2. **VAPID keys** — Generate and configure `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_CONTACT_EMAIL`
+3. **Backend push service** — `notification_service.py` using `pywebpush` library
+4. **Push subscription storage** — DB table for user push endpoints
+5. **Rate limiting** — Batch notifications within 1-min windows
 - Falls back gracefully if user denies permission — in-app bell still works
 
 ---

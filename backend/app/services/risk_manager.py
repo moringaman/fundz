@@ -17,6 +17,7 @@ class RiskConfig:
     max_position_size: float = 1000.0
     trailing_stop_pct: Optional[float] = None
     max_open_positions: int = 3
+    max_exposure: Optional[float] = None  # absolute $ cap; if None, falls back to max_position_size * 10
 
 
 @dataclass
@@ -73,11 +74,12 @@ class RiskManager:
         trade_value = quantity * entry_price
         potential_exposure = total_exposure + trade_value
         
-        if potential_exposure > risk_config.max_position_size * 10:
+        if potential_exposure > (risk_config.max_exposure or risk_config.max_position_size * 10):
+            exposure_limit = risk_config.max_exposure or risk_config.max_position_size * 10
             return RiskCheckResult(
                 allowed=False,
                 action="reject",
-                reason=f"Max position size exceeded: ${risk_config.max_position_size * 10}"
+                reason=f"Max exposure exceeded: ${exposure_limit:.0f}"
             )
         
         if len(current_positions) >= risk_config.max_open_positions:
@@ -237,9 +239,16 @@ class RiskManager:
                 concentration = "low"
 
             # Determine risk level
+            # Exposure threshold is configurable via Settings → Risk Limits
+            try:
+                from app.api.routes.settings import get_risk_limits
+                exposure_threshold = get_risk_limits().exposure_threshold_pct
+            except Exception:
+                exposure_threshold = 80.0
+
             if daily_pnl <= -max_daily_loss:
                 risk_level = "danger"
-            elif daily_pnl <= -max_daily_loss / 2 or exposure_pct > 80:
+            elif daily_pnl <= -max_daily_loss / 2 or exposure_pct > exposure_threshold:
                 risk_level = "caution"
             else:
                 risk_level = "safe"
@@ -248,8 +257,8 @@ class RiskManager:
             recommendations = []
             if risk_level != "safe":
                 recommendations.append(f"Current risk level: {risk_level}")
-            if exposure_pct > 80:
-                recommendations.append(f"Portfolio exposure high ({exposure_pct:.1f}% of capital)")
+            if exposure_pct > exposure_threshold:
+                recommendations.append(f"Portfolio exposure high ({exposure_pct:.1f}% of capital, threshold: {exposure_threshold:.0f}%)")
             if daily_pnl < 0:
                 recommendations.append(f"Daily P&L negative: ${daily_pnl:.2f}")
             if concentration == "high":

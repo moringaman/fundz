@@ -12,6 +12,7 @@ from app.services.agent_scheduler import agent_scheduler
 from app.services.llm import LLMRegistry
 from app.services.team_chat import team_chat
 from app.services.daily_report import daily_report_service
+from app.services.firm_advisor import firm_advisor
 
 router = APIRouter(prefix="/fund", tags=["fund"])
 
@@ -459,7 +460,7 @@ async def get_performance_attribution():
 # ==================== Risk Manager Endpoints ====================
 
 @router.get("/risk-assessment", response_model=RiskAssessmentResponse)
-async def get_risk_assessment(total_capital: float = 10000):
+async def get_risk_assessment():
     """
     Get current portfolio risk assessment.
     Serves the scheduler's cached assessment (computed every 5 min with real positions).
@@ -482,9 +483,8 @@ async def get_risk_assessment(total_capital: float = 10000):
                 reasoning=cached.reasoning or "",
             )
 
-        # Fallback: compute live with real positions from paper trading
+        # Fallback: compute live with real positions and real capital
         from app.services.paper_trading import paper_trading
-        daily_pnl = risk_manager.get_daily_pnl()
         positions_live = await paper_trading.get_positions_live()
         current_positions = [
             {
@@ -496,6 +496,24 @@ async def get_risk_assessment(total_capital: float = 10000):
             }
             for p in positions_live
         ]
+
+        # Compute real total capital (USDT balance + positions value)
+        try:
+            balances = await paper_trading.get_all_balances()
+            usdt_balance = next((b.available for b in balances if b.asset == "USDT"), 10000.0)
+            positions_value = sum(
+                p.get("quantity", 0) * p.get("current_price", p.get("entry_price", 0))
+                for p in positions_live
+            )
+            total_capital = usdt_balance + positions_value
+        except Exception:
+            total_capital = 10000.0
+
+        # Compute daily P&L from DB (FIFO-matched sells today)
+        try:
+            daily_pnl = await agent_scheduler._compute_daily_pnl()
+        except Exception:
+            daily_pnl = risk_manager.get_daily_pnl()
 
         assessment = await risk_manager.generate_risk_assessment(
             current_positions=current_positions,
@@ -781,3 +799,45 @@ async def get_strategy_actions(limit: int = 20):
             ]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch strategy actions: {str(e)}")
+
+
+# ==================== Firm Advisor Chatbot ====================
+
+class AdvisorQuestionRequest(BaseModel):
+    message: str
+
+class AdvisorResponse(BaseModel):
+    response: str
+    timestamp: str
+    context_summary: Dict[str, Any]
+
+class AdvisorMessage(BaseModel):
+    role: str
+    content: str
+    timestamp: str
+
+
+@router.post("/advisor/ask", response_model=AdvisorResponse)
+async def ask_firm_advisor(req: AdvisorQuestionRequest):
+    """Ask the fund management team a question about strategy or market conditions."""
+    if not req.message.strip():
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+    try:
+        result = await firm_advisor.ask(req.message.strip())
+        return AdvisorResponse(**result)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Advisor failed: {str(e)}")
+
+
+@router.get("/advisor/history", response_model=List[AdvisorMessage])
+async def get_advisor_history(limit: int = 50):
+    """Get conversation history with the firm advisor."""
+    history = firm_advisor.get_history(limit)
+    return [AdvisorMessage(**msg) for msg in history]
+
+
+@router.post("/advisor/clear")
+async def clear_advisor_history():
+    """Clear the advisor conversation history."""
+    firm_advisor.clear_history()
+    return {"status": "cleared"}

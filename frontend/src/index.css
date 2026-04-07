@@ -225,7 +225,7 @@ body {
 @media (min-width: 641px) { .mobile-header { display: none; } }
 
 /* ── Utility ─────────────────────────────────────────────────────────── */
-.space-y-6 > * + * { margin-top: 1.25rem; }
+.space-y-6 > * + * { margin-top: 1.25rem; margin-left: 1.25rem; }
 .positive { color: var(--green); }
 .negative { color: var(--red); }
 .text-gray-400 { color: var(--text-secondary); }
@@ -244,6 +244,7 @@ body {
   color: var(--text-primary);
   letter-spacing: -.01em;
   margin-bottom: 1.25rem;
+  margin-left: 1.25rem;
 }
 
 /* ── Ticker Bar (Dashboard) ──────────────────────────────────────────── */
@@ -353,7 +354,8 @@ body {
   background: var(--bg-panel);
   border: 1px solid var(--border);
   border-radius: 10px;
-  overflow: hidden;
+  overflow: auto;
+  max-height: 600px;
 }
 
 .panel-header {
@@ -501,7 +503,7 @@ body {
   display: flex;
   flex-direction: column;
   gap: 0;
-  max-height: 300px;
+  max-height: 400px;
   overflow-y: auto;
 }
 .activity-feed::-webkit-scrollbar { width: 3px; }
@@ -922,9 +924,15 @@ body {
 .detail-label { color: var(--text-secondary); }
 .detail-value { font-family: var(--mono); color: var(--text-primary); font-size: .75rem; }
 
-.detail-progress { display: flex; align-items: center; gap: .5rem; }
-.progress-bar { height: 4px; background: var(--green); border-radius: 2px; min-width: 12px; max-width: 80px; }
-.progress-bar + span { font-family: var(--mono); font-size: .75rem; color: var(--text-secondary); }
+.detail-progress { display: flex; align-items: center; gap: .5rem; flex: 1; max-width: 160px; }
+.detail-progress .progress-track {
+  flex: 1; height: 6px; background: var(--bg-hover); border-radius: 3px; overflow: hidden; position: relative;
+}
+.detail-progress .progress-fill {
+  height: 100%; border-radius: 3px; min-width: 2px;
+  transition: width 0.3s ease;
+}
+.detail-progress .progress-pct { font-family: var(--mono); font-size: .75rem; color: var(--text-primary); font-weight: 600; min-width: 36px; text-align: right; }
 
 .risk-row { flex-direction: column; gap: .25rem; align-items: flex-start; }
 .risk-values { display: flex; gap: 1rem; }
@@ -1607,3 +1615,8 @@ body {
 }
 .daily-report-kv > div > span:first-child { color: var(--text-dim); }
 .daily-report-kv > div > span:last-child { color: var(--text-primary); font-family: var(--mono); font-weight: 600; }
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}

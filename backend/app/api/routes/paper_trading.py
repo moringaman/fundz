@@ -112,6 +112,74 @@ async def get_paper_balance():
     ]
 
 
+class AdjustBalanceRequest(BaseModel):
+    asset: str = "USDT"
+    amount: float
+
+
+@router.post("/balance/adjust")
+async def adjust_paper_balance(req: AdjustBalanceRequest):
+    """Deposit or withdraw funds from the paper trading wallet."""
+    try:
+        updated = await paper_trading.adjust_balance(req.asset, req.amount)
+        action = "deposited" if req.amount > 0 else "withdrew"
+        return {
+            "message": f"Successfully {action} {abs(req.amount)} {req.asset}",
+            **updated,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/portfolio")
+async def get_paper_portfolio():
+    """Canonical portfolio summary — single source of truth for balances,
+    positions value, total capital, and exposure."""
+    balances = await paper_trading.get_all_balances()
+    positions = await paper_trading.get_positions_live()
+
+    # Cash balances
+    balance_list = [
+        {"asset": b.asset, "available": b.available, "locked": b.locked}
+        for b in balances
+    ]
+    usdt_bal = next((b for b in balances if b.asset == "USDT"), None)
+    usdt_total = (usdt_bal.available + usdt_bal.locked) if usdt_bal else 0.0
+
+    # Open positions value
+    positions_value = sum(
+        p.get("quantity", 0) * p.get("current_price", p.get("entry_price", 0))
+        for p in positions
+    )
+
+    total_capital = usdt_total + positions_value
+
+    # Exposure = positions value / total capital (same as risk manager)
+    exposure_pct = (positions_value / total_capital * 100) if total_capital > 0 else 0.0
+
+    # Concentration
+    largest_position = None
+    concentration = "low"
+    if positions:
+        largest = max(positions, key=lambda p: p.get("quantity", 0) * p.get("current_price", p.get("entry_price", 0)))
+        largest_val = largest.get("quantity", 0) * largest.get("current_price", largest.get("entry_price", 0))
+        largest_pct = (largest_val / positions_value * 100) if positions_value > 0 else 0
+        largest_position = {"symbol": largest.get("symbol"), "value": largest_val, "pct": largest_pct}
+        concentration = "high" if largest_pct > 40 else ("medium" if largest_pct > 25 else "low")
+
+    return {
+        "balances": balance_list,
+        "positions_count": len(positions),
+        "positions_value": positions_value,
+        "usdt_available": usdt_bal.available if usdt_bal else 0.0,
+        "usdt_total": usdt_total,
+        "total_capital": total_capital,
+        "exposure_pct": exposure_pct,
+        "concentration": concentration,
+        "largest_position": largest_position,
+    }
+
+
 @router.post("/order", response_model=OrderResponse)
 async def place_paper_order(order: OrderRequest):
     try:
@@ -165,6 +233,12 @@ async def get_paper_orders(symbol: Optional[str] = None, limit: int = 50):
     ]
 
 
+@router.get("/closed-trades")
+async def get_closed_trades(symbol: Optional[str] = None, limit: int = 100):
+    """Return FIFO-matched buy→sell round-trips with realised P&L."""
+    return await paper_trading.get_closed_trades(symbol=symbol, limit=limit)
+
+
 @router.get("/positions")
 async def get_paper_positions(symbol: Optional[str] = None):
     return await paper_trading.get_positions_live(symbol)
@@ -173,3 +247,29 @@ async def get_paper_positions(symbol: Optional[str] = None):
 @router.get("/pnl")
 async def get_paper_pnl():
     return await paper_trading.calculate_pnl()
+
+
+class UpdatePositionRequest(BaseModel):
+    stop_loss_price: Optional[float] = None
+    take_profit_price: Optional[float] = None
+    trailing_stop_pct: Optional[float] = None
+
+
+@router.patch("/positions/{position_id}")
+async def update_position_sl_tp(position_id: str, body: UpdatePositionRequest):
+    """Update stop-loss, take-profit, or trailing-stop on an open position."""
+    kwargs: dict = {}
+    if body.stop_loss_price is not None:
+        kwargs["stop_loss_price"] = body.stop_loss_price
+    if body.take_profit_price is not None:
+        kwargs["take_profit_price"] = body.take_profit_price
+    if body.trailing_stop_pct is not None:
+        kwargs["trailing_stop_pct"] = body.trailing_stop_pct
+
+    if not kwargs:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    result = await paper_trading.update_position_sl_tp(position_id, **kwargs)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Position not found")
+    return result

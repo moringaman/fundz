@@ -24,6 +24,7 @@ class RiskLimits(BaseModel):
     default_stop_loss_pct: float = Field(default=2.0, ge=0.1, le=50)
     default_take_profit_pct: float = Field(default=4.0, ge=0.1, le=100)
     max_leverage: float = Field(default=1.0, ge=1.0, le=125)
+    exposure_threshold_pct: float = Field(default=80.0, ge=10.0, le=100.0)
 
 
 class TradingPreferences(BaseModel):
@@ -32,6 +33,9 @@ class TradingPreferences(BaseModel):
     paper_trading_default: bool = True
     auto_confirm_orders: bool = False
     default_order_type: str = "limit"
+    trading_pairs: list[str] = Field(
+        default=["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT"]
+    )
 
 
 class LlmConfig(BaseModel):
@@ -89,6 +93,16 @@ class LlmConfigUpdateRequest(BaseModel):
 
 _runtime_risk_limits = RiskLimits()
 _runtime_trading_prefs = TradingPreferences()
+
+
+def get_risk_limits() -> RiskLimits:
+    """Access current risk limits from other modules."""
+    return _runtime_risk_limits
+
+
+def get_trading_prefs() -> TradingPreferences:
+    """Access current trading preferences from other modules."""
+    return _runtime_trading_prefs
 
 
 def _mask_key(key: Optional[str]) -> Optional[str]:
@@ -205,3 +219,9 @@ async def send_test_email():
     if ok:
         return {"status": "ok", "message": f"Test email sent to {app_settings.mail_to_address}"}
     raise HTTPException(status_code=502, detail="Email delivery failed — check server logs")
+
+
+@router.get("/trading-pairs")
+async def get_trading_pairs():
+    """Return the configured trading pairs list."""
+    return {"pairs": _runtime_trading_prefs.trading_pairs}

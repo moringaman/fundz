@@ -14,6 +14,7 @@ from app.services.indicators import IndicatorService
 from app.services.paper_trading import paper_trading
 from app.services.backtest import BacktestEngine
 from app.services.risk_manager import risk_manager, RiskConfig
+from app.models import OrderSide, OrderStatus
 from app.services.research_analyst import research_analyst
 from app.services.fund_manager import fund_manager
 from app.services.cio_agent import cio_agent
@@ -80,6 +81,7 @@ class AgentScheduler:
         self._current_analyst_report = None
         self._current_execution_plan = None
         self._current_cio_report = None
+        self._current_confluence_scores: Dict[str, Dict] = {}
     
     @property
     def is_running(self) -> bool:
@@ -92,6 +94,144 @@ class AgentScheduler:
     def get_current_risk_assessment(self):
         """Return the latest risk assessment computed during team analysis."""
         return self._current_risk_assessment
+
+    async def _compute_daily_pnl(self) -> float:
+        """Compute today's realized P&L from FIFO-matched buy→sell orders."""
+        from datetime import date
+        try:
+            orders = await paper_trading.get_orders(limit=500)
+            today = date.today()
+            # Filter sells executed today
+            today_sells = [
+                o for o in orders
+                if o.side == OrderSide.SELL
+                and o.status == OrderStatus.FILLED
+                and o.created_at
+                and o.created_at.date() == today
+            ]
+            if not today_sells:
+                return 0.0
+
+            # Get ALL filled orders for FIFO matching
+            all_orders = sorted(orders, key=lambda o: o.created_at or datetime.min)
+            # Group buys by (symbol, agent_id)
+            buy_queues: dict = {}
+            daily_pnl = 0.0
+
+            for o in all_orders:
+                key = (o.symbol, o.agent_id or "__none__")
+                if o.side == OrderSide.BUY and o.status == OrderStatus.FILLED:
+                    buy_queues.setdefault(key, []).append({"qty": o.quantity, "price": o.price})
+                elif o.side == OrderSide.SELL and o.status == OrderStatus.FILLED:
+                    buys = buy_queues.get(key, [])
+                    remaining = o.quantity
+                    sell_pnl = 0.0
+                    while remaining > 1e-12 and buys:
+                        fill = min(remaining, buys[0]["qty"])
+                        sell_pnl += fill * (o.price - buys[0]["price"])
+                        remaining -= fill
+                        buys[0]["qty"] -= fill
+                        if buys[0]["qty"] <= 1e-12:
+                            buys.pop(0)
+                    # Only count P&L for today's sells
+                    if o.created_at and o.created_at.date() == today:
+                        daily_pnl += sell_pnl
+
+            return round(daily_pnl, 4)
+        except Exception as e:
+            logger.error(f"Failed to compute daily P&L: {e}")
+            return risk_manager.get_daily_pnl()
+
+    def _build_team_context(self, agent_id: str, symbol: str) -> Optional[Dict]:
+        """Build team intelligence dict for LLM-based agents."""
+        ctx = {}
+
+        # Technical Analyst data
+        if hasattr(self, '_current_confluence_scores') and self._current_confluence_scores:
+            ta_data = self._current_confluence_scores.get(symbol)
+            if ta_data:
+                ctx["ta"] = {
+                    "signal": ta_data.get("signal", "hold"),
+                    "confidence": ta_data.get("confidence", 0),
+                    "alignment": ta_data.get("alignment", "unknown"),
+                    "confluence_score": ta_data.get("score", 0),
+                    "patterns_count": ta_data.get("patterns", 0),
+                    "patterns_summary": ta_data.get("details", ""),
+                    "observations": ta_data.get("details", ""),
+                    "support": 0,
+                    "resistance": 0,
+                }
+
+        # Research Analyst data
+        if self._current_analyst_report:
+            report = self._current_analyst_report
+            regime = getattr(report, 'market_regime', None)
+            top_opp = getattr(report, 'top_opportunity', None)
+            if regime:
+                ctx["research"] = {
+                    "regime": getattr(regime, 'regime', 'unknown'),
+                    "sentiment": getattr(regime, 'sentiment', 'neutral'),
+                    "volatility": getattr(regime, 'volatility_regime', 'medium'),
+                    "correlation": getattr(regime, 'correlation_status', 'mixed'),
+                    "top_opportunity": (
+                        f"{top_opp.symbol} {top_opp.recommended_action} ({top_opp.confidence:.0%})"
+                        if top_opp else "None"
+                    ),
+                }
+
+        # Risk Manager data
+        if self._current_risk_assessment:
+            ra = self._current_risk_assessment
+            ctx["risk"] = {
+                "risk_level": ra.risk_level,
+                "exposure_pct": ra.exposure_pct_of_capital,
+                "daily_pnl": ra.daily_pnl,
+                "concentration": ra.concentration_risk,
+                "recommendations": "; ".join(ra.recommendations[:3]) if ra.recommendations else "None",
+            }
+
+        # Agent's own performance
+        metrics = self._agent_metrics.get(agent_id)
+        if metrics:
+            ctx["agent_performance"] = {
+                "win_rate": metrics.win_rate,
+                "total_runs": metrics.total_runs,
+                "total_pnl": metrics.total_pnl,
+                "streak": (
+                    f"{metrics.successful_runs}W/{metrics.failed_runs}L"
+                    if metrics.total_runs > 0 else "No trades yet"
+                ),
+            }
+
+        return ctx if ctx else None
+
+    def _build_market_context(self, agent_id: str, symbol: str) -> Optional[Dict]:
+        """Build market context dict for non-AI (indicator-based) strategies."""
+        ctx = {}
+
+        # Market regime from Research Analyst
+        if self._current_analyst_report:
+            regime = getattr(self._current_analyst_report, 'market_regime', None)
+            if regime:
+                ctx["regime"] = getattr(regime, 'regime', 'unknown')
+
+        # TA signal for this symbol
+        if hasattr(self, '_current_confluence_scores') and self._current_confluence_scores:
+            ta_data = self._current_confluence_scores.get(symbol)
+            if ta_data:
+                ctx["ta_signal"] = ta_data.get("signal", "hold")
+                ctx["ta_confidence"] = ta_data.get("confidence", 0)
+
+        # Risk level
+        if self._current_risk_assessment:
+            ctx["risk_level"] = self._current_risk_assessment.risk_level
+
+        # Agent win rate
+        metrics = self._agent_metrics.get(agent_id)
+        if metrics and metrics.total_runs > 0:
+            ctx["win_rate"] = metrics.win_rate
+
+        return ctx if ctx else None
     
     async def start(self):
         if self._running:
@@ -264,11 +404,16 @@ class AgentScheduler:
                 try:
                     current_price = await paper_trading.fetch_current_price(pos.symbol)
                     if current_price <= 0:
+                        logger.warning(f"SL/TP monitor: skipping {pos.symbol} — bad price {current_price}")
                         continue
 
                     entry = pos.entry_price or 0
                     if entry <= 0:
+                        logger.warning(f"SL/TP monitor: skipping {pos.symbol} — bad entry {entry}")
                         continue
+
+                    pos_side = pos.side.value if hasattr(pos.side, 'value') else str(pos.side)
+                    is_short = pos_side.lower() == 'sell'
 
                     # Use stored TA-informed SL/TP from position, fall back to agent config %
                     agent_config = self._enabled_agents.get(pos.agent_id, {})
@@ -279,14 +424,26 @@ class AgentScheduler:
                         or agent_config.get('trailing_stop_pct')
                     )
 
-                    sl_price = getattr(pos, 'stop_loss_price', None) or entry * (1 - sl_pct / 100)
-                    tp_price = getattr(pos, 'take_profit_price', None) or entry * (1 + tp_pct / 100)
+                    stored_sl = getattr(pos, 'stop_loss_price', None)
+                    stored_tp = getattr(pos, 'take_profit_price', None)
 
-                    # Update highest price watermark for trailing stop
+                    if is_short:
+                        sl_price = stored_sl if stored_sl is not None else entry * (1 + sl_pct / 100)
+                        tp_price = stored_tp if stored_tp is not None else entry * (1 - tp_pct / 100)
+                    else:
+                        sl_price = stored_sl if stored_sl is not None else entry * (1 - sl_pct / 100)
+                        tp_price = stored_tp if stored_tp is not None else entry * (1 + tp_pct / 100)
+
+                    # Update watermark: highest_price for longs, lowest_price for shorts
                     highest = getattr(pos, 'highest_price', None) or entry
-                    if current_price > highest:
-                        highest = current_price
-                        await paper_trading.update_highest_price(pos.id, current_price)
+                    if is_short:
+                        if current_price < highest:
+                            highest = current_price
+                            await paper_trading.update_highest_price(pos.id, current_price)
+                    else:
+                        if current_price > highest:
+                            highest = current_price
+                            await paper_trading.update_highest_price(pos.id, current_price)
 
                     risk_config = RiskConfig(
                         stop_loss_pct=sl_pct,
@@ -295,7 +452,7 @@ class AgentScheduler:
                     )
 
                     position_dict = {
-                        'side': pos.side.value if hasattr(pos.side, 'value') else str(pos.side),
+                        'side': pos_side,
                         'entry_price': entry,
                         'stop_loss': sl_price,
                         'take_profit': tp_price,
@@ -304,23 +461,41 @@ class AgentScheduler:
 
                     check = risk_manager.check_exit(position_dict, current_price, risk_config)
 
+                    if is_short:
+                        pnl_pct = ((entry - current_price) / entry) * 100
+                    else:
+                        pnl_pct = ((current_price - entry) / entry) * 100
+                    direction = "SHORT" if is_short else "LONG"
+                    logger.info(
+                        f"SL/TP monitor: {pos.symbol} {direction} | price=${current_price:.2f} entry=${entry:.2f} "
+                        f"SL=${sl_price:.2f} TP=${tp_price:.2f} pnl={pnl_pct:+.2f}% → {check.action}"
+                    )
+
                     if check.action == "exit":
                         logger.info(
-                            f"Position exit triggered for {pos.symbol}: {check.reason} "
+                            f"Position exit triggered for {pos.symbol} {direction}: {check.reason} "
                             f"(entry: ${entry:.2f}, current: ${current_price:.2f})"
                         )
                         try:
+                            # Exit: sell for longs, buy-to-cover for shorts
+                            exit_side = "buy" if is_short else "sell"
                             await paper_trading.place_order(
                                 symbol=pos.symbol,
-                                side="sell",
+                                side=exit_side,
                                 quantity=pos.quantity,
                                 price=current_price,
                                 agent_id=pos.agent_id,
                             )
-                            logger.info(f"SL/TP exit executed: sold {pos.quantity} {pos.symbol} @ ${current_price:.2f}")
+                            action_word = "covered" if is_short else "sold"
+                            logger.info(f"SL/TP exit executed: {action_word} {pos.quantity} {pos.symbol} @ ${current_price:.2f}")
 
-                            # Update agent metrics
-                            pnl = (current_price - entry) * pos.quantity
+                            # Calculate P&L
+                            if is_short:
+                                pnl = (entry - current_price) * pos.quantity
+                            else:
+                                pnl = (current_price - entry) * pos.quantity
+                            risk_manager.record_pnl(pnl)
+
                             if pos.agent_id and pos.agent_id in self._agent_metrics:
                                 m = self._agent_metrics[pos.agent_id]
                                 m.total_runs += 1
@@ -337,7 +512,7 @@ class AgentScheduler:
                             pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
                             await team_chat.add_message(
                                 agent_role="execution_coordinator",
-                                content=f"📊 **{exit_type.upper()}** {pos.symbol}: {pnl_str} ({check.reason})",
+                                content=f"📊 **{exit_type.upper()}** {pos.symbol} ({direction}): {pnl_str} ({check.reason})",
                                 message_type="trade",
                             )
 
@@ -345,10 +520,174 @@ class AgentScheduler:
                             logger.error(f"Failed to execute SL/TP exit for {pos.symbol}: {e}")
 
                 except Exception as e:
-                    logger.debug(f"Position monitor error for {pos.symbol}: {e}")
+                    logger.warning(f"Position monitor error for {pos.symbol}: {e}", exc_info=True)
 
         except Exception as e:
             logger.error(f"Position monitoring failed: {e}")
+
+    # ------------------------------------------------------------------
+    # Autonomous SL/TP Review (Fund Manager + TA confluence)
+    # ------------------------------------------------------------------
+
+    async def _review_open_position_levels(self):
+        """Fund Manager reviews SL/TP on all open positions using TA confluence
+        and market context.  Runs during team analysis (every 5 min).
+        Adjustments are persisted to DB so the 60-second position monitor
+        picks them up immediately."""
+        try:
+            positions = await paper_trading.get_positions()
+            if not positions:
+                return
+
+            confluence = self._current_confluence_scores or {}
+            risk_assessment = self._current_risk_assessment
+            analyst_report = self._current_analyst_report
+
+            # Build concise market context once
+            market_ctx_lines = []
+            if analyst_report:
+                regime = getattr(analyst_report, 'market_regime', None)
+                if regime:
+                    market_ctx_lines.append(
+                        f"Market regime: {regime.regime} | Sentiment: {regime.sentiment}"
+                    )
+            if risk_assessment:
+                market_ctx_lines.append(
+                    f"Portfolio risk: {risk_assessment.risk_level} | "
+                    f"Exposure: {getattr(risk_assessment, 'exposure_pct', 'N/A')}%"
+                )
+            market_ctx = "\n".join(market_ctx_lines) or "No broader market context available."
+
+            # Build per-position summaries
+            position_blocks = []
+            for pos in positions:
+                try:
+                    current_price = await paper_trading.fetch_current_price(pos.symbol)
+                except Exception:
+                    current_price = pos.current_price or pos.entry_price or 0
+                entry = pos.entry_price or 0
+                if entry <= 0:
+                    continue
+
+                pnl_pct = ((current_price - entry) / entry) * 100 if entry else 0
+                sl = getattr(pos, 'stop_loss_price', None)
+                tp = getattr(pos, 'take_profit_price', None)
+
+                # TA confluence for this symbol
+                ta = confluence.get(pos.symbol, {})
+                ta_line = (
+                    f"TA signal={ta.get('signal','N/A')}, "
+                    f"confluence={ta.get('score',0):.0%}, "
+                    f"alignment={ta.get('alignment','N/A')}"
+                ) if ta else "No TA data"
+
+                position_blocks.append(
+                    f"- {pos.symbol} | side={getattr(pos.side, 'value', pos.side)} "
+                    f"entry=${entry:.2f} now=${current_price:.2f} pnl={pnl_pct:+.2f}% "
+                    f"SL={'$'+f'{sl:.2f}' if sl else 'NONE'} "
+                    f"TP={'$'+f'{tp:.2f}' if tp else 'NONE'} | {ta_line} "
+                    f"| id={pos.id}"
+                )
+
+            if not position_blocks:
+                return
+
+            from app.services.llm import llm_service
+
+            system_prompt = (
+                "You are Sarah Chen, the Fund Manager of an AI crypto trading fund. "
+                "You are reviewing open positions and deciding whether their stop-loss "
+                "and take-profit levels should be adjusted based on the latest technical "
+                "analysis, market regime, and risk context.\n\n"
+                "RULES:\n"
+                "1. Only adjust levels when there is a clear reason (TA signal change, "
+                "support/resistance shift, regime change, position well in profit).\n"
+                "2. Never widen a stop-loss beyond the original entry risk (e.g. if entry "
+                "was $100 and SL was $97, don't move SL below $97).\n"
+                "3. For profitable positions, consider tightening SL to lock in gains.\n"
+                "4. If TA confluence is bearish for a long position, tighten SL.\n"
+                "5. If TA confluence is strongly bullish, consider extending TP.\n"
+                "6. If no change is warranted, return an empty adjustments array.\n"
+                "7. Always include a brief reason per adjustment.\n\n"
+                "Return ONLY valid JSON:\n"
+                '{"adjustments": [\n'
+                '  {"position_id": "...", "symbol": "...", '
+                '"new_stop_loss": <number|null>, "new_take_profit": <number|null>, '
+                '"reason": "..."}\n'
+                '], "summary": "one-line overall summary"}'
+            )
+
+            user_prompt = (
+                f"MARKET CONTEXT:\n{market_ctx}\n\n"
+                f"OPEN POSITIONS:\n" + "\n".join(position_blocks)
+            )
+
+            raw = await llm_service._call_llm_text(
+                system_prompt, user_prompt, temperature=0.3, max_tokens=1200
+            )
+
+            # Parse JSON response
+            import json as _json
+            # Strip markdown fences if present
+            cleaned = raw.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0]
+            data = _json.loads(cleaned)
+            adjustments = data.get("adjustments", [])
+            summary = data.get("summary", "")
+
+            if not adjustments:
+                logger.info("SL/TP Review: No adjustments needed")
+                return
+
+            adjusted_count = 0
+            for adj in adjustments:
+                pid = adj.get("position_id")
+                if not pid:
+                    continue
+                new_sl = adj.get("new_stop_loss")
+                new_tp = adj.get("new_take_profit")
+                reason = adj.get("reason", "")
+                symbol = adj.get("symbol", "?")
+
+                kwargs = {}
+                if new_sl is not None:
+                    kwargs["stop_loss_price"] = float(new_sl)
+                if new_tp is not None:
+                    kwargs["take_profit_price"] = float(new_tp)
+                if not kwargs:
+                    continue
+
+                result = await paper_trading.update_position_sl_tp(pid, **kwargs)
+                if result:
+                    adjusted_count += 1
+                    parts = []
+                    if new_sl is not None:
+                        parts.append(f"SL→${new_sl:.2f}")
+                    if new_tp is not None:
+                        parts.append(f"TP→${new_tp:.2f}")
+                    logger.info(
+                        f"SL/TP Review: {symbol} {' '.join(parts)} — {reason}"
+                    )
+
+            if adjusted_count > 0:
+                await team_chat.add_message(
+                    agent_role="fund_manager",
+                    content=(
+                        f"🎯 **SL/TP Review:** Adjusted levels on {adjusted_count} "
+                        f"position(s). {summary}"
+                    ),
+                    message_type="allocation",
+                )
+
+            logger.info(
+                f"SL/TP Review complete: {adjusted_count}/{len(adjustments)} adjusted"
+            )
+
+        except _json.JSONDecodeError:
+            logger.warning("SL/TP Review: LLM returned invalid JSON, skipping")
+        except Exception as e:
+            logger.error(f"SL/TP Review failed: {e}", exc_info=True)
 
     async def _fetch_agents_from_db(self) -> List[dict]:
         """Fetch all agents from database for team tier decisions"""
@@ -424,7 +763,12 @@ class AgentScheduler:
             agents_list = await self._fetch_agents_from_db()
             agent_metrics = self._build_agent_metrics_list(agents_list)
             current_positions = await self._get_current_positions()
-            daily_pnl = risk_manager.get_daily_pnl()
+
+            # Compute daily P&L from DB (robust across restarts)
+            daily_pnl = await self._compute_daily_pnl()
+            # Sync to risk manager so in-memory tracker stays accurate
+            risk_manager._check_daily_reset()
+            risk_manager._daily_pnl['today'] = daily_pnl
 
             # Calculate real total capital (USDT balance + value of all positions)
             try:
@@ -454,17 +798,24 @@ class AgentScheduler:
             try:
                 market_condition = await fund_manager.analyze_market()
 
-                # Gather unique trading symbols across all agents for TA confluence
+                # Gather unique trading symbols: agent pairs + configured global pairs
                 all_symbols = set()
                 for a in agents_list:
                     pairs = a.get("trading_pairs") or a.get("config", {}).get("trading_pairs", [])
                     all_symbols.update(pairs)
+                # Also include all pairs from the global trading config
+                try:
+                    from app.api.routes.settings import get_trading_prefs
+                    all_symbols.update(get_trading_prefs().trading_pairs)
+                except Exception:
+                    pass
                 if not all_symbols:
                     all_symbols = {"BTCUSDT"}
 
                 # Get Technical Analyst confluence scores so FM can reconcile signals
                 try:
                     confluence_scores = await technical_analyst.get_confluence_scores(list(all_symbols))
+                    self._current_confluence_scores = confluence_scores
                     logger.info(f"Team Tier: TA confluence for {len(confluence_scores)} symbols")
                 except Exception as e:
                     logger.warning(f"Team Tier: TA confluence failed, FM will proceed without: {e}")
@@ -515,6 +866,13 @@ class AgentScheduler:
                 await team_chat.log_risk_assessment(risk_assessment)
             except Exception as e:
                 logger.error(f"Team Tier: Risk manager failed: {e}")
+
+            # 3.5 Fund Manager SL/TP Review: Adjust open position levels
+            #     based on TA confluence + market context + risk assessment
+            try:
+                await self._review_open_position_levels()
+            except Exception as e:
+                logger.error(f"Team Tier: SL/TP review failed: {e}")
 
             # 4. Execution Coordinator: Optimize order timing
             try:
@@ -627,6 +985,13 @@ class AgentScheduler:
                 logger.info(f"Running automated agent: {config.get('name')} "
                            f"(allocation: {(allocation_pct or 0):.1f}%)")
 
+                # Read paper/live mode from settings
+                try:
+                    from app.api.routes.settings import get_trading_prefs
+                    use_paper_mode = get_trading_prefs().paper_trading_default
+                except Exception:
+                    use_paper_mode = True
+
                 result = await self.run_agent(
                     agent_id=config['id'],
                     name=config.get('name', ''),
@@ -637,7 +1002,7 @@ class AgentScheduler:
                     stop_loss_pct=config.get('stop_loss_pct', 2.0),
                     take_profit_pct=config.get('take_profit_pct', 4.0),
                     trailing_stop_pct=config.get('trailing_stop_pct'),
-                    use_paper=True
+                    use_paper=use_paper_mode
                 )
 
                 config['_last_run'] = datetime.now()
@@ -705,6 +1070,10 @@ class AgentScheduler:
             
             df = pd.DataFrame(df_data)
             df = df.sort_values('time')
+
+            # Gather team intelligence for agent decision-making
+            team_context = self._build_team_context(agent_id, symbol)
+            market_context = self._build_market_context(agent_id, symbol)
             
             if strategy_type == 'ai':
                 from app.services.llm import llm_service
@@ -714,12 +1083,16 @@ class AgentScheduler:
                     'bb_upper': float(self.indicator_service.calculate_bollinger_bands(df['close']).iloc[-1]['upper']) if len(df) >= 20 else None,
                     'bb_lower': float(self.indicator_service.calculate_bollinger_bands(df['close']).iloc[-1]['lower']) if len(df) >= 20 else None,
                 }
-                llm_result = await llm_service.generate_signal(indicators_dict, {'current': float(df['close'].iloc[-1])})
+                llm_result = await llm_service.generate_signal(
+                    indicators_dict,
+                    {'current': float(df['close'].iloc[-1])},
+                    team_context=team_context,
+                )
                 signal = llm_result.action
                 confidence = llm_result.confidence
                 reasoning = llm_result.reasoning
             else:
-                signal_result = self.indicator_service.generate_signal(df, {'strategy': strategy_type})
+                signal_result = self.indicator_service.generate_signal(df, {'strategy': strategy_type}, market_context=market_context)
                 signal = signal_result.signal.value if signal_result.signal else 'hold'
                 confidence = signal_result.confidence
             
@@ -734,28 +1107,24 @@ class AgentScheduler:
                 quantity = (usdt_balance * allocation_pct / 100) / current_price
 
                 if signal == 'sell':
-                    positions = await paper_trading.get_positions(symbol)
-                    held = next((p.quantity for p in positions if p.symbol == symbol), 0.0)
-                    if held <= 0:
-                        self._record_run(agent_id, symbol, signal, confidence, current_price, False)
-                        return AgentRun(
-                            agent_id=agent_id,
-                            timestamp=timestamp,
-                            symbol=symbol,
-                            signal=signal,
-                            confidence=confidence,
-                            price=current_price,
-                            executed=False,
-                            error="No position to sell"
-                        )
-                    # Sell the full position (not a fraction)
-                    quantity = held
+                    positions = await paper_trading.get_positions(symbol, agent_id=agent_id)
+                    long_pos = next((p for p in positions if p.symbol == symbol and p.side == OrderSide.BUY), None)
+                    if long_pos:
+                        # Close the existing long position
+                        quantity = long_pos.quantity
+                    else:
+                        # Open a short position — use the same sizing as a buy
+                        pass  # quantity already calculated above
                 
+                from app.api.routes.settings import get_risk_limits
+                _limits = get_risk_limits()
                 risk_config = RiskConfig(
                     stop_loss_pct=stop_loss_pct,
                     take_profit_pct=take_profit_pct,
-                    max_daily_loss=5.0,
+                    max_daily_loss=_limits.max_daily_loss_pct,
                     max_position_size=usdt_balance * allocation_pct / 100,
+                    max_open_positions=_limits.max_open_positions,
+                    max_exposure=usdt_balance * _limits.exposure_threshold_pct / 100,
                 )
                 
                 risk_check = risk_manager.check_trade(
@@ -841,17 +1210,83 @@ class AgentScheduler:
                         logger.error(f"Paper trade failed: {e}")
                 elif not use_paper and settings.phemex_api_key and settings.phemex_api_secret:
                     try:
-                        result = await self.phemex.place_order(
-                            symbol=symbol,
-                            side=signal,
-                            quantity=quantity,
-                            order_type="Market",
-                            price=current_price
-                        )
+                        # Determine if this is a short — use contract API for shorts, spot for longs
+                        is_short_entry = signal.lower() == 'sell'
+                        if is_short_entry:
+                            # Use contract (perpetual futures) API for short positions
+                            result = await self.phemex.place_contract_order(
+                                symbol=symbol,
+                                side="sell",
+                                quantity=quantity,
+                                order_type="Market",
+                                stop_loss_price=adjusted_sl,
+                                take_profit_price=adjusted_tp,
+                            )
+                        else:
+                            result = await self.phemex.place_spot_order_with_sl_tp(
+                                symbol=symbol,
+                                side=signal,
+                                quantity=quantity,
+                                order_type="Market",
+                                price=current_price,
+                                stop_loss_price=adjusted_sl,
+                                take_profit_price=adjusted_tp,
+                            )
                         executed = True
-                        logger.info(f"Real trade executed: {signal} {quantity} {symbol} @ {current_price}")
+                        direction = "SHORT" if is_short_entry else "LONG"
+                        sl_str = f"${adjusted_sl:.2f}" if adjusted_sl else "N/A"
+                        tp_str = f"${adjusted_tp:.2f}" if adjusted_tp else "N/A"
+                        logger.info(f"LIVE {direction} trade executed: {signal} {quantity} {symbol} @ {current_price} | SL: {sl_str} TP: {tp_str}")
+
+                        # Record live trade in DB for tracking
+                        try:
+                            from app.database import get_async_session
+                            from app.models import Trade as DBTrade, OrderSide as DBOrderSide, OrderStatus as DBOrderStatus
+                            async with get_async_session() as db:
+                                db_trade = DBTrade(
+                                    user_id="default-user",
+                                    agent_id=agent_id,
+                                    symbol=symbol,
+                                    side=DBOrderSide.BUY if signal.lower() == "buy" else DBOrderSide.SELL,
+                                    quantity=quantity,
+                                    price=current_price,
+                                    total=quantity * current_price,
+                                    fee=quantity * current_price * 0.001,
+                                    status=DBOrderStatus.FILLED,
+                                    is_paper=False,
+                                    phemex_order_id=result.get("data", {}).get("orderID"),
+                                )
+                                db.add(db_trade)
+                                await db.commit()
+                        except Exception as db_err:
+                            logger.warning(f"Failed to record live trade in DB: {db_err}")
+
+                        # Place trailing stop for both longs and shorts
+                        if trailing_stop_pct and current_price:
+                            try:
+                                if is_short_entry:
+                                    # Short trailing: trigger side is Buy (cover), offset positive
+                                    offset = current_price * trailing_stop_pct / 100
+                                    await self.phemex.place_trailing_stop_order(
+                                        symbol=symbol,
+                                        side="Buy",
+                                        quantity=quantity,
+                                        trailing_offset=offset,
+                                    )
+                                else:
+                                    offset = -(current_price * trailing_stop_pct / 100)
+                                    await self.phemex.place_trailing_stop_order(
+                                        symbol=symbol,
+                                        side="Sell",
+                                        quantity=quantity,
+                                        trailing_offset=offset,
+                                    )
+                                logger.info(f"Trailing stop placed: {symbol} offset=${abs(offset):.2f} ({trailing_stop_pct}%)")
+                            except Exception as te:
+                                logger.warning(f"Trailing stop placement failed (non-fatal): {te}")
+
                     except Exception as e:
-                        logger.error(f"Real trade failed: {e}")
+                        logger.error(f"LIVE trade failed: {e}")
             
             self._record_run(agent_id, symbol, signal, confidence, current_price, executed, pnl)
             

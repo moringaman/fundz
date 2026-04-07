@@ -1,7 +1,7 @@
-import { Activity, Bot, Wallet, Settings, X, TrendingUp, History, Zap, Users } from 'lucide-react';
+import { Activity, Bot, Wallet, Settings, X, TrendingUp, History, Zap, Users, MessageCircle } from 'lucide-react';
 import { useAppSelector, useAppDispatch } from '../../store/hooks';
 import { setSidebarOpen } from '../../store/slices/uiSlice';
-import { useAutomationStatus, useAgents, useTradeHistory, useFundTeamStatus } from '../../hooks/useQueries';
+import { useAutomationStatus, useAgents, usePaperOrders, useTradeHistory, useFundTeamStatus } from '../../hooks/useQueries';
 import { NavBadge } from '../common/NavBadge';
 import { SidebarTicker } from '../common/SidebarTicker';
 
@@ -20,6 +20,7 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
   const { data: automationStatus } = useAutomationStatus();
   const { data: agentsData = [] } = useAgents();
   const { data: tradeHistoryData = [] } = useTradeHistory(undefined, 100);
+  const { data: paperOrdersData = [] } = usePaperOrders(undefined, 100);
   const { data: fundTeamStatusData } = useFundTeamStatus();
 
   const enabledAgentCount = (Array.isArray(agentsData) ? agentsData : []).filter((a: any) => a.is_enabled).length;
@@ -27,9 +28,13 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
   const fundTeamRisk = (fundTeamStatusData as any)?.risk_level ?? 'safe';
 
   const oneDayAgo = Date.now() - 86_400_000;
-  const trades24h = (Array.isArray(tradeHistoryData) ? tradeHistoryData : []).filter(
+  const liveTrades24h = (Array.isArray(tradeHistoryData) ? tradeHistoryData : []).filter(
     (t: any) => new Date(t.created_at ?? t.timestamp ?? 0).getTime() > oneDayAgo
-  ).length;
+  );
+  const paperTrades24h = (Array.isArray(paperOrdersData) ? paperOrdersData : []).filter(
+    (t: any) => new Date(t.created_at ?? t.timestamp ?? 0).getTime() > oneDayAgo
+  );
+  const trades24h = liveTrades24h.length + paperTrades24h.length;
 
   const sigAction = signal?.action;
 
@@ -115,6 +120,12 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
             ) : (
               <NavBadge variant="green">OK</NavBadge>
             )}
+          </button>
+
+          {/* Firm Advisor */}
+          <button type="button" onClick={() => navigate('advisor')} className={`nav-item ${activePage === 'advisor' ? 'active' : ''}`}>
+            <MessageCircle size={16} />
+            <span>Advisor</span>
           </button>
 
           {/* Wallet */}

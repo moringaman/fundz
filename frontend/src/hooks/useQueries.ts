@@ -1,4 +1,4 @@
-import { useQuery, useQueryClient, QueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient, QueryClient, useMutation } from '@tanstack/react-query';
 import { tradingApi, agentApi, paperApi, automationApi, settingsApi, fundApi } from '../lib/api';
 import { wsClient } from '../lib/websocket';
 import { useEffect } from 'react';
@@ -44,8 +44,8 @@ export function useTradeHistory(symbol?: string, limit = 50) {
   return useQuery({
     queryKey: ['tradeHistory', symbol, limit],
     queryFn: () => tradingApi.getHistory(symbol, limit).then((r) => r.data),
-    refetchInterval: 60_000,
-    staleTime: 30_000,
+    refetchInterval: 15_000,
+    staleTime: 10_000,
   });
 }
 
@@ -122,12 +122,33 @@ export function usePaperPnl() {
   });
 }
 
+// ─── Paper balance (wallet) ──────────────────────────────────────────────────
+export function usePaperBalance() {
+  return useQuery({
+    queryKey: ['paperBalance'],
+    queryFn: () => paperApi.getBalance().then((r) => r.data),
+    refetchInterval: 20_000,
+    staleTime: 15_000,
+  });
+}
+
+// ─── Paper portfolio (canonical summary) ─────────────────────────────────────
+export function usePaperPortfolio() {
+  return useQuery({
+    queryKey: ['paperPortfolio'],
+    queryFn: () => paperApi.getPortfolio().then((r) => r.data),
+    refetchInterval: 15_000,
+    staleTime: 10_000,
+  });
+}
+
 // ─── Paper orders ────────────────────────────────────────────────────────────
 export function usePaperOrders(symbol?: string, limit = 50) {
   return useQuery({
     queryKey: ['paperOrders', symbol, limit],
     queryFn: () => paperApi.getOrders(symbol, limit).then((r) => r.data),
-    refetchInterval: 30_000,
+    refetchInterval: 15_000,
+    staleTime: 10_000,
   });
 }
 
@@ -140,12 +161,26 @@ export function usePaperPositions() {
   });
 }
 
-// ─── Paper balance ───────────────────────────────────────────────────────────
-export function usePaperBalance() {
+// ─── Update position SL/TP ──────────────────────────────────────────────────
+export function useUpdatePositionSlTp() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (vars: { positionId: string; stop_loss_price?: number; take_profit_price?: number; trailing_stop_pct?: number }) => {
+      const { positionId, ...data } = vars;
+      return paperApi.updatePositionSlTp(positionId, data).then((r) => r.data);
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['paperPositions'] });
+    },
+  });
+}
+
+// ─── Paper closed trades ─────────────────────────────────────────────────────
+export function useClosedTrades(symbol?: string, limit = 100) {
   return useQuery({
-    queryKey: ['paperBalance'],
-    queryFn: () => paperApi.getBalance().then((r) => r.data),
-    refetchInterval: 20_000,
+    queryKey: ['closedTrades', symbol, limit],
+    queryFn: () => paperApi.getClosedTrades(symbol, limit).then((r) => r.data),
+    refetchInterval: 30_000,
   });
 }
 
@@ -169,10 +204,10 @@ export function useFundAllocationDecision(totalCapital = 10000) {
   });
 }
 
-export function useFundRiskAssessment(totalCapital = 10000) {
+export function useFundRiskAssessment() {
   return useQuery({
     queryKey: ['fundRiskAssessment'],
-    queryFn: () => fetch(`/api/fund/risk-assessment?total_capital=${totalCapital}`).then(r => r.json()),
+    queryFn: () => fetch('/api/fund/risk-assessment').then(r => r.json()),
     staleTime: 30_000,       // 30 seconds stale - risk is more time sensitive
     refetchInterval: 120_000, // Refresh every 2 minutes
   });
@@ -193,6 +228,35 @@ export function useFundPerformanceAttribution() {
     queryFn: () => fetch('/api/fund/performance-attribution').then(r => r.json()),
     staleTime: 60_000,
     refetchInterval: 300_000,
+  });
+}
+
+// ─── Firm Advisor ────────────────────────────────────────────────────────────
+export function useAdvisorHistory(limit = 50) {
+  return useQuery({
+    queryKey: ['advisorHistory', limit],
+    queryFn: () => fundApi.getAdvisorHistory(limit).then((r) => r.data),
+    staleTime: 5_000,
+  });
+}
+
+export function useAskAdvisor() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (message: string) => fundApi.askAdvisor(message).then((r) => r.data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['advisorHistory'] });
+    },
+  });
+}
+
+export function useClearAdvisorHistory() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => fundApi.clearAdvisorHistory(),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['advisorHistory'] });
+    },
   });
 }
 
@@ -261,6 +325,14 @@ export function useSettings() {
     queryKey: ['settings'],
     queryFn: () => settingsApi.getSettings().then((r) => r.data),
     staleTime: 60_000,
+  });
+}
+
+export function useTradingPairs() {
+  return useQuery({
+    queryKey: ['tradingPairs'],
+    queryFn: () => settingsApi.getTradingPairs().then((r) => r.data?.pairs as string[] ?? []),
+    staleTime: 120_000,
   });
 }
 

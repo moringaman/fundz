@@ -281,6 +281,27 @@ async def lifespan(app: FastAPI):
             "ALTER TABLE positions ADD COLUMN trailing_stop_pct FLOAT"
         )) if not await _column_exists(conn, "positions", "trailing_stop_pct") else None
 
+        # Add is_paper column to trades and positions (defaults all existing to paper=true)
+        if not await _column_exists(conn, "trades", "is_paper"):
+            await conn.execute(text(
+                "ALTER TABLE trades ADD COLUMN is_paper BOOLEAN DEFAULT TRUE"
+            ))
+            await conn.execute(text("UPDATE trades SET is_paper = TRUE WHERE is_paper IS NULL"))
+        if not await _column_exists(conn, "positions", "is_paper"):
+            await conn.execute(text(
+                "ALTER TABLE positions ADD COLUMN is_paper BOOLEAN DEFAULT TRUE"
+            ))
+            await conn.execute(text("UPDATE positions SET is_paper = TRUE WHERE is_paper IS NULL"))
+
+        # Add unique constraint for per-agent position isolation (safe: ignore if exists)
+        try:
+            await conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_position_user_agent_symbol "
+                "ON positions (user_id, agent_id, symbol)"
+            ))
+        except Exception:
+            pass  # Index already exists or DB doesn't support IF NOT EXISTS
+
     from app.services.llm import llm_service
     try:
         await llm_service.initialize()

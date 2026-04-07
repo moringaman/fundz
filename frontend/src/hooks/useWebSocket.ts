@@ -1,20 +1,24 @@
 import { useEffect } from 'react';
 import { wsClient } from '../lib/websocket';
+import { useTradingPairs } from './useQueries';
 
-const ALL_SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'ADAUSDT'];
+const FALLBACK_SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'ADAUSDT'];
 
 /**
  * Manages the WebSocket lifecycle for the app.
  * - Connects on mount.
- * - Subscribes to ALL symbols so the ticker strip always has live data.
+ * - Subscribes to configured trading pairs so the ticker strip has live data.
  */
 export function useWebSocket() {
+  const { data: configuredPairs } = useTradingPairs();
+  const symbols = configuredPairs && configuredPairs.length > 0 ? configuredPairs : FALLBACK_SYMBOLS;
+
   useEffect(() => {
     wsClient.connect();
-    // Subscribe to all symbols immediately so every ticker chip shows live data
-    wsClient.subscribe(ALL_SYMBOLS);
-    // wsClient is a module-level singleton — don't disconnect on cleanup
-    // as React StrictMode double-mounts would kill the connection before
-    // it finishes establishing.
   }, []);
+
+  // Re-subscribe whenever the configured pairs change
+  useEffect(() => {
+    wsClient.subscribe(symbols);
+  }, [symbols.join(',')]);
 }

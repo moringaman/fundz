@@ -114,7 +114,7 @@ class IndicatorService:
             "volume_sma": float(volume_sma.iloc[-1]) if len(volume_sma) > 0 and not pd.isna(volume_sma.iloc[-1]) else None,
         }
 
-    def generate_signal(self, df: pd.DataFrame, config: Dict[str, Any]) -> TradingSignal:
+    def generate_signal(self, df: pd.DataFrame, config: Dict[str, Any], market_context: Optional[Dict[str, Any]] = None) -> TradingSignal:
         indicators = self.calculate_all(df)
         
         if not indicators.get("rsi"):
@@ -197,6 +197,57 @@ class IndicatorService:
                 final_signal = Signal.HOLD
                 confidence = 0.0
                 reasoning = "Perfect signal tie, staying neutral"
+
+        # Apply market context adjustments (team intelligence for non-AI strategies)
+        if market_context and final_signal != Signal.HOLD:
+            regime = market_context.get("regime", "").lower()
+            ta_signal = market_context.get("ta_signal", "").lower()
+            ta_confidence = market_context.get("ta_confidence", 0)
+            risk_level = market_context.get("risk_level", "safe").lower()
+            win_rate = market_context.get("win_rate")
+
+            adjustments = []
+
+            # Regime–strategy alignment
+            if strategy in ("momentum", "breakout") and regime in ("ranging",):
+                confidence *= 0.7
+                adjustments.append(f"reduced confidence (ranging market vs {strategy})")
+            elif strategy == "mean_reversion" and regime in ("trending_up", "trending_down"):
+                confidence *= 0.7
+                adjustments.append(f"reduced confidence (trending market vs mean_reversion)")
+            elif strategy in ("momentum",) and regime in ("trending_up",) and final_signal == Signal.BUY:
+                confidence = min(confidence * 1.15, 1.0)
+                adjustments.append("boosted confidence (momentum + trending_up + buy)")
+            elif strategy in ("momentum",) and regime in ("trending_down",) and final_signal == Signal.SELL:
+                confidence = min(confidence * 1.15, 1.0)
+                adjustments.append("boosted confidence (momentum + trending_down + sell)")
+
+            # TA confluence boost/penalty
+            if ta_signal and ta_confidence > 0.6:
+                if (ta_signal == "bullish" and final_signal == Signal.BUY) or \
+                   (ta_signal == "bearish" and final_signal == Signal.SELL):
+                    confidence = min(confidence * 1.2, 1.0)
+                    adjustments.append(f"boosted by TA confluence ({ta_signal})")
+                elif (ta_signal == "bullish" and final_signal == Signal.SELL) or \
+                     (ta_signal == "bearish" and final_signal == Signal.BUY):
+                    confidence *= 0.6
+                    adjustments.append(f"penalised — TA opposes ({ta_signal} vs {final_signal.value})")
+
+            # Risk level dampening
+            if risk_level == "danger":
+                confidence *= 0.5
+                adjustments.append("halved — risk level danger")
+            elif risk_level == "caution" and final_signal == Signal.BUY:
+                confidence *= 0.8
+                adjustments.append("reduced — risk level caution")
+
+            # Agent performance dampening
+            if win_rate is not None and win_rate < 0.4:
+                confidence *= 0.8
+                adjustments.append(f"reduced — low win rate ({win_rate:.0%})")
+
+            if adjustments:
+                reasoning += " | Context: " + ", ".join(adjustments)
 
         return TradingSignal(
             signal=final_signal,

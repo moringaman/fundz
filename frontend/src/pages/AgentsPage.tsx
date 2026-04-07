@@ -500,8 +500,16 @@ export function AgentsPage() {
                     <div className="detail-row">
                       <span className="detail-label">Allocation</span>
                       <div className="detail-progress">
-                        <div className="progress-bar" style={{ width: `${agent.allocation_percentage}%` }} />
-                        <span>{agent.allocation_percentage}%</span>
+                        <div className="progress-track">
+                          <div
+                            className="progress-fill"
+                            style={{
+                              width: `${Math.min(agent.allocation_percentage, 100)}%`,
+                              background: agent.allocation_percentage >= 30 ? 'var(--green)' : agent.allocation_percentage >= 15 ? 'var(--amber)' : 'var(--text-secondary)',
+                            }}
+                          />
+                        </div>
+                        <span className="progress-pct">{agent.allocation_percentage}%</span>
                       </div>
                     </div>
                     <div className="detail-row">

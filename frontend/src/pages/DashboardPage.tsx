@@ -1,15 +1,17 @@
 import { useNavigate } from 'react-router-dom';
-import { ArrowUpRight, ArrowDownRight, Minus, HelpCircle, RotateCcw } from 'lucide-react';
+import { ArrowUpRight, ArrowDownRight, Minus, HelpCircle, RotateCcw, Wallet, Users, Shield } from 'lucide-react';
 import { useAppSelector, useAppDispatch } from '../store/hooks';
 import { setSelectedSymbol } from '../store/slices/marketSlice';
 import { paperApi } from '../lib/api';
 import {
   usePaperStatus,
   usePaperPnl,
+  usePaperPortfolio,
   useBalance,
   useAgents,
   useAutomationMetrics,
   useAutomationRuns,
+  useFundTeamStatus,
 } from '../hooks/useQueries';
 import { WsIndicator } from '../components/common/WsIndicator';
 import { MiniChart } from '../components/common/MiniChart';
@@ -30,10 +32,12 @@ export function DashboardPage() {
 
   const { data: paperStatus, refetch: refetchStatus } = usePaperStatus();
   const { data: paperPnl, refetch: refetchPnl } = usePaperPnl();
+  const { data: portfolio } = usePaperPortfolio();
   const { data: balancesRaw } = useBalance();
   const { data: agentsData = [] } = useAgents();
   const { data: metricsData = [] } = useAutomationMetrics();
   const { data: runsData = [] } = useAutomationRuns(undefined, 12);
+  const { data: teamStatus } = useFundTeamStatus();
 
   const paperEnabled = paperStatus?.enabled ?? false;
   const agents: any[] = Array.isArray(agentsData) ? agentsData : [];
@@ -56,6 +60,14 @@ export function DashboardPage() {
 
   const sigAction = signal?.action ?? 'hold';
   const sigConf = signal?.confidence ?? 0;
+
+  // ── Portfolio totals (from canonical backend endpoint) ──
+  const portfolioTotal = portfolio?.total_capital ?? 0;
+  const usdtTotal = portfolio?.usdt_total ?? 0;
+  const holdingsValue = portfolio?.positions_value ?? 0;
+  const exposurePct = portfolio?.exposure_pct ?? 0;
+  const portfolioBalances: { asset: string; available: number; locked: number }[] =
+    Array.isArray(portfolio?.balances) ? portfolio.balances : [];
 
   return (
     <div style={{ padding: '1rem 1.1rem', display: 'flex', flexDirection: 'column', gap: '.75rem', height: '100%', overflow: 'auto' }}>
@@ -291,7 +303,81 @@ export function DashboardPage() {
         {/* Column 3 — Portfolio & Paper P&L */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: '.75rem' }}>
 
-          {/* Paper P&L */}
+          {/* Portfolio Summary */}
+          <div className="panel">
+            <div className="panel-header">
+              <div style={{ display: 'flex', alignItems: 'center', gap: '.5rem' }}>
+                <Wallet size={14} />
+                <span className="panel-title">Portfolio</span>
+              </div>
+              <span style={{ fontFamily: 'var(--mono)', fontSize: '.65rem', color: paperEnabled ? 'var(--amber)' : 'var(--green)' }}>
+                {paperEnabled ? 'PAPER' : 'LIVE'}
+              </span>
+            </div>
+            <div className="panel-body">
+              <div style={{ textAlign: 'center', marginBottom: '.5rem' }}>
+                <div style={{ fontSize: '.7rem', color: 'var(--text-secondary)', marginBottom: '.15rem' }}>Total Value</div>
+                <div style={{ fontSize: '1.5rem', fontWeight: 700, fontFamily: 'var(--mono)', color: 'var(--text-primary)' }}>
+                  ${portfolioTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                </div>
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '.4rem' }}>
+                <div className="stat-card">
+                  <div className="stat-label">Cash (USDT)</div>
+                  <div className="stat-value" style={{ fontSize: '.82rem' }}>
+                    ${usdtTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                  </div>
+                </div>
+                <div className="stat-card">
+                  <div className="stat-label">Positions Value</div>
+                  <div className="stat-value" style={{ fontSize: '.82rem' }}>
+                    ${holdingsValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                  </div>
+                </div>
+                <div className="stat-card">
+                  <div className="stat-label">Exposure</div>
+                  <div className="stat-value" style={{
+                    fontSize: '.82rem',
+                    color: exposurePct > 80 ? 'var(--red)' : exposurePct > 50 ? 'var(--amber)' : 'var(--green)',
+                  }}>
+                    {exposurePct.toFixed(1)}%
+                  </div>
+                </div>
+                <div className="stat-card">
+                  <div className="stat-label">Concentration</div>
+                  <div className="stat-value" style={{
+                    fontSize: '.82rem',
+                    color: portfolio?.concentration === 'high' ? 'var(--red)' : portfolio?.concentration === 'medium' ? 'var(--amber)' : 'var(--green)',
+                  }}>
+                    {(portfolio?.concentration ?? 'low').toUpperCase()}
+                  </div>
+                </div>
+              </div>
+              {portfolioBalances.filter(b => b.asset !== 'USDT' && (b.available + b.locked) > 0).length > 0 && (
+                <div style={{ marginTop: '.4rem', display: 'flex', flexWrap: 'wrap', gap: '.3rem' }}>
+                  {portfolioBalances.filter(b => b.asset !== 'USDT' && (b.available + b.locked) > 0).map(b => {
+                    const price = tickers[`${b.asset}USDT`]?.lastPrice ?? 0;
+                    const val = (b.available + b.locked) * price;
+                    return (
+                      <div key={b.asset} style={{
+                        fontSize: '.65rem',
+                        fontFamily: 'var(--mono)',
+                        padding: '.15rem .4rem',
+                        borderRadius: 4,
+                        background: 'var(--bg-hover)',
+                        color: 'var(--text-secondary)',
+                      }}>
+                        {b.asset} {b.available.toLocaleString(undefined, { maximumFractionDigits: 4 })}
+                        <span style={{ color: 'var(--text-dim)', marginLeft: '.25rem' }}>
+                          ≈${val.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
           <div className="panel">
             <div className="panel-header">
               <span className="panel-title">Paper Trading</span>
@@ -414,20 +500,73 @@ export function DashboardPage() {
             </div>
           </div>
 
-          {/* Balances */}
-          {balances.length > 0 && (
-            <div className="panel">
-              <div className="panel-header"><span className="panel-title">Balances</span></div>
-              <div className="panel-body-compact">
-                {balances.slice(0, 4).map((b: any) => (
-                  <div key={b.asset} style={{ display: 'flex', justifyContent: 'space-between', padding: '.3rem 0', borderBottom: '1px solid var(--border)', fontFamily: 'var(--mono)', fontSize: '.78rem' }}>
-                    <span style={{ color: 'var(--text-secondary)' }}>{b.asset}</span>
-                    <span style={{ color: 'var(--text-primary)' }}>{b.available?.toFixed(4)}</span>
-                  </div>
-                ))}
+          {/* Team Status Summary */}
+          <div className="panel">
+            <div className="panel-header">
+              <div style={{ display: 'flex', alignItems: 'center', gap: '.5rem' }}>
+                <Users size={14} />
+                <span className="panel-title">Fund Team</span>
               </div>
+              <button
+                type="button"
+                onClick={() => navigate('/fundteam')}
+                style={{ fontSize: '.65rem', color: 'var(--accent)', background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'var(--mono)' }}
+              >
+                DETAILS →
+              </button>
             </div>
-          )}
+            <div className="panel-body-compact">
+              {teamStatus ? (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '.4rem' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '.35rem .5rem', background: 'var(--bg-elevated)', borderRadius: 6, border: '1px solid var(--border)' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '.4rem' }}>
+                      <Shield size={13} />
+                      <span style={{ fontSize: '.75rem', color: 'var(--text-secondary)' }}>Risk Level</span>
+                    </div>
+                    <span style={{
+                      fontSize: '.75rem',
+                      fontWeight: 700,
+                      fontFamily: 'var(--mono)',
+                      color: teamStatus.risk_level === 'danger' ? 'var(--red)' : teamStatus.risk_level === 'caution' ? 'var(--amber)' : 'var(--green)',
+                    }}>
+                      {(teamStatus.risk_level ?? 'unknown').toUpperCase()}
+                    </span>
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '.35rem' }}>
+                    <div className="stat-card">
+                      <div className="stat-label">Market</div>
+                      <div className="stat-value" style={{ fontSize: '.78rem', textTransform: 'capitalize' }}>
+                        {teamStatus.market_sentiment ?? '—'}
+                      </div>
+                    </div>
+                    <div className="stat-card">
+                      <div className="stat-label">CIO View</div>
+                      <div className="stat-value" style={{ fontSize: '.78rem', textTransform: 'capitalize' }}>
+                        {teamStatus.cio_sentiment ?? '—'}
+                      </div>
+                    </div>
+                    <div className="stat-card">
+                      <div className="stat-label">Fund P&L</div>
+                      <div className={`stat-value ${(teamStatus.fund_pnl ?? 0) >= 0 ? 'positive' : 'negative'}`} style={{ fontSize: '.78rem' }}>
+                        {(teamStatus.fund_pnl ?? 0) >= 0 ? '+' : ''}${(teamStatus.fund_pnl ?? 0).toFixed(2)}
+                      </div>
+                    </div>
+                    <div className="stat-card">
+                      <div className="stat-label">Top Agent</div>
+                      <div className="stat-value" style={{ fontSize: '.72rem' }}>
+                        {teamStatus.top_agent ?? '—'}
+                      </div>
+                    </div>
+                  </div>
+                  <div style={{ fontSize: '.68rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)', textAlign: 'right' }}>
+                    {teamStatus.agents_active ?? 0} agents active
+                  </div>
+                </div>
+              ) : (
+                <p style={{ fontSize: '.75rem', color: 'var(--text-dim)', textAlign: 'center', padding: '.75rem 0' }}>Loading team status…</p>
+              )}
+            </div>
+          </div>
         </div>
       </div>
     </div>
