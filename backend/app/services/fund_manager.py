@@ -79,7 +79,14 @@ class FundManagerAgent:
         self.llm_service = LLMService()
         self._last_rebalance = None
     
-    async def analyze_market(self, symbol: str = "BTCUSDT") -> MarketCondition:
+    async def analyze_market(self, symbol: str = None) -> MarketCondition:
+        if not symbol:
+            try:
+                from app.api.routes.settings import get_trading_prefs
+                pairs = get_trading_prefs().trading_pairs
+                symbol = pairs[0] if pairs else "BTCUSDT"
+            except Exception:
+                symbol = "BTCUSDT"
         try:
             klines = await self.phemex.get_klines(symbol, "1h", 100)
 
@@ -559,11 +566,11 @@ Determine optimal capital allocation. Return JSON:
             metrics = metrics_by_id.get(agent_id, {})
             total_runs = metrics.get('total_runs', 0)
             pairs = agent.get('trading_pairs', agent.get('config', {}).get('trading_pairs', []))
-            primary_symbol = pairs[0] if pairs else 'BTCUSDT'
+            pairs_str = ", ".join(pairs) if pairs else "none configured"
 
             lines.append(f"\n{agent.get('name', agent_id)}:")
             lines.append(f"  Strategy: {agent.get('strategy_type', 'unknown')}")
-            lines.append(f"  Symbol: {primary_symbol}")
+            lines.append(f"  Symbols: {pairs_str}")
             if total_runs == 0:
                 lines.append(f"  Status: NEW AGENT (no live trades yet — metrics from backtest)")
             lines.append(f"  Win Rate: {(metrics.get('win_rate', 0.5) or 0):.1%}")
@@ -571,14 +578,16 @@ Determine optimal capital allocation. Return JSON:
             lines.append(f"  Runs: {total_runs}")
             lines.append(f"  Current Allocation: {(agent.get('allocation_percentage', 10) or 0):.1f}%")
 
-            # Add confluence info if available
-            if confluence_scores and primary_symbol in confluence_scores:
-                conf = confluence_scores[primary_symbol]
-                lines.append(
-                    f"  Technical Confluence: {conf.get('score', 0):.0%} "
-                    f"({conf.get('alignment', '?')} alignment, "
-                    f"{conf.get('patterns', 0)} patterns)"
-                )
+            # Add confluence info for all pairs
+            if confluence_scores:
+                for pair in pairs:
+                    if pair in confluence_scores:
+                        conf = confluence_scores[pair]
+                        lines.append(
+                            f"  {pair} Confluence: {conf.get('score', 0):.0%} "
+                            f"({conf.get('alignment', '?')} alignment, "
+                            f"{conf.get('patterns', 0)} patterns)"
+                        )
 
         return "\n".join(lines)
 

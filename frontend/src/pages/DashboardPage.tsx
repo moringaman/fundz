@@ -221,7 +221,8 @@ export function DashboardPage() {
           )}
         </div>
 
-        {/* Column 2 — Agent Activity Feed */}
+        {/* Column 2 — Agent Activity + Performance/Team */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '.75rem' }}>
         <div className="panel" style={{ display: 'flex', flexDirection: 'column' }}>
           <div className="panel-header">
             <div style={{ display: 'flex', alignItems: 'center', gap: '.5rem' }}>
@@ -293,6 +294,134 @@ export function DashboardPage() {
             <button type="button" className="qa-btn qa-btn-primary" onClick={() => navigate('/automation')}>Scheduler</button>
             <button type="button" className="qa-btn qa-btn-ghost" onClick={() => navigate('/trading')}>Trade</button>
           </div>
+        </div>
+
+        {/* Agent Performance + Fund Team side by side */}
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '.75rem' }}>
+
+          {/* Agent Performance Summary */}
+          <div className="panel">
+            <div className="panel-header">
+              <div style={{ display: 'flex', alignItems: 'center', gap: '.5rem' }}>
+                <span className="panel-title">Agent Performance</span>
+                <span title="Historical P&L and win rate for each AI agent. Shows which agents are most profitable and accurate over time.">
+                  <HelpCircle
+                    size={14}
+                    style={{ color: 'var(--text-dim)', cursor: 'help' }}
+                  />
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => navigate('/automation')}
+                style={{ fontSize: '.65rem', color: 'var(--accent)', background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'var(--mono)' }}
+              >
+                DETAILS →
+              </button>
+            </div>
+            <div className="panel-body-compact">
+              {metrics.length === 0 ? (
+                <p style={{ fontSize: '.75rem', color: 'var(--text-dim)', textAlign: 'center', padding: '.75rem 0' }}>No runs yet</p>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '.4rem' }}>
+                  {metrics.slice(0, 4).map((m: any) => {
+                    const agent = agents.find((a) => a.id === m.agent_id);
+                    return (
+                      <div key={m.agent_id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '.4rem .5rem', background: 'var(--bg-elevated)', borderRadius: '6px', border: '1px solid var(--border)' }}>
+                        <span style={{ fontSize: '.75rem', fontWeight: 600, color: 'var(--text-primary)' }}>
+                          {agent?.name ?? m.agent_id?.slice(0, 8)}
+                        </span>
+                        <div style={{ display: 'flex', gap: '.75rem', fontFamily: 'var(--mono)', fontSize: '.72rem' }}>
+                          <span className={m.total_pnl >= 0 ? 'positive' : 'negative'}>
+                            {m.total_pnl >= 0 ? '+' : ''}${m.total_pnl?.toFixed(2)}
+                          </span>
+                          <span style={{ color: 'var(--text-secondary)' }}>
+                            {(m.win_rate * 100).toFixed(0)}% win
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                  <div style={{ paddingTop: '.35rem', borderTop: '1px solid var(--border)', display: 'flex', justifyContent: 'space-between', fontFamily: 'var(--mono)', fontSize: '.72rem' }}>
+                    <span style={{ color: 'var(--text-secondary)' }}>Total P&L</span>
+                    <span className={totalPnl >= 0 ? 'positive' : 'negative'}>
+                      {totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(2)}
+                    </span>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Team Status Summary */}
+          <div className="panel">
+            <div className="panel-header">
+              <div style={{ display: 'flex', alignItems: 'center', gap: '.5rem' }}>
+                <Users size={14} />
+                <span className="panel-title">Fund Team</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => navigate('/fundteam')}
+                style={{ fontSize: '.65rem', color: 'var(--accent)', background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'var(--mono)' }}
+              >
+                DETAILS →
+              </button>
+            </div>
+            <div className="panel-body-compact">
+              {teamStatus ? (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '.4rem' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '.35rem .5rem', background: 'var(--bg-elevated)', borderRadius: 6, border: '1px solid var(--border)' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '.4rem' }}>
+                      <Shield size={13} />
+                      <span style={{ fontSize: '.75rem', color: 'var(--text-secondary)' }}>Risk Level</span>
+                    </div>
+                    <span style={{
+                      fontSize: '.75rem',
+                      fontWeight: 700,
+                      fontFamily: 'var(--mono)',
+                      color: teamStatus.risk_level === 'danger' ? 'var(--red)' : teamStatus.risk_level === 'caution' ? 'var(--amber)' : 'var(--green)',
+                    }}>
+                      {(teamStatus.risk_level ?? 'unknown').toUpperCase()}
+                    </span>
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '.35rem' }}>
+                    <div className="stat-card">
+                      <div className="stat-label">Market</div>
+                      <div className="stat-value" style={{ fontSize: '.78rem', textTransform: 'capitalize' }}>
+                        {teamStatus.market_sentiment ?? '—'}
+                      </div>
+                    </div>
+                    <div className="stat-card">
+                      <div className="stat-label">CIO View</div>
+                      <div className="stat-value" style={{ fontSize: '.78rem', textTransform: 'capitalize' }}>
+                        {teamStatus.cio_sentiment ?? '—'}
+                      </div>
+                    </div>
+                    <div className="stat-card">
+                      <div className="stat-label">Fund P&L</div>
+                      <div className={`stat-value ${(teamStatus.fund_pnl ?? 0) >= 0 ? 'positive' : 'negative'}`} style={{ fontSize: '.78rem' }}>
+                        {(teamStatus.fund_pnl ?? 0) >= 0 ? '+' : ''}${(teamStatus.fund_pnl ?? 0).toFixed(2)}
+                      </div>
+                    </div>
+                    <div className="stat-card">
+                      <div className="stat-label">Top Agent</div>
+                      <div className="stat-value" style={{ fontSize: '.72rem' }}>
+                        {teamStatus.top_agent ?? '—'}
+                      </div>
+                    </div>
+                  </div>
+                  <div style={{ fontSize: '.68rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)', textAlign: 'right' }}>
+                    {teamStatus.agents_active ?? 0} agents active
+                  </div>
+                </div>
+              ) : (
+                <p style={{ fontSize: '.75rem', color: 'var(--text-dim)', textAlign: 'center', padding: '.75rem 0' }}>Loading team status…</p>
+              )}
+            </div>
+          </div>
+
+        </div>
         </div>
 
         {/* Column 3 — Portfolio & Paper P&L */}
@@ -437,128 +566,6 @@ export function DashboardPage() {
                 <p style={{ fontSize: '.78rem', color: 'var(--text-dim)', textAlign: 'center', padding: '1rem 0' }}>
                   {paperEnabled ? 'Loading P&L...' : 'Enable to practice without real money'}
                 </p>
-              )}
-            </div>
-          </div>
-
-          {/* Agent Performance Summary */}
-          <div className="panel">
-            <div className="panel-header">
-              <div style={{ display: 'flex', alignItems: 'center', gap: '.5rem' }}>
-                <span className="panel-title">Agent Performance</span>
-                <span title="Historical P&L and win rate for each AI agent. Shows which agents are most profitable and accurate over time.">
-                  <HelpCircle
-                    size={14}
-                    style={{ color: 'var(--text-dim)', cursor: 'help' }}
-                  />
-                </span>
-              </div>
-              <button
-                type="button"
-                onClick={() => navigate('/automation')}
-                style={{ fontSize: '.65rem', color: 'var(--accent)', background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'var(--mono)' }}
-              >
-                DETAILS →
-              </button>
-            </div>
-            <div className="panel-body-compact">
-              {metrics.length === 0 ? (
-                <p style={{ fontSize: '.75rem', color: 'var(--text-dim)', textAlign: 'center', padding: '.75rem 0' }}>No runs yet</p>
-              ) : (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '.4rem' }}>
-                  {metrics.slice(0, 4).map((m: any) => {
-                    const agent = agents.find((a) => a.id === m.agent_id);
-                    return (
-                      <div key={m.agent_id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '.4rem .5rem', background: 'var(--bg-elevated)', borderRadius: '6px', border: '1px solid var(--border)' }}>
-                        <span style={{ fontSize: '.75rem', fontWeight: 600, color: 'var(--text-primary)' }}>
-                          {agent?.name ?? m.agent_id?.slice(0, 8)}
-                        </span>
-                        <div style={{ display: 'flex', gap: '.75rem', fontFamily: 'var(--mono)', fontSize: '.72rem' }}>
-                          <span className={m.total_pnl >= 0 ? 'positive' : 'negative'}>
-                            {m.total_pnl >= 0 ? '+' : ''}${m.total_pnl?.toFixed(2)}
-                          </span>
-                          <span style={{ color: 'var(--text-secondary)' }}>
-                            {(m.win_rate * 100).toFixed(0)}% win
-                          </span>
-                        </div>
-                      </div>
-                    );
-                  })}
-                  <div style={{ paddingTop: '.35rem', borderTop: '1px solid var(--border)', display: 'flex', justifyContent: 'space-between', fontFamily: 'var(--mono)', fontSize: '.72rem' }}>
-                    <span style={{ color: 'var(--text-secondary)' }}>Total P&L</span>
-                    <span className={totalPnl >= 0 ? 'positive' : 'negative'}>
-                      {totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(2)}
-                    </span>
-                  </div>
-                </div>
-              )}
-            </div>
-          </div>
-
-          {/* Team Status Summary */}
-          <div className="panel">
-            <div className="panel-header">
-              <div style={{ display: 'flex', alignItems: 'center', gap: '.5rem' }}>
-                <Users size={14} />
-                <span className="panel-title">Fund Team</span>
-              </div>
-              <button
-                type="button"
-                onClick={() => navigate('/fundteam')}
-                style={{ fontSize: '.65rem', color: 'var(--accent)', background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'var(--mono)' }}
-              >
-                DETAILS →
-              </button>
-            </div>
-            <div className="panel-body-compact">
-              {teamStatus ? (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '.4rem' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '.35rem .5rem', background: 'var(--bg-elevated)', borderRadius: 6, border: '1px solid var(--border)' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '.4rem' }}>
-                      <Shield size={13} />
-                      <span style={{ fontSize: '.75rem', color: 'var(--text-secondary)' }}>Risk Level</span>
-                    </div>
-                    <span style={{
-                      fontSize: '.75rem',
-                      fontWeight: 700,
-                      fontFamily: 'var(--mono)',
-                      color: teamStatus.risk_level === 'danger' ? 'var(--red)' : teamStatus.risk_level === 'caution' ? 'var(--amber)' : 'var(--green)',
-                    }}>
-                      {(teamStatus.risk_level ?? 'unknown').toUpperCase()}
-                    </span>
-                  </div>
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '.35rem' }}>
-                    <div className="stat-card">
-                      <div className="stat-label">Market</div>
-                      <div className="stat-value" style={{ fontSize: '.78rem', textTransform: 'capitalize' }}>
-                        {teamStatus.market_sentiment ?? '—'}
-                      </div>
-                    </div>
-                    <div className="stat-card">
-                      <div className="stat-label">CIO View</div>
-                      <div className="stat-value" style={{ fontSize: '.78rem', textTransform: 'capitalize' }}>
-                        {teamStatus.cio_sentiment ?? '—'}
-                      </div>
-                    </div>
-                    <div className="stat-card">
-                      <div className="stat-label">Fund P&L</div>
-                      <div className={`stat-value ${(teamStatus.fund_pnl ?? 0) >= 0 ? 'positive' : 'negative'}`} style={{ fontSize: '.78rem' }}>
-                        {(teamStatus.fund_pnl ?? 0) >= 0 ? '+' : ''}${(teamStatus.fund_pnl ?? 0).toFixed(2)}
-                      </div>
-                    </div>
-                    <div className="stat-card">
-                      <div className="stat-label">Top Agent</div>
-                      <div className="stat-value" style={{ fontSize: '.72rem' }}>
-                        {teamStatus.top_agent ?? '—'}
-                      </div>
-                    </div>
-                  </div>
-                  <div style={{ fontSize: '.68rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)', textAlign: 'right' }}>
-                    {teamStatus.agents_active ?? 0} agents active
-                  </div>
-                </div>
-              ) : (
-                <p style={{ fontSize: '.75rem', color: 'var(--text-dim)', textAlign: 'center', padding: '.75rem 0' }}>Loading team status…</p>
               )}
             </div>
           </div>

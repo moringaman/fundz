@@ -415,7 +415,7 @@ IMPORTANT: Weight your decision using team intelligence:
 - Look for CONFLUENCE across team signals — 3+ team members agreeing = high conviction
 """
 
-        return f"""You are a professional cryptocurrency trading analyst. Generate a precise trading signal using technical analysis and team intelligence.
+        return f"""You are a HIGHLY SELECTIVE professional cryptocurrency trading analyst. Your PRIMARY objective is PROFITABLE trades — you are measured on P&L, not trade count. A missed trade costs nothing; a losing trade costs real money.
 
 PRICE ACTION:
 - Current Price: ${price_data.get('current', 0)}
@@ -433,23 +433,25 @@ VOLATILITY & SUPPORT/RESISTANCE:
 - ATR (Volatility): {atr:.2f}
 - Current position vs BB: {"Near resistance (upper band)" if price_data.get('current', 0) > bb_middle else "Near support (lower band)" if price_data.get('current', 0) < bb_middle else "Mid-range"}
 {team_section}
-ANALYSIS FRAMEWORK:
-1. TREND: Identify the dominant trend (uptrend = higher highs/lows, downtrend = lower highs/lows, range = oscillating)
-2. MOMENTUM: Assess RSI and MACD for momentum strength (converging/diverging signals)
-3. CONFLUENCE: Look for overlapping signals across indicators AND team intelligence
-4. REVERSAL RISK: Consider divergences (price making new highs but momentum weakening = potential reversal)
-5. VOLATILITY: Factor in ATR (high volatility = wider stops, low volatility = tighter risk)
-6. TEAM ALIGNMENT: Weight team signals — if TA, Research, and Risk agree, increase conviction
+TRADING RULES (MANDATORY):
+1. DEFAULT TO HOLD — only signal buy/sell when you have HIGH conviction
+2. Require 3+ confluent signals pointing the same direction before acting
+3. NEVER trade against the dominant trend. If trend is unclear, HOLD
+4. Validate risk:reward BEFORE recommending — identify a concrete stop-loss level (support/resistance) and ensure the target is at least 2x the risk
+5. If RSI is between 35-65 and MACD histogram is near zero, that is NO SIGNAL — return HOLD
+6. Choppy/ranging markets = HOLD. Only trade clear trends or extreme reversals
+7. Each fee round-trip costs 0.12% — your edge must exceed this
+8. It is BETTER to miss 10 good trades than to enter 1 bad trade
 
 CONFIDENCE CALIBRATION:
-- High (0.7-1.0): 3+ confluent signals, clear trend, MACD + RSI aligned, team agrees
-- Medium (0.4-0.7): 2 aligned signals, mixed momentum, some team disagreement
-- Low (0.0-0.4): Conflicting signals, choppy action, team signals diverge
+- 0.8-1.0: Strong trend + 3+ aligned indicators + clear support/resistance + team agrees → BUY or SELL
+- 0.6-0.8: Clear trend + 2 aligned indicators + identifiable levels → BUY or SELL (cautious size)
+- Below 0.6: Insufficient evidence → MUST return HOLD regardless of indicators
 
 Return JSON: {{"action": "buy|sell|hold", "confidence": 0.0-1.0, "reasoning": "brief but specific technical analysis reasoning incorporating team intelligence", "key_levels": {{"resistance": 0.0, "support": 0.0}}, "risk_level": "low|medium|high"}}
 
 IMPORTANT: "sell" means SHORT if no long position exists. You can profit from downtrends by shorting. Use sell signals when bearish indicators are strong.
-"""
+IMPORTANT: When in doubt, ALWAYS return hold. Your job is to MAKE MONEY, not to trade."""
 
     def _build_strategy_evaluation_prompt(self, strategy_config: Dict[str, Any], performance: Dict[str, Any]) -> str:
         total_trades = performance.get('total_trades', 0) or 0

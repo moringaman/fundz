@@ -186,16 +186,16 @@ class PaperTradingService:
                 if short_position:
                     # Closing (covering) a short position
                     close_qty = min(quantity, short_position.quantity)
-                    cost = close_qty * price
-                    if usdt_balance.available < cost:
-                        raise ValueError(
-                            f"Insufficient USDT balance to cover short: need {cost:.2f}, have {usdt_balance.available:.2f}"
-                        )
                     # Short P&L: entry(sell) - exit(buy)
                     realized = (short_position.entry_price - price) * close_qty
-                    usdt_balance.available -= cost
-                    # Return the original margin
-                    usdt_balance.available += close_qty * short_position.entry_price
+                    # Net cost is only the loss (if any) — margin from original short is returned
+                    net_cost = max(-realized, 0)  # positive when trade lost money
+                    if usdt_balance.available < net_cost:
+                        raise ValueError(
+                            f"Insufficient USDT balance to cover short loss: need {net_cost:.2f}, have {usdt_balance.available:.2f}"
+                        )
+                    # Apply net settlement: return margin + realized P&L
+                    usdt_balance.available += realized  # positive if profitable, negative if loss
 
                     if short_position.quantity <= close_qty + 1e-12:
                         await db.delete(short_position)

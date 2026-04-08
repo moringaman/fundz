@@ -236,9 +236,15 @@ export function HistoryPage() {
                     type="button"
                     onClick={() => {
                       if (closingPos === pos.id) return;
+                      if (!window.confirm(`Close ${pos.symbol} ${pos.side} position at market price?`)) return;
                       setClosingPos(pos.id);
                       closePos.mutate(pos.id, {
                         onSettled: () => setClosingPos(null),
+                        onError: (err: unknown) => {
+                          const msg = (err as { response?: { data?: { detail?: string } } })
+                            ?.response?.data?.detail || 'Failed to close position';
+                          alert(msg);
+                        },
                       });
                     }}
                     disabled={closingPos === pos.id}

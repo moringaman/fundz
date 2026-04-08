@@ -354,8 +354,8 @@ body {
   background: var(--bg-panel);
   border: 1px solid var(--border);
   border-radius: 10px;
-  overflow: auto;
-  max-height: 600px;
+  overflow: hidden;
+  /* max-height: 600px; */
 }
 
 .panel-header {
@@ -503,7 +503,7 @@ body {
   display: flex;
   flex-direction: column;
   gap: 0;
-  max-height: 400px;
+  max-height: 280px;
   overflow-y: auto;
 }
 .activity-feed::-webkit-scrollbar { width: 3px; }
@@ -1364,49 +1364,52 @@ body {
 /* ── Team Chat Toasts ───────────────────────────────────────────────── */
 .team-chat-toasts {
   position: fixed;
-  top: 1rem;
-  right: 1rem;
+  top: 1.25rem;
+  right: 1.25rem;
   z-index: 9999;
   display: flex;
   flex-direction: column;
   gap: .5rem;
-  max-width: 380px;
+  max-width: 440px;
+  min-width: 320px;
   pointer-events: none;
 }
 .team-chat-toast {
   pointer-events: auto;
-  padding: .65rem .85rem;
-  border-radius: 8px;
+  padding: .85rem 1rem;
+  border-radius: 10px;
   border: 1px solid var(--border);
   cursor: pointer;
   animation: toastSlideIn .3s ease-out;
   transition: opacity .2s, transform .2s;
-  backdrop-filter: blur(12px);
+  backdrop-filter: blur(16px);
+  box-shadow: 0 4px 24px rgba(0,0,0,.45);
 }
-.team-chat-toast:hover { opacity: .7; }
+.team-chat-toast:hover { opacity: .75; }
 .team-chat-toast-header {
   display: flex;
   align-items: center;
-  gap: .4rem;
-  margin-bottom: .3rem;
+  gap: .5rem;
+  margin-bottom: .4rem;
 }
-.team-chat-toast-avatar { font-size: 1rem; }
+.team-chat-toast-avatar { font-size: 1.15rem; }
 .team-chat-toast-name {
-  font-size: .72rem;
+  font-size: .85rem;
   font-weight: 700;
   color: var(--text-primary);
 }
 .team-chat-toast-type {
-  font-size: .6rem;
+  font-size: .68rem;
   text-transform: uppercase;
   letter-spacing: .06em;
+  font-family: var(--mono);
   color: var(--text-secondary);
   margin-left: auto;
 }
 .team-chat-toast-content {
-  font-size: .72rem;
-  color: var(--text-secondary);
-  line-height: 1.45;
+  font-size: .82rem;
+  color: var(--text-primary);
+  line-height: 1.55;
 }
 
 @keyframes toastSlideIn {

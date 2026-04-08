@@ -277,8 +277,11 @@ class AgentScheduler:
     async def _bootstrap_from_backtest(self, agent: dict):
         """Run a quick backtest and seed agent metrics so new agents get fair allocation."""
         agent_id = agent["id"]
-        pairs = agent.get("trading_pairs", ["BTCUSDT"])
-        symbol = pairs[0] if pairs else "BTCUSDT"
+        pairs = agent.get("trading_pairs", [])
+        symbol = pairs[0] if pairs else None
+        if not symbol:
+            logger.warning(f"Agent {agent_id} has no trading pairs — skipping bootstrap")
+            return
         strategy = agent.get("strategy_type", "momentum")
 
         try:
@@ -882,7 +885,7 @@ class AgentScheduler:
                 except Exception:
                     pass
                 if not all_symbols:
-                    all_symbols = {"BTCUSDT"}
+                    all_symbols = {"BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT"}
 
                 # Get Technical Analyst confluence scores so FM can reconcile signals
                 try:
@@ -1106,7 +1109,7 @@ class AgentScheduler:
                     allocation_pct=allocation_pct,  # <-- NOW DYNAMIC from Portfolio Manager
                     max_position=config.get('max_position_size', 0.1),
                     stop_loss_pct=config.get('stop_loss_pct', 2.0),
-                    take_profit_pct=config.get('take_profit_pct', 4.0),
+                    take_profit_pct=config.get('take_profit_pct', 6.0),
                     trailing_stop_pct=config.get('trailing_stop_pct', 3.0),
                     use_paper=use_paper_mode
                 )
@@ -1143,71 +1146,97 @@ class AgentScheduler:
                 error="No trading pairs configured"
             )
         
-        symbol = trading_pairs[0]
-        
-        try:
-            klines = await self.phemex.get_klines(symbol, "1h", 200)
-            
-            data = klines.get('data', klines) if isinstance(klines, dict) else klines
-            
-            if not data or len(data) < 50:
-                return AgentRun(
-                    agent_id=agent_id,
-                    timestamp=timestamp,
-                    symbol=symbol,
-                    signal="hold",
-                    confidence=0,
-                    price=0,
-                    executed=False,
-                    error="Insufficient market data"
-                )
-            
-            import pandas as pd
-            df_data = []
-            for k in data:
-                df_data.append({
-                    'time': k[0] / 1000,
-                    'open': float(k[2]),
-                    'high': float(k[3]),
-                    'low': float(k[4]),
-                    'close': float(k[5]),
-                    'volume': float(k[7]),
-                })
-            
-            df = pd.DataFrame(df_data)
-            df = df.sort_values('time')
+        # ── Scan ALL pairs, pick the best opportunity ──────────────────────
+        best_symbol = None
+        best_confidence = 0.0
+        best_signal = "hold"
+        best_df = None
+        best_reasoning = ""
 
-            # Gather team intelligence for agent decision-making
-            team_context = self._build_team_context(agent_id, symbol)
-            market_context = self._build_market_context(agent_id, symbol)
-            
-            if strategy_type == 'ai':
-                from app.services.llm import llm_service
-                indicators_dict = {
-                    'rsi': float(self.indicator_service.calculate_rsi(df['close']).iloc[-1]) if len(df) >= 14 else None,
-                    'macd': float(self.indicator_service.calculate_macd(df['close']).iloc[-1]['macd']) if len(df) >= 26 else None,
-                    'bb_upper': float(self.indicator_service.calculate_bollinger_bands(df['close']).iloc[-1]['upper']) if len(df) >= 20 else None,
-                    'bb_lower': float(self.indicator_service.calculate_bollinger_bands(df['close']).iloc[-1]['lower']) if len(df) >= 20 else None,
-                }
-                llm_result = await llm_service.generate_signal(
-                    indicators_dict,
-                    {'current': float(df['close'].iloc[-1])},
-                    team_context=team_context,
-                )
-                signal = llm_result.action
-                confidence = llm_result.confidence
-                reasoning = llm_result.reasoning
-            else:
-                signal_result = self.indicator_service.generate_signal(df, {'strategy': strategy_type}, market_context=market_context)
-                signal = signal_result.signal.value if signal_result.signal else 'hold'
-                confidence = signal_result.confidence
-            
-            current_price = df['close'].iloc[-1]
-            
+        for candidate_symbol in trading_pairs:
+            try:
+                klines = await self.phemex.get_klines(candidate_symbol, "1h", 200)
+                data = klines.get('data', klines) if isinstance(klines, dict) else klines
+                if not data or len(data) < 50:
+                    continue
+
+                import pandas as pd
+                df_data = [{
+                    'time': k[0] / 1000,
+                    'open': float(k[2]), 'high': float(k[3]),
+                    'low': float(k[4]), 'close': float(k[5]),
+                    'volume': float(k[7]),
+                } for k in data]
+                df = pd.DataFrame(df_data).sort_values('time')
+
+                market_context = self._build_market_context(agent_id, candidate_symbol)
+
+                if strategy_type == 'ai':
+                    from app.services.llm import llm_service
+                    indicators_dict = {
+                        'rsi': float(self.indicator_service.calculate_rsi(df['close']).iloc[-1]) if len(df) >= 14 else None,
+                        'macd': float(self.indicator_service.calculate_macd(df['close']).iloc[-1]['macd']) if len(df) >= 26 else None,
+                        'bb_upper': float(self.indicator_service.calculate_bollinger_bands(df['close']).iloc[-1]['upper']) if len(df) >= 20 else None,
+                        'bb_lower': float(self.indicator_service.calculate_bollinger_bands(df['close']).iloc[-1]['lower']) if len(df) >= 20 else None,
+                    }
+                    team_context = self._build_team_context(agent_id, candidate_symbol)
+                    llm_result = await llm_service.generate_signal(
+                        indicators_dict,
+                        {'current': float(df['close'].iloc[-1])},
+                        team_context=team_context,
+                    )
+                    sig = llm_result.action
+                    conf = llm_result.confidence
+                    reas = llm_result.reasoning
+                else:
+                    signal_result = self.indicator_service.generate_signal(df, {'strategy': strategy_type}, market_context=market_context)
+                    sig = signal_result.signal.value if signal_result.signal else 'hold'
+                    conf = signal_result.confidence
+                    reas = getattr(signal_result, 'reasoning', '')
+
+                if sig in ('buy', 'sell') and conf > best_confidence:
+                    best_symbol = candidate_symbol
+                    best_confidence = conf
+                    best_signal = sig
+                    best_df = df
+                    best_reasoning = reas
+            except Exception as e:
+                logger.warning(f"Skipping {candidate_symbol} for agent {name}: {e}")
+                continue
+
+        # If no pair produced a tradeable signal, return hold for the first pair
+        if best_symbol is None or best_signal == 'hold':
+            symbol = trading_pairs[0]
+            try:
+                klines = await self.phemex.get_klines(symbol, "1h", 200)
+                data = klines.get('data', klines) if isinstance(klines, dict) else klines
+                current_price = float(data[-1][5]) if data else 0
+            except Exception:
+                current_price = 0
+            self._record_run(agent_id, symbol, "hold", best_confidence, current_price, False)
+            return AgentRun(
+                agent_id=agent_id, timestamp=timestamp, symbol=symbol,
+                signal="hold", confidence=best_confidence, price=current_price,
+                executed=False,
+            )
+
+        symbol = best_symbol
+        signal = best_signal
+        confidence = best_confidence
+        reasoning = best_reasoning
+        df = best_df
+        current_price = df['close'].iloc[-1]
+        team_context = self._build_team_context(agent_id, symbol)
+
+        if len(trading_pairs) > 1:
+            logger.info(f"Agent {name}: scanned {len(trading_pairs)} pairs, "
+                       f"best opportunity: {signal.upper()} {symbol} ({confidence:.0%})")
+
+        try:
             executed = False
             pnl = None
             
-            if signal in ['buy', 'sell'] and confidence >= 0.3:
+            if signal in ['buy', 'sell'] and confidence >= 0.6:
                 # Minimum profit gate: reject trades where TP doesn't cover round-trip fees
                 round_trip_fee_pct = 0.06 * 2  # 0.06% entry + 0.06% exit = 0.12%
                 net_tp_pct = take_profit_pct - round_trip_fee_pct
@@ -1222,6 +1251,26 @@ class AgentScheduler:
                         signal="hold", confidence=0, price=current_price,
                         executed=False, error="TP too low after fees"
                     )
+
+                # Conflict gate: prevent opposing positions on same symbol across agents
+                all_positions = await paper_trading.get_positions(symbol)
+                for existing_pos in (all_positions or []):
+                    pos_side = existing_pos.side.value if hasattr(existing_pos.side, 'value') else str(existing_pos.side)
+                    is_conflict = (
+                        (signal == 'buy' and pos_side.lower() == 'sell') or
+                        (signal == 'sell' and pos_side.lower() == 'buy')
+                    )
+                    if is_conflict and existing_pos.agent_id != agent_id:
+                        logger.warning(
+                            f"Position conflict: {signal.upper()} {symbol} blocked — "
+                            f"another agent already {pos_side.upper()}"
+                        )
+                        self._record_run(agent_id, symbol, signal, confidence, current_price, False, error="Position conflict")
+                        return AgentRun(
+                            agent_id=agent_id, timestamp=datetime.now(), symbol=symbol,
+                            signal="hold", confidence=0, price=current_price,
+                            executed=False, error="Position conflict with another agent"
+                        )
 
                 balances = await paper_trading.get_all_balances()
                 usdt_balance = next((b.available for b in balances if b.asset == "USDT"), 10000.0)
@@ -1819,7 +1868,7 @@ class AgentScheduler:
                                 # Strategy-specific configuration
                                 risk = get_risk_limits()
                                 prefs = get_trading_prefs()
-                                trading_pairs = prefs.trading_pairs or ["BTCUSDT", "ETHUSDT"]
+                                trading_pairs = prefs.trading_pairs or ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT"]
 
                                 STRATEGY_PROFILES = {
                                     "momentum": {

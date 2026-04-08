@@ -42,8 +42,8 @@ export function TeamChatToasts() {
             <span className="team-chat-toast-type">{msg.message_type}</span>
           </div>
           <div className="team-chat-toast-content">
-            {msg.content.replace(/\*\*/g, '').slice(0, 120)}
-            {msg.content.length > 120 ? '…' : ''}
+            {msg.content.replace(/\*\*/g, '').slice(0, 200)}
+            {msg.content.length > 200 ? '…' : ''}
           </div>
         </div>
       ))}
