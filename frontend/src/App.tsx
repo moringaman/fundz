@@ -6,6 +6,7 @@ import { useMarketStream } from './hooks/useMarketStream';
 import { useWsQueryInvalidation } from './hooks/useQueries';
 import { useTeamChatStream } from './hooks/useTeamChatStream';
 import { useBrowserNotifications } from './hooks/useBrowserNotifications';
+import { useEventSounds } from './hooks/useEventSounds';
 import { Sidebar } from './components/layout/Sidebar';
 import { WsIndicator } from './components/common/WsIndicator';
 import { TeamChatToasts } from './components/TeamChatToasts';
@@ -15,6 +16,7 @@ import { AgentsPage } from './pages/AgentsPage';
 import { AutomationPage } from './pages/AutomationPage';
 import { HistoryPage } from './pages/HistoryPage';
 import { FundTeamPage } from './pages/FundTeamPage';
+import { TradersPage } from './pages/TradersPage';
 import { FirmAdvisorPage } from './pages/FirmAdvisorPage';
 import { WalletPage } from './pages/WalletPage';
 import { SettingsPage } from './pages/SettingsPage';
@@ -29,6 +31,7 @@ const routeToPage: Record<string, string> = {
   '/automation': 'automation',
   '/history': 'history',
   '/fund-team': 'fundteam',
+  '/traders': 'traders',
   '/advisor': 'advisor',
   '/wallet': 'wallet',
   '/settings': 'settings',
@@ -46,6 +49,7 @@ function App() {
   useWsQueryInvalidation();
   useTeamChatStream();
   useBrowserNotifications();
+  useEventSounds();
 
   const activePage = routeToPage[location.pathname] || 'dashboard';
   const handleNavigate = (page: string) => {
@@ -75,6 +79,7 @@ function App() {
           <Route path="/automation" element={<AutomationPage />} />
           <Route path="/history" element={<HistoryPage />} />
           <Route path="/fund-team" element={<FundTeamPage />} />
+          <Route path="/traders" element={<TradersPage />} />
           <Route path="/advisor" element={<FirmAdvisorPage />} />
           <Route path="/wallet" element={<WalletPage />} />
           <Route path="/settings" element={<SettingsPage />} />

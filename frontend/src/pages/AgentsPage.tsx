@@ -2,15 +2,21 @@ import { useState } from 'react';
 import { Play } from 'lucide-react';
 import { useAppSelector } from '../store/hooks';
 import { automationApi } from '../lib/api';
-import { useAgents, useAutomationMetrics } from '../hooks/useQueries';
+import { useAgents, useAutomationMetrics, useTraders } from '../hooks/useQueries';
 import { timeAgo } from '../utils/timeAgo';
+import { usePagination, Paginator } from '../components/common/Paginator';
 
 export function AgentsPage() {
   const selectedSymbol = useAppSelector((s) => s.market.selectedSymbol);
   const { data: agentsData = [], refetch: refetchAgents } = useAgents();
   const { data: metricsData = [] } = useAutomationMetrics();
+  const { data: tradersData = [] } = useTraders();
 
   const agents: any[] = Array.isArray(agentsData) ? agentsData : [];
+  const traders: any[] = Array.isArray(tradersData) ? tradersData : [];
+  const traderMap: Record<string, any> = {};
+  for (const t of traders) traderMap[t.id] = t;
+
   const agentMetrics: Record<string, any> = {};
   for (const m of (Array.isArray(metricsData) ? metricsData : [])) {
     agentMetrics[m.agent_id] = m;
@@ -21,6 +27,7 @@ export function AgentsPage() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [backtestResults, setBacktestResults] = useState<Record<string, any>>({});
   const [backtestLoading, setBacktestLoading] = useState<string | null>(null);
+  const agentsPager = usePagination(agents, 8);
   const [formData, setFormData] = useState({
     name: '',
     strategy_type: 'momentum',
@@ -32,6 +39,7 @@ export function AgentsPage() {
     take_profit_pct: 4.0,
     trailing_stop_pct: 0,
     run_interval_seconds: 3600,
+    timeframe: '15m',
   });
 
   const runAgentNow = async (agent: any) => {
@@ -74,6 +82,7 @@ export function AgentsPage() {
         take_profit_pct: 4.0,
         trailing_stop_pct: 0,
         run_interval_seconds: 3600,
+        timeframe: '15m',
       });
       refetchAgents();
     } catch (error) {
@@ -113,10 +122,10 @@ export function AgentsPage() {
     }
   };
 
-  const runBacktest = async (agentId: string, symbol: string = 'BTCUSDT') => {
+  const runBacktest = async (agentId: string, symbol: string = 'BTCUSDT', timeframe: string = '1h') => {
     setBacktestLoading(agentId);
     try {
-      const res = await fetch(`/api/agents/${agentId}/backtest?symbol=${symbol}&interval=1h`, { method: 'POST' });
+      const res = await fetch(`/api/agents/${agentId}/backtest?symbol=${symbol}&interval=${timeframe}`, { method: 'POST' });
       const data = await res.json();
       setBacktestResults((prev) => ({ ...prev, [agentId]: data }));
     } catch (error) {
@@ -138,17 +147,23 @@ export function AgentsPage() {
       take_profit_pct: agent.take_profit_pct || 4.0,
       trailing_stop_pct: agent.trailing_stop_pct || 0,
       run_interval_seconds: agent.run_interval_seconds,
+      timeframe: agent.timeframe || '1h',
     });
     setEditingId(agent.id);
     setShowForm(false);
   };
 
   const strategies = [
-    { value: 'momentum', label: 'Momentum', desc: 'Follows trend strength' },
-    { value: 'mean_reversion', label: 'Mean Reversion', desc: 'Trades around average price' },
-    { value: 'breakout', label: 'Breakout', desc: 'Trades price breakouts' },
-    { value: 'ai', label: 'AI Agent', desc: 'LLM-powered analysis and signals' },
+    { value: 'momentum',        label: 'Momentum',        desc: 'Follows trend strength',                    timeframes: ['15m', '30m', '1h'],        defaultTf: '15m' },
+    { value: 'mean_reversion',  label: 'Mean Reversion',  desc: 'Trades around average price',               timeframes: ['15m', '30m', '1h', '4h'],  defaultTf: '1h'  },
+    { value: 'breakout',        label: 'Breakout',        desc: 'Trades price breakouts',                    timeframes: ['30m', '1h', '4h'],          defaultTf: '1h'  },
+    { value: 'grid',            label: 'Grid',            desc: 'Buy/sell at range levels — sideways mkts',  timeframes: ['5m', '15m', '30m', '1h'],   defaultTf: '15m' },
+    { value: 'scalping',        label: 'Scalping',        desc: 'Fast entries on small moves',               timeframes: ['1m', '5m', '15m'],          defaultTf: '5m'  },
+    { value: 'trend_following', label: 'Trend Following', desc: 'Rides multi-hour / multi-day trends',       timeframes: ['1h', '4h', '1d'],           defaultTf: '4h'  },
+    { value: 'ai',              label: 'AI Strategy',     desc: 'LLM-powered analysis and signals',          timeframes: ['5m', '15m', '30m', '1h', '4h', '1d'], defaultTf: '1h' },
   ];
+
+  const currentStrategyDef = strategies.find((s) => s.value === formData.strategy_type);
 
   const availablePairs = [
     'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'ADAUSDT',
@@ -176,18 +191,18 @@ export function AgentsPage() {
   return (
     <div className="space-y-6">
       <div className="agent-header">
-        <h1 className="page-title" style={{ marginBottom: 0 }}>Trading Agents</h1>
+        <h1 className="page-title" style={{ marginBottom: 0 }}>Trading Strategies</h1>
         <button type="button" className="agent-btn" onClick={() => { setShowForm(!showForm); setEditingId(null); }}>
-          {showForm ? 'Cancel' : '+ New Agent'}
+          {showForm ? 'Cancel' : '+ New Strategy'}
         </button>
       </div>
 
       {showForm && (
         <div className="agent-form">
-          <h3 className="form-title">Create New Agent</h3>
+          <h3 className="form-title">Create New Strategy</h3>
 
           <div className="form-group">
-            <label className="form-label">Agent Name</label>
+            <label className="form-label">Strategy Name</label>
             <input
               type="text"
               className="settings-input"
@@ -207,10 +222,35 @@ export function AgentsPage() {
                     name="strategy"
                     value={s.value}
                     checked={formData.strategy_type === s.value}
-                    onChange={(e) => setFormData({ ...formData, strategy_type: e.target.value })}
+                    onChange={(e) => setFormData({ ...formData, strategy_type: e.target.value, timeframe: s.defaultTf })}
                   />
                   <span className="strategy-label">{s.label}</span>
                   <span className="strategy-desc">{s.desc}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+
+          <div className="form-group">
+            <label className="form-label">
+              Chart Timeframe
+              {currentStrategyDef && (
+                <span style={{ marginLeft: '.5rem', fontSize: '.65rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)' }}>
+                  — recommended for {currentStrategyDef.label}: {currentStrategyDef.timeframes.join(', ')}
+                </span>
+              )}
+            </label>
+            <div className="strategy-options" style={{ flexDirection: 'row', flexWrap: 'wrap' }}>
+              {(currentStrategyDef?.timeframes ?? ['1m','5m','15m','30m','1h','4h','1d']).map((tf) => (
+                <label key={tf} className={`strategy-option ${formData.timeframe === tf ? 'selected' : ''}`} style={{ flex: '0 0 auto', minWidth: 'auto' }}>
+                  <input
+                    type="radio"
+                    name="timeframe"
+                    value={tf}
+                    checked={formData.timeframe === tf}
+                    onChange={() => setFormData({ ...formData, timeframe: tf })}
+                  />
+                  <span className="strategy-label" style={{ fontSize: '.75rem' }}>{tf}</span>
                 </label>
               ))}
             </div>
@@ -320,23 +360,24 @@ export function AgentsPage() {
           </div>
 
           <button type="button" className="settings-btn" onClick={createAgent}>
-            Create Agent
+            Create Strategy
           </button>
         </div>
       )}
 
       {agents.length === 0 && !showForm ? (
         <div className="card">
-          <p className="text-gray-400">No agents configured yet. Create your first agent to start automated trading.</p>
+          <p className="text-gray-400">No strategies configured yet. Create your first strategy to start automated trading.</p>
         </div>
       ) : (
-        <div className="agents-grid">
-          {agents.map((agent) => (
+        <>
+          <div className="agents-grid">
+            {agentsPager.pageItems.map((agent) => (
             <div key={agent.id} className={`agent-card ${agent.is_enabled ? 'enabled' : ''}`}>
               {editingId === agent.id ? (
                 <div className="agent-edit-form">
                   <div className="form-group">
-                    <label className="form-label">Agent Name</label>
+                    <label className="form-label">Strategy Name</label>
                     <input
                       type="text"
                       className="settings-input"
@@ -454,6 +495,27 @@ export function AgentsPage() {
                   </div>
 
                   <div className="form-group">
+                    <label className="form-label">
+                      Chart Timeframe
+                      {(() => { const sd = strategies.find(s => s.value === formData.strategy_type); return sd ? <span style={{ marginLeft: '.5rem', fontSize: '.6rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)' }}>recommended: {sd.timeframes.join(', ')}</span> : null; })()}
+                    </label>
+                    <div className="strategy-options" style={{ flexDirection: 'row', flexWrap: 'wrap' }}>
+                      {(strategies.find(s => s.value === formData.strategy_type)?.timeframes ?? ['1m','5m','15m','30m','1h','4h','1d']).map((tf) => (
+                        <label key={tf} className={`strategy-option ${formData.timeframe === tf ? 'selected' : ''}`} style={{ flex: '0 0 auto', minWidth: 'auto' }}>
+                          <input
+                            type="radio"
+                            name={`edit-tf-${agent.id}`}
+                            value={tf}
+                            checked={formData.timeframe === tf}
+                            onChange={() => setFormData({ ...formData, timeframe: tf })}
+                          />
+                          <span className="strategy-label" style={{ fontSize: '.75rem' }}>{tf}</span>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="form-group">
                     <label className="form-label">Run Interval</label>
                     <div className="strategy-options" style={{ flexDirection: 'row', flexWrap: 'wrap' }}>
                       {intervals.map((iv) => (
@@ -481,7 +543,23 @@ export function AgentsPage() {
                   <div className="agent-card-header">
                     <div>
                       <h3>{agent.name}</h3>
-                      <span className="strategy-tag">{agent.strategy_type}</span>
+                      <div style={{ display: 'flex', gap: '.4rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                        <span className="strategy-tag">{agent.strategy_type}</span>
+                        <span style={{
+                          fontSize: '.6rem', fontFamily: 'var(--mono)', padding: '.15rem .4rem',
+                          borderRadius: '4px', background: 'rgba(255,200,0,.08)', color: '#f5c842',
+                          border: '1px solid rgba(255,200,0,.2)',
+                        }}>{agent.timeframe || '1h'}</span>
+                        {agent.trader_id && traderMap[agent.trader_id] && (
+                          <span style={{
+                            fontSize: '.6rem', fontFamily: 'var(--mono)', padding: '.15rem .4rem',
+                            borderRadius: '4px', background: 'var(--accent-dim)', color: 'var(--accent)',
+                            border: '1px solid rgba(0,194,255,.2)',
+                          }}>
+                            {traderMap[agent.trader_id].config?.avatar || '🤖'} {traderMap[agent.trader_id].name}
+                          </span>
+                        )}
+                      </div>
                     </div>
                     <label className="toggle-switch">
                       <input
@@ -637,7 +715,7 @@ export function AgentsPage() {
                     <button
                       type="button"
                       className="backtest-btn"
-                      onClick={() => runBacktest(agent.id, agent.trading_pairs[0])}
+                      onClick={() => runBacktest(agent.id, agent.trading_pairs[0], agent.timeframe || '1h')}
                       disabled={backtestLoading === agent.id}
                     >
                       {backtestLoading === agent.id ? 'Running...' : 'Backtest'}
@@ -649,7 +727,9 @@ export function AgentsPage() {
               )}
             </div>
           ))}
-        </div>
+          </div>
+          <Paginator page={agentsPager.page} totalPages={agentsPager.totalPages} total={agentsPager.total} pageSize={8} onPage={agentsPager.setPage} label="strategies" />
+        </>
       )}
     </div>
   );

@@ -28,8 +28,8 @@ class RiskLimits(BaseModel):
     max_position_size_pct: float = Field(default=5.0, ge=0.1, le=100)
     max_daily_loss_pct: float = Field(default=5.0, ge=0.1, le=50)
     max_open_positions: int = Field(default=5, ge=1, le=50)
-    default_stop_loss_pct: float = Field(default=2.0, ge=0.1, le=50)
-    default_take_profit_pct: float = Field(default=4.0, ge=0.1, le=100)
+    default_stop_loss_pct: float = Field(default=3.5, ge=0.1, le=50)
+    default_take_profit_pct: float = Field(default=7.0, ge=0.1, le=100)
     max_leverage: float = Field(default=1.0, ge=1.0, le=125)
     exposure_threshold_pct: float = Field(default=80.0, ge=10.0, le=100.0)
 
@@ -93,6 +93,22 @@ class LlmConfigUpdateRequest(BaseModel):
     anthropic_api_key: Optional[str] = None
     openrouter_api_key: Optional[str] = None
 
+class TelegramSettingsModel(BaseModel):
+    bot_token: str = ""
+    chat_id: str = ""
+    enabled: bool = False
+    trade_executed: bool = True
+    trade_rejected: bool = True
+    ta_veto: bool = True
+    daily_loss_limit: bool = True
+    position_closed: bool = True
+    take_profit_hit: bool = True
+    automation_start_stop: bool = True
+    agent_error: bool = True
+    api_error: bool = True
+    daily_report: bool = True
+    rebalance: bool = False
+
 
 # ── DB-backed settings store ──────────────────────────────────────────────────
 # Settings are loaded from the database on first access and cached in memory.
@@ -144,7 +160,7 @@ async def _save_setting(key: str, value: dict):
 
 
 async def _load_all_settings():
-    """Load risk limits and trading prefs from DB, fall back to defaults."""
+    """Load risk limits, trading prefs and Telegram config from DB, fall back to defaults."""
     global _runtime_risk_limits, _runtime_trading_prefs, _settings_loaded
 
     if _settings_loaded:
@@ -170,7 +186,22 @@ async def _load_all_settings():
     else:
         _runtime_trading_prefs = TradingPreferences()
 
+    # Load and apply Telegram settings
+    telegram_data = await _load_setting("telegram")
+    if telegram_data:
+        try:
+            _apply_telegram_config(TelegramSettingsModel(**telegram_data))
+            logger.info("Loaded Telegram settings from DB")
+        except Exception as e:
+            logger.warning(f"Failed to apply Telegram settings: {e}")
+
     _settings_loaded = True
+
+
+def _apply_telegram_config(model: TelegramSettingsModel) -> None:
+    """Push a TelegramSettingsModel into the telegram_service singleton."""
+    from app.services.telegram_service import TelegramConfig, telegram_service
+    telegram_service.configure(TelegramConfig(**model.model_dump()))
 
 
 def get_risk_limits() -> RiskLimits:
@@ -311,3 +342,72 @@ async def get_trading_pairs():
     """Return the configured trading pairs list."""
     await _load_all_settings()
     return {"pairs": _runtime_trading_prefs.trading_pairs}
+
+
+# ── Telegram settings ─────────────────────────────────────────────────────────
+
+@router.get("/telegram", response_model=TelegramSettingsModel)
+async def get_telegram_settings():
+    """Return current Telegram settings (token masked)."""
+    await _load_all_settings()
+    from app.services.telegram_service import telegram_service
+    cfg = telegram_service.get_config()
+    data = {
+        "bot_token": f"...{cfg.bot_token[-6:]}" if len(cfg.bot_token) > 6 else ("***" if cfg.bot_token else ""),
+        "chat_id": cfg.chat_id,
+        "enabled": cfg.enabled,
+        "trade_executed": cfg.trade_executed,
+        "trade_rejected": cfg.trade_rejected,
+        "ta_veto": cfg.ta_veto,
+        "daily_loss_limit": cfg.daily_loss_limit,
+        "position_closed": cfg.position_closed,
+        "take_profit_hit": cfg.take_profit_hit,
+        "automation_start_stop": cfg.automation_start_stop,
+        "agent_error": cfg.agent_error,
+        "api_error": cfg.api_error,
+        "daily_report": cfg.daily_report,
+        "rebalance": cfg.rebalance,
+    }
+    return TelegramSettingsModel(**data)
+
+
+@router.put("/telegram", response_model=TelegramSettingsModel)
+async def update_telegram_settings(req: TelegramSettingsModel):
+    """Save Telegram settings (persisted to DB and applied immediately)."""
+    await _load_all_settings()
+    from app.services.telegram_service import telegram_service
+
+    # If token is masked placeholder, keep existing token
+    existing_cfg = telegram_service.get_config()
+    token = req.bot_token
+    if token.startswith("...") or token == "***":
+        token = existing_cfg.bot_token
+
+    model_with_real_token = TelegramSettingsModel(**{**req.model_dump(), "bot_token": token})
+    await _save_setting("telegram", model_with_real_token.model_dump())
+    _apply_telegram_config(model_with_real_token)
+    logger.info(f"Telegram settings updated — enabled={req.enabled}")
+
+    # Return with masked token
+    masked = model_with_real_token.model_dump()
+    masked["bot_token"] = f"...{token[-6:]}" if len(token) > 6 else ("***" if token else "")
+    return TelegramSettingsModel(**masked)
+
+
+@router.post("/test-telegram")
+async def test_telegram(req: TelegramSettingsModel):
+    """Send a test message to verify bot token + chat ID (does not save)."""
+    from app.services.telegram_service import telegram_service
+
+    # Use saved token if placeholder passed
+    token = req.bot_token
+    if token.startswith("...") or token == "***":
+        token = telegram_service.get_config().bot_token
+
+    if not token or not req.chat_id:
+        raise HTTPException(status_code=400, detail="Bot token and chat ID are required")
+
+    result = await telegram_service.test_connection(token, req.chat_id)
+    if result["ok"]:
+        return {"status": "ok", "message": result["message"]}
+    raise HTTPException(status_code=502, detail=result["message"])

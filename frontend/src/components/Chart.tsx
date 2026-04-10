@@ -30,17 +30,17 @@ export function Chart({ data, symbol, timeframe = '1h', onTimeframeChange }: Cha
 
     const chart = createChart(chartContainerRef.current, {
       layout: {
-        background: { type: ColorType.Solid, color: '#111827' },
-        textColor: '#9CA3AF',
+        background: { type: ColorType.Solid, color: '#0d1220' },
+        textColor: '#8ba3c7',
       },
       grid: {
-        vertLines: { color: '#1F2937' },
-        horzLines: { color: '#1F2937' },
+        vertLines: { color: '#1c2b42' },
+        horzLines: { color: '#1c2b42' },
       },
       crosshair: { mode: 1 },
-      rightPriceScale: { borderColor: '#374151' },
+      rightPriceScale: { borderColor: '#243650' },
       timeScale: {
-        borderColor: '#374151',
+        borderColor: '#243650',
         timeVisible: true,
         secondsVisible: false,
       },
@@ -49,16 +49,16 @@ export function Chart({ data, symbol, timeframe = '1h', onTimeframeChange }: Cha
     });
 
     const candleSeries = chart.addSeries(CandlestickSeries, {
-      upColor: '#22C55E',
-      downColor: '#EF4444',
-      borderUpColor: '#22C55E',
-      borderDownColor: '#EF4444',
-      wickUpColor: '#22C55E',
-      wickDownColor: '#EF4444',
+      upColor: '#00e676',
+      downColor: '#ff5370',
+      borderUpColor: '#00e676',
+      borderDownColor: '#ff5370',
+      wickUpColor: '#00e676',
+      wickDownColor: '#ff5370',
     });
 
     const volumeSeries = chart.addSeries(HistogramSeries, {
-      color: '#3B82F6',
+      color: '#00c2ff',
       priceFormat: { type: 'volume' },
       priceScaleId: 'volume',
     });

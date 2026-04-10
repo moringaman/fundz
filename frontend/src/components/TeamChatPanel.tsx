@@ -1,4 +1,4 @@
-import { useRef, useEffect } from 'react';
+import { useRef } from 'react';
 import { MessageCircle } from 'lucide-react';
 import { useFundConversations } from '../hooks/useQueries';
 
@@ -7,9 +7,9 @@ export function TeamChatPanel() {
   const chatEndRef = useRef<HTMLDivElement>(null);
   const msgs: any[] = Array.isArray(conversations) ? conversations : [];
 
-  useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [msgs.length]);
+  // useEffect(() => {
+  //   chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  // }, [msgs.length]);
 
   const typeColors: Record<string, string> = {
     warning: 'var(--red)',
@@ -17,6 +17,26 @@ export function TeamChatPanel() {
     decision: 'var(--green)',
     recommendation: 'var(--amber)',
     greeting: 'var(--text-secondary)',
+    trade_intent: 'var(--amber)',
+    risk_decision: 'var(--red)',
+    trade_executed: 'var(--green)',
+    trade_blocked: 'var(--red)',
+    allocation: 'var(--accent)',
+    ta_confluence: '#a78bfa',
+  };
+
+  const typeLabels: Record<string, string> = {
+    trade_intent: 'trade intent',
+    risk_decision: 'risk decision',
+    trade_executed: 'executed',
+    trade_blocked: 'blocked',
+    allocation: 'allocation',
+    ta_confluence: 'TA confluence',
+    analysis: 'analysis',
+    decision: 'decision',
+    recommendation: 'recommendation',
+    warning: 'warning',
+    greeting: 'greeting',
   };
 
   const formatContent = (content: string) => {
@@ -63,7 +83,7 @@ export function TeamChatPanel() {
                   className="team-chat-msg-type-badge"
                   style={{ color: typeColors[msg.message_type] || 'var(--text-secondary)' }}
                 >
-                  {msg.message_type}
+                  {typeLabels[msg.message_type] || msg.message_type}
                 </span>
                 <span className="team-chat-msg-time">{formatTime(msg.timestamp)}</span>
               </div>

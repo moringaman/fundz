@@ -5,15 +5,17 @@ import {
   useFundRiskAssessment,
   useFundCIOReport,
   useFundPerformanceAttribution,
-  useFundAllocationDecision,
   useFundTeamRoster,
   useFundTechnicalAnalysisBatch,
-  useAgents,
+  useAgents as _useAgents,
   useStrategyActions,
   useTradeRetrospective,
+  useTraderLeaderboard,
+  useTraderAllocation,
 } from '../hooks/useQueries';
 import { DailyReportPanel } from '../components/DailyReportPanel';
 import { TeamChatPanel } from '../components/TeamChatPanel';
+import { usePagination, Paginator } from '../components/common/Paginator';
 
 export function FundTeamPage() {
   const { data: marketAnalysis, isLoading: marketLoading } = useFundMarketAnalysis();
@@ -21,16 +23,22 @@ export function FundTeamPage() {
   const { data: riskData, isLoading: riskLoading } = useFundRiskAssessment();
   const { data: cioReport, isLoading: cioLoading } = useFundCIOReport();
   const { data: attribution, isLoading: attrLoading } = useFundPerformanceAttribution();
-  const { data: allocation, isLoading: allocLoading } = useFundAllocationDecision();
+  const { data: traderAllocation, isLoading: allocLoading } = useTraderAllocation();
   const { data: teamRoster } = useFundTeamRoster();
-  const { data: agents } = useAgents();
+  // agents data available via _useAgents() if needed for future agent-name lookups
   const { data: strategyActions } = useStrategyActions();
   const { data: retroData } = useTradeRetrospective();
+  const { data: traderLeaderboard = [] } = useTraderLeaderboard();
   const [selectedTASymbol, setSelectedTASymbol] = useState<string | null>(null);
 
   const taReports: any[] = Array.isArray(technicalBatch) ? technicalBatch : [];
   const activeSymbol = selectedTASymbol || (taReports.length > 0 ? taReports[0].symbol : null);
   const technicalAnalysis = taReports.find((r: any) => r.symbol === activeSymbol) || null;
+
+  const leaderboardEntries: any[] = (cioReport as any)?.agent_leaderboard ?? [];
+  const leaderboardPager = usePagination(leaderboardEntries, 8);
+  const strategyActionsList: any[] = Array.isArray(strategyActions) ? strategyActions : [];
+  const actionsPager = usePagination(strategyActionsList, 8);
 
   const riskLevel: string = (riskData as any)?.risk_level ?? 'unknown';
   const riskColors: Record<string, string> = {
@@ -59,12 +67,6 @@ export function FundTeamPage() {
       title: 'Agent',
       bio: 'Loading...'
     };
-  };
-
-  const getAgentName = (agentId: string) => {
-    const agentsList = (agents as any) || [];
-    const agent = agentsList.find((a: any) => a.id === agentId);
-    return agent?.name || agentId;
   };
 
   return (
@@ -112,6 +114,92 @@ export function FundTeamPage() {
 
       {/* Main Grid */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))', gap: '1.5rem' }}>
+
+        {/* === Trader Leaderboard === */}
+        <div className="panel" style={{ gridColumn: 'span 2' }}>
+          <div className="panel-header">
+            <div style={{ display: 'flex', alignItems: 'center', gap: '.5rem' }}>
+              <span style={{ fontSize: '1.2rem' }}>🏆</span>
+              <span className="panel-title">Competing Traders</span>
+            </div>
+            <span style={{ fontFamily: 'var(--mono)', fontSize: '.65rem', color: 'var(--text-dim)' }}>
+              {(traderLeaderboard as any[]).filter((t: any) => t.is_enabled).length} active
+            </span>
+          </div>
+          <div className="panel-body">
+            {(traderLeaderboard as any[]).length === 0 ? (
+              <p style={{ fontSize: '.78rem', color: 'var(--text-dim)', textAlign: 'center', padding: '1rem 0' }}>
+                No traders configured. Start the scheduler to seed defaults.
+              </p>
+            ) : (
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: '.75rem' }}>
+                {(traderLeaderboard as any[]).map((t: any, i: number) => (
+                  <div key={t.id} style={{
+                    padding: '.75rem',
+                    background: 'var(--bg-elevated)',
+                    borderRadius: '8px',
+                    border: `1px solid ${i === 0 ? 'rgba(0,230,118,.3)' : 'var(--border)'}`,
+                  }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '.5rem' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '.4rem' }}>
+                        <span style={{ fontSize: '1.1rem' }}>{t.config?.avatar || ['🥇','🥈','🥉'][i] || '🏅'}</span>
+                        <div>
+                          <div style={{ fontSize: '.85rem', fontWeight: 700, color: 'var(--text-primary)' }}>{t.name}</div>
+                          <div style={{ fontSize: '.6rem', fontFamily: 'var(--mono)', color: 'var(--text-dim)' }}>
+                            {t.llm_model?.split('/').pop() || 'unknown'}
+                          </div>
+                        </div>
+                      </div>
+                      <span style={{
+                        fontSize: '.6rem', fontFamily: 'var(--mono)', padding: '.15rem .35rem',
+                        borderRadius: '4px',
+                        background: t.is_enabled ? 'var(--green-dim)' : 'var(--bg-hover)',
+                        color: t.is_enabled ? 'var(--green)' : 'var(--text-dim)',
+                      }}>
+                        {t.is_enabled ? 'ACTIVE' : 'OFF'}
+                      </span>
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '.35rem' }}>
+                      <div className="stat-card">
+                        <div className="stat-label">P&L</div>
+                        <div className={`stat-value ${t.total_pnl >= 0 ? 'positive' : 'negative'}`} style={{ fontSize: '.82rem' }}>
+                          {t.total_pnl >= 0 ? '+' : ''}${t.total_pnl?.toFixed(2)}
+                        </div>
+                      </div>
+                      <div className="stat-card">
+                        <div className="stat-label">Win Rate</div>
+                        <div className="stat-value" style={{ fontSize: '.82rem' }}>
+                          {t.win_rate != null ? `${(t.win_rate * 100).toFixed(0)}%` : '—'}
+                        </div>
+                      </div>
+                      <div className="stat-card">
+                        <div className="stat-label">Allocation</div>
+                        <div className="stat-value" style={{ fontSize: '.82rem', color: 'var(--accent)' }}>
+                          {t.allocation_pct?.toFixed(1)}%
+                        </div>
+                        {t.allocation_dollars > 0 && (
+                          <div style={{ fontSize: '.6rem', fontFamily: 'var(--mono)', color: 'var(--text-dim)', marginTop: '.1rem' }}>
+                            ${t.allocation_dollars?.toLocaleString('en-US', { maximumFractionDigits: 0 })}
+                          </div>
+                        )}
+                      </div>
+                      <div className="stat-card">
+                        <div className="stat-label">Strategies</div>
+                        <div className="stat-value" style={{ fontSize: '.82rem' }}>
+                          {t.agent_count}
+                        </div>
+                      </div>
+                    </div>
+                    <div style={{ marginTop: '.35rem', fontSize: '.6rem', fontFamily: 'var(--mono)', color: 'var(--text-dim)' }}>
+                      {t.total_trades} trades
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+
         {/* === Research Analyst === */}
         <div className="panel" style={{ gridColumn: 'span 2' }}>
           <div className="panel-header">
@@ -340,16 +428,45 @@ export function FundTeamPage() {
               )}
 
               {/* Multi-Timeframe */}
-              {(technicalAnalysis as any).multi_timeframe && (
-                <div style={{ marginTop: '.75rem', padding: '.4rem .5rem', background: 'var(--bg-hover)', borderRadius: '4px' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <span style={{ fontSize: '.6rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)', textTransform: 'uppercase' }}>Multi-TF</span>
-                    <span style={{ fontSize: '.65rem', fontFamily: 'var(--mono)', color: (technicalAnalysis as any).multi_timeframe.trend_confirmation ? 'var(--green)' : 'var(--amber)' }}>
-                      {(technicalAnalysis as any).multi_timeframe.alignment?.toUpperCase()} | {((technicalAnalysis as any).multi_timeframe.confluence_score || 0) * 100}%
-                    </span>
+              {(technicalAnalysis as any).multi_timeframe && (() => {
+                const mtf = (technicalAnalysis as any).multi_timeframe;
+                const tiers = [
+                  { label: mtf.tf_primary || '1h', data: mtf.timeframe_1h },
+                  { label: mtf.tf_mid     || '4h', data: mtf.timeframe_4h },
+                  { label: mtf.tf_high    || '1d', data: mtf.timeframe_1d },
+                ];
+                const trendColor = (t: string) =>
+                  t === 'bullish' ? 'var(--green)' : t === 'bearish' ? 'var(--red)' : 'var(--text-dim)';
+                const alignColor = mtf.alignment === 'bullish' ? 'var(--green)' : mtf.alignment === 'bearish' ? 'var(--red)' : 'var(--amber)';
+                return (
+                  <div style={{ marginTop: '.75rem', padding: '.5rem', background: 'var(--bg-hover)', borderRadius: '6px' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '.4rem' }}>
+                      <span style={{ fontSize: '.6rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)', textTransform: 'uppercase', letterSpacing: '.05em' }}>Multi-Timeframe</span>
+                      <span style={{ fontSize: '.65rem', fontFamily: 'var(--mono)', color: alignColor, fontWeight: 700 }}>
+                        {mtf.alignment?.toUpperCase()} · {Math.round((mtf.confluence_score || 0) * 100)}%
+                      </span>
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '.3rem' }}>
+                      {tiers.map(({ label, data }) => {
+                        const trend = data?.trend || 'neutral';
+                        return (
+                          <div key={label} style={{ background: 'var(--bg-card)', borderRadius: '4px', padding: '.3rem .4rem', textAlign: 'center' }}>
+                            <div style={{ fontSize: '.55rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)', textTransform: 'uppercase', marginBottom: '.15rem' }}>{label}</div>
+                            <div style={{ fontSize: '.65rem', fontFamily: 'var(--mono)', fontWeight: 700, color: trendColor(trend) }}>
+                              {trend === 'bullish' ? '▲' : trend === 'bearish' ? '▼' : '—'} {trend.toUpperCase()}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    {mtf.trend_confirmation && (
+                      <div style={{ fontSize: '.55rem', color: 'var(--green)', fontFamily: 'var(--mono)', textAlign: 'center', marginTop: '.35rem' }}>
+                        ✓ Trend confirmed across timeframes
+                      </div>
+                    )}
                   </div>
-                </div>
-              )}
+                );
+              })()}
               </div>
               )}
             </div>
@@ -592,33 +709,28 @@ export function FundTeamPage() {
 
           {allocLoading ? (
             <div style={{ display: 'flex', justifyContent: 'center', padding: '1.5rem', color: 'var(--text-dim)' }}>Calculating allocation...</div>
-          ) : allocation ? (
+          ) : traderAllocation?.traders?.length > 0 ? (
             <div>
-              {/* Allocation chart */}
-              {Object.keys((allocation as any).allocation_pct ?? {}).length > 0 ? (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '.75rem' }}>
-                  {Object.entries((allocation as any).allocation_pct as Record<string, number>)
-                    .sort(([, a], [, b]) => b - a)
-                    .map(([agentId, pct]: [string, number]) => (
-                      <div key={agentId}>
-                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: '.35rem' }}>
-                          <span style={{ fontSize: '.75rem', fontFamily: 'var(--sans)', color: 'var(--text)', fontWeight: 500, flexShrink: 1, overflow: 'hidden', textOverflow: 'ellipsis' }}>{getAgentName(agentId)}</span>
-                          <span style={{ fontSize: '.8rem', fontFamily: 'var(--mono)', fontWeight: 700, color: 'var(--accent)', flexShrink: 0, marginLeft: '.5rem' }}>{pct.toFixed(1)}%</span>
-                        </div>
-                        <div style={{ height: '14px', background: 'var(--bg-hover)', borderRadius: '4px', overflow: 'hidden', boxShadow: 'inset 0 1px 2px rgba(0,0,0,0.2)' }}>
-                          <div style={{ height: '100%', width: `${Math.min(pct, 100)}%`, background: 'linear-gradient(90deg, var(--accent), var(--accent-bright))', borderRadius: '4px', transition: 'width 0.3s ease' }} />
-                        </div>
-                      </div>
-                    ))}
-                </div>
-              ) : (
-                <div style={{ color: 'var(--text-dim)', fontSize: '.7rem', textAlign: 'center', padding: '1.5rem', fontFamily: 'var(--mono)' }}>No agents to allocate</div>
-              )}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '.75rem' }}>
+                {(traderAllocation.traders as any[]).map((t: any) => (
+                  <div key={t.id}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: '.35rem' }}>
+                      <span style={{ fontSize: '.75rem', fontFamily: 'var(--sans)', color: 'var(--text)', fontWeight: 500 }}>
+                        {t.avatar} {t.name}
+                        <span style={{ fontSize: '.6rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)', marginLeft: '.35rem' }}>{t.llm_model}</span>
+                      </span>
+                      <span style={{ fontSize: '.8rem', fontFamily: 'var(--mono)', fontWeight: 700, color: 'var(--accent)', flexShrink: 0, marginLeft: '.5rem' }}>{(t.allocation_pct as number).toFixed(1)}%</span>
+                    </div>
+                    <div style={{ height: '14px', background: 'var(--bg-hover)', borderRadius: '4px', overflow: 'hidden', boxShadow: 'inset 0 1px 2px rgba(0,0,0,0.2)' }}>
+                      <div style={{ height: '100%', width: `${Math.min(t.allocation_pct, 100)}%`, background: 'linear-gradient(90deg, var(--accent), var(--accent-bright))', borderRadius: '4px', transition: 'width 0.3s ease' }} />
+                    </div>
+                  </div>
+                ))}
+              </div>
 
-              {/* PM Reasoning */}
-              {(allocation as any).reasoning && (
+              {traderAllocation.reasoning && (
                 <div style={{ marginTop: '.75rem', fontSize: '.68rem', color: 'var(--text-secondary)', lineHeight: 1.5, padding: '.5rem', background: 'var(--bg-hover)', borderRadius: '4px', borderLeft: '2px solid var(--accent)' }}>
-                  {(allocation as any).reasoning}
+                  {traderAllocation.reasoning}
                 </div>
               )}
             </div>
@@ -627,54 +739,55 @@ export function FundTeamPage() {
           )}
         </div>
 
-        {/* === Agent Leaderboard (from CIO) === */}
+        {/* === Strategy Leaderboard (from CIO) === */}
         <div className="panel">
           <div className="panel-header">
             <div className="panel-title">
               <Users size={14} />
-              Agent Leaderboard
+              Strategy Leaderboard
             </div>
             <span style={{ fontSize: '.65rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)' }}>RANKED BY P&L</span>
           </div>
 
           {cioLoading ? (
-            <div style={{ display: 'flex', justifyContent: 'center', padding: '1.5rem', color: 'var(--text-dim)' }}>Ranking agents...</div>
-          ) : ((cioReport as any)?.agent_leaderboard as any[])?.length > 0 ? (
-            <div>
-              {((cioReport as any).agent_leaderboard as any[]).map((entry: any, i: number) => (
+            <div style={{ display: 'flex', justifyContent: 'center', padding: '1.5rem', color: 'var(--text-dim)' }}>Ranking strategies...</div>
+          ) : leaderboardEntries.length > 0 ? (
+            <>
+              <div>
+                {leaderboardPager.pageItems.map((entry: any, i: number) => {
+                  const rank = (leaderboardPager.page - 1) * 8 + i;
+                  return (
                 <div key={entry.agent_id} style={{
                   display: 'flex', justifyContent: 'space-between', alignItems: 'center',
                   padding: '.45rem .6rem',
-                  background: i === 0 ? 'rgba(0, 194, 255, .05)' : 'var(--bg-hover)',
+                  background: rank === 0 ? 'rgba(0, 194, 255, .05)' : 'var(--bg-hover)',
                   borderRadius: '5px',
                   marginBottom: '.35rem',
-                  borderLeft: i === 0 ? '2px solid var(--accent)' : '2px solid transparent',
+                  borderLeft: rank === 0 ? '2px solid var(--accent)' : '2px solid transparent',
                 }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: '.5rem' }}>
-                    <span style={{ fontSize: '.65rem', fontFamily: 'var(--mono)', color: i === 0 ? 'var(--accent)' : 'var(--text-dim)', minWidth: '14px' }}>#{i + 1}</span>
+                    <span style={{ fontSize: '.65rem', fontFamily: 'var(--mono)', color: rank === 0 ? 'var(--accent)' : 'var(--text-dim)', minWidth: '14px' }}>#{rank + 1}</span>
                     <div>
-                      <div style={{ fontSize: '.75rem', fontFamily: 'var(--mono)', fontWeight: 700, color: 'var(--text)' }}>{entry.agent_name ?? entry.agent_id?.substring(0, 10)}</div>
+                      <div style={{ fontSize: '.75rem', fontFamily: 'var(--mono)', fontWeight: 700, color: 'var(--text)' }}>{entry.agent_name && !entry.agent_name.includes('-') ? entry.agent_name : (entry.name ?? entry.agent_name)}</div>
                       <div style={{ fontSize: '.6rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)' }}>{(entry.win_rate * 100).toFixed(0)}% WR · {entry.total_runs} runs</div>
                     </div>
                   </div>
                   <div style={{ textAlign: 'right' }}>
-                    <div style={{
-                      fontSize: '.8rem',
-                      fontFamily: 'var(--mono)',
-                      fontWeight: 700,
-                      color: entry.total_pnl >= 0 ? 'var(--green)' : 'var(--red)',
-                    }}>
+                    <div style={{ fontSize: '.8rem', fontFamily: 'var(--mono)', fontWeight: 700, color: entry.total_pnl >= 0 ? 'var(--green)' : 'var(--red)' }}>
                       {entry.total_pnl >= 0 ? '+' : ''}{entry.total_pnl.toFixed(2)}
                     </div>
                     <div style={{ fontSize: '.6rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)' }}>{entry.contribution_pct.toFixed(1)}% of fund</div>
                   </div>
                 </div>
-              ))}
-            </div>
+                  );
+                })}
+              </div>
+              <Paginator page={leaderboardPager.page} totalPages={leaderboardPager.totalPages} total={leaderboardPager.total} pageSize={8} onPage={leaderboardPager.setPage} label="strategies" />
+            </>
           ) : (
             <div style={{ color: 'var(--text-dim)', fontSize: '.75rem', textAlign: 'center', padding: '1.5rem' }}>
               <Users size={28} style={{ opacity: .3, display: 'block', margin: '0 auto .5rem' }} />
-              No agent data yet. Agents need to run first.
+              No strategy data yet. Strategies need to run first.
             </div>
           )}
         </div>
@@ -687,56 +800,59 @@ export function FundTeamPage() {
           <h3 className="card-title"><GitBranch size={16} /> Strategy Actions</h3>
           <span style={{ fontSize: '.65rem', color: 'var(--text-dim)' }}>Fund Manager ↔ Technical Analyst Cooperation</span>
         </div>
-        {Array.isArray(strategyActions) && strategyActions.length > 0 ? (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '.5rem', padding: '.5rem' }}>
-            {strategyActions.slice(0, 10).map((action: any) => {
-              const actionColors: Record<string, string> = {
-                create_agent: '#22c55e',
-                disable_agent: '#ef4444',
-                enable_agent: '#3b82f6',
-                adjust_params: '#f59e0b',
-              };
-              const actionIcons: Record<string, string> = {
-                create_agent: '➕',
-                disable_agent: '⛔',
-                enable_agent: '✅',
-                adjust_params: '⚙️',
-              };
-              return (
-                <div key={action.id} style={{
-                  padding: '.6rem .8rem',
-                  borderRadius: '8px',
-                  background: 'var(--surface)',
-                  borderLeft: `3px solid ${actionColors[action.action] || 'var(--border)'}`,
-                  fontSize: '.75rem',
-                }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '.3rem' }}>
-                    <span style={{ fontWeight: 600, color: actionColors[action.action] || 'var(--text)' }}>
-                      {actionIcons[action.action] || '📋'} {action.action?.replace('_', ' ')}
-                    </span>
-                    <span style={{ color: 'var(--text-dim)', fontSize: '.65rem' }}>
-                      {action.created_at ? new Date(action.created_at).toLocaleString() : ''}
-                    </span>
+        {strategyActionsList.length > 0 ? (
+          <>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '.5rem', padding: '.5rem' }}>
+              {actionsPager.pageItems.map((action: any) => {
+                const actionColors: Record<string, string> = {
+                  create_agent: '#22c55e',
+                  disable_agent: '#ef4444',
+                  enable_agent: '#3b82f6',
+                  adjust_params: '#f59e0b',
+                };
+                const actionIcons: Record<string, string> = {
+                  create_agent: '➕',
+                  disable_agent: '⛔',
+                  enable_agent: '✅',
+                  adjust_params: '⚙️',
+                };
+                return (
+                  <div key={action.id} style={{
+                    padding: '.6rem .8rem',
+                    borderRadius: '8px',
+                    background: 'var(--surface)',
+                    borderLeft: `3px solid ${actionColors[action.action] || 'var(--border)'}`,
+                    fontSize: '.75rem',
+                  }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '.3rem' }}>
+                      <span style={{ fontWeight: 600, color: actionColors[action.action] || 'var(--text)' }}>
+                        {actionIcons[action.action] || '📋'} {action.action?.replace('_', ' ')}
+                      </span>
+                      <span style={{ color: 'var(--text-dim)', fontSize: '.65rem' }}>
+                        {action.created_at ? new Date(action.created_at).toLocaleString() : ''}
+                      </span>
+                    </div>
+                    <div style={{ color: 'var(--text)', marginBottom: '.2rem' }}>
+                      <strong>{action.target_agent_name || 'New Agent'}</strong>
+                      {action.strategy_type && <span style={{ marginLeft: '.4rem', color: 'var(--text-dim)' }}>({action.strategy_type})</span>}
+                    </div>
+                    <div style={{ color: 'var(--text-dim)', fontSize: '.7rem', lineHeight: 1.4 }}>
+                      {action.rationale?.slice(0, 150)}{action.rationale?.length > 150 ? '…' : ''}
+                    </div>
+                    <div style={{ display: 'flex', gap: '.6rem', marginTop: '.3rem', fontSize: '.65rem', color: 'var(--text-dim)' }}>
+                      {action.confluence_score != null && <span>Confluence: {(action.confluence_score * 100).toFixed(0)}%</span>}
+                      {action.backtest_net_pnl != null && <span>Backtest PnL: ${action.backtest_net_pnl.toFixed(2)}</span>}
+                      <span style={{ color: action.executed ? 'var(--green)' : 'var(--red)' }}>
+                        {action.executed ? '✓ Executed' : '✗ Not executed'}
+                      </span>
+                      <span>By: {action.initiated_by}</span>
+                    </div>
                   </div>
-                  <div style={{ color: 'var(--text)', marginBottom: '.2rem' }}>
-                    <strong>{action.target_agent_name || 'New Agent'}</strong>
-                    {action.strategy_type && <span style={{ marginLeft: '.4rem', color: 'var(--text-dim)' }}>({action.strategy_type})</span>}
-                  </div>
-                  <div style={{ color: 'var(--text-dim)', fontSize: '.7rem', lineHeight: 1.4 }}>
-                    {action.rationale?.slice(0, 150)}{action.rationale?.length > 150 ? '…' : ''}
-                  </div>
-                  <div style={{ display: 'flex', gap: '.6rem', marginTop: '.3rem', fontSize: '.65rem', color: 'var(--text-dim)' }}>
-                    {action.confluence_score != null && <span>Confluence: {(action.confluence_score * 100).toFixed(0)}%</span>}
-                    {action.backtest_net_pnl != null && <span>Backtest PnL: ${action.backtest_net_pnl.toFixed(2)}</span>}
-                    <span style={{ color: action.executed ? 'var(--green)' : 'var(--red)' }}>
-                      {action.executed ? '✓ Executed' : '✗ Not executed'}
-                    </span>
-                    <span>By: {action.initiated_by}</span>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
+                );
+              })}
+            </div>
+            <Paginator page={actionsPager.page} totalPages={actionsPager.totalPages} total={actionsPager.total} pageSize={8} onPage={actionsPager.setPage} label="actions" />
+          </>
         ) : (
           <div style={{ color: 'var(--text-dim)', fontSize: '.75rem', textAlign: 'center', padding: '1.5rem' }}>
             <GitBranch size={28} style={{ opacity: .3, display: 'block', margin: '0 auto .5rem' }} />

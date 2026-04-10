@@ -15,6 +15,8 @@ from collections import deque
 import json
 import logging
 
+from app.utils import fmt_price
+
 logger = logging.getLogger(__name__)
 
 # Max messages kept in memory (roughly 2 hours of 5-min cycles × 6 agents)
@@ -110,20 +112,29 @@ class TeamChatService:
         metadata: Optional[Dict[str, Any]] = None,
     ) -> ChatMessage:
         _ensure_profiles_loaded()
-        profile = AGENT_PROFILES.get(agent_role) or _get_agent_profile(agent_role)
+        meta = metadata or {}
+        # Support trader roles: override name/avatar via metadata if role isn't a standard agent
+        if agent_role not in AGENT_PROFILES and not agent_role.startswith("trader_"):
+            profile = _get_agent_profile(agent_role)
+        else:
+            profile = AGENT_PROFILES.get(agent_role) or {"name": agent_role, "role": agent_role, "title": agent_role, "avatar": "🤖"}
+
+        display_name = meta.get("_override_name") or profile.get("name", agent_role)
+        display_avatar = meta.get("_override_avatar") or profile.get("avatar", "🤖")
+
         msg = ChatMessage(
             id=self._next_id(),
             agent_id=agent_role,
-            agent_name=profile["name"],
-            agent_role=profile["role"],
-            avatar=profile["avatar"],
+            agent_name=display_name,
+            agent_role=profile.get("role", agent_role),
+            avatar=display_avatar,
             content=content,
             message_type=message_type,
             mentions=mentions or [],
-            metadata=metadata or {},
+            metadata=meta,
         )
         self._messages.append(msg)
-        logger.info(f"TeamChat [{profile['title']}]: {content[:80]}…" if len(content) > 80 else f"TeamChat [{profile['title']}]: {content}")
+        logger.info(f"TeamChat [{display_name}]: {content[:80]}…" if len(content) > 80 else f"TeamChat [{display_name}]: {content}")
 
         # Persist to database
         await self._persist_message(msg)
@@ -304,14 +315,15 @@ class TeamChatService:
             pending = plan.pending_orders_count
             action = plan.recommended_action
 
+            # Only post when there are actually orders to discuss
             if pending == 0:
-                content = "No pending orders in the queue. Standing by for new signals from the team."
-            else:
-                content = (
-                    f"I have **{pending}** pending orders queued. "
-                    f"Recommended action: **{action.replace('_', ' ')}**. "
-                    f"Estimated slippage: {(plan.aggregate_slippage_estimate or 0):.3f}%."
-                )
+                return
+
+            content = (
+                f"I have **{pending}** pending orders queued. "
+                f"Recommended action: **{action.replace('_', ' ')}**. "
+                f"Estimated slippage: {(plan.aggregate_slippage_estimate or 0):.3f}%."
+            )
 
             await self.add_message(
                 agent_role="execution_coordinator",
@@ -354,6 +366,196 @@ class TeamChatService:
             content=f"Blocked **{agent_name}** from running — {reason}.",
             message_type="warning",
             metadata={"blocked_agent": agent_name, "reason": reason},
+        )
+
+    async def log_trade_intent(
+        self,
+        trader_name: str,
+        trader_avatar: str,
+        agent_name: str,
+        symbol: str,
+        side: str,
+        strategy: str,
+        confidence: float,
+        reasoning: str,
+    ) -> None:
+        """Trader announces an intended trade with rationale before execution gates."""
+        direction = "LONG 📈" if side == "buy" else "SHORT 📉"
+        content = (
+            f"Intending to go **{direction}** on **{symbol}** via *{agent_name}* "
+            f"({strategy} strategy, {confidence:.0%} confidence).\n\n"
+            f"Rationale: {reasoning[:250]}{'…' if len(reasoning) > 250 else ''}\n\n"
+            f"Requesting TA confluence from @technical_analyst and risk clearance from @risk_manager."
+        )
+        await self.add_message(
+            agent_role=f"trader_{trader_name.lower().replace(' ', '_')}",
+            content=content,
+            message_type="decision",
+            mentions=["@technical_analyst", "@risk_manager"],
+            metadata={
+                "trader_name": trader_name,
+                "agent_name": agent_name,
+                "symbol": symbol,
+                "side": side,
+                "strategy": strategy,
+                "confidence": confidence,
+                "_override_name": trader_name,
+                "_override_avatar": trader_avatar,
+            },
+        )
+
+    async def log_ta_confluence(
+        self,
+        symbol: str,
+        ta_signal: str,
+        ta_confidence: float,
+        patterns: list,
+        support_levels: list,
+        resistance_levels: list,
+        trade_signal: str,
+    ) -> None:
+        """Marcus (Technical Analyst) responds with chart confluence for the requested symbol."""
+        alignment = "✅ Aligned" if ta_signal == trade_signal else ("❌ Opposing" if (ta_signal == "buy" and trade_signal == "sell") or (ta_signal == "sell" and trade_signal == "buy") else "⚠️ Neutral")
+        pattern_text = ""
+        if patterns:
+            top = patterns[:3]
+            pattern_text = "\n\nPatterns identified: " + ", ".join(
+                f"**{p.name}** ({p.confidence:.0%})" for p in top if hasattr(p, 'name')
+            )
+        level_text = ""
+        if support_levels or resistance_levels:
+            s_str = ", ".join(fmt_price(s) for s in (support_levels or [])[:2]) or "—"
+            r_str = ", ".join(fmt_price(r) for r in (resistance_levels or [])[:2]) or "—"
+            level_text = f"\n\nKey levels — Support: {s_str} | Resistance: {r_str}"
+        content = (
+            f"TA confluence on **{symbol}**: signal **{ta_signal.upper()}** at {ta_confidence:.0%} confidence. "
+            f"Trade intent {alignment}.{pattern_text}{level_text}"
+        )
+        await self.add_message(
+            agent_role="technical_analyst",
+            content=content,
+            message_type="analysis",
+            mentions=["@risk_manager"],
+            metadata={
+                "symbol": symbol,
+                "ta_signal": ta_signal,
+                "ta_confidence": ta_confidence,
+                "alignment": alignment,
+            },
+        )
+
+    async def log_risk_decision(
+        self,
+        agent_name: str,
+        symbol: str,
+        side: str,
+        allowed: bool,
+        reason: str,
+        sl_price: Optional[float] = None,
+        tp_price: Optional[float] = None,
+    ) -> None:
+        """Elena (Risk Manager) posts approval or denial with sizing details."""
+        if allowed:
+            sl_str = f"${sl_price:,.2f}" if sl_price else "N/A"
+            tp_str = f"${tp_price:,.2f}" if tp_price else "N/A"
+            content = (
+                f"✅ **APPROVED** — {agent_name} may proceed with **{side.upper()} {symbol}**.\n\n"
+                f"Position sizing cleared. SL: {sl_str} | TP: {tp_str}. "
+                f"Risk parameters within fund limits."
+            )
+            msg_type = "analysis"
+        else:
+            content = (
+                f"🚫 **DENIED** — {agent_name} trade on **{symbol}** blocked.\n\n"
+                f"Reason: {reason}"
+            )
+            msg_type = "warning"
+        await self.add_message(
+            agent_role="risk_manager",
+            content=content,
+            message_type=msg_type,
+            mentions=["@portfolio_manager"],
+            metadata={
+                "agent_name": agent_name,
+                "symbol": symbol,
+                "side": side,
+                "allowed": allowed,
+                "reason": reason,
+                "sl_price": sl_price,
+                "tp_price": tp_price,
+            },
+        )
+
+    async def log_trade_executed(
+        self,
+        trader_name: str,
+        trader_avatar: str,
+        agent_name: str,
+        symbol: str,
+        side: str,
+        quantity: float,
+        price: float,
+        sl_price: Optional[float],
+        tp_price: Optional[float],
+    ) -> None:
+        """Trader confirms trade placement and thanks the team."""
+        direction = "LONG" if side == "buy" else "SHORT"
+        sl_str = f"${sl_price:,.2f}" if sl_price else "N/A"
+        tp_str = f"${tp_price:,.2f}" if tp_price else "N/A"
+        value_str = f"${quantity * price:,.2f}"
+        content = (
+            f"Trade executed — **{direction} {symbol}** @ ${price:,.4f} ({value_str} notional).\n\n"
+            f"SL: {sl_str} | TP: {tp_str}\n\n"
+            f"Thanks @technical_analyst for the confluence and @risk_manager for the clearance. "
+            f"Position is live — monitoring closely. 🎯"
+        )
+        await self.add_message(
+            agent_role=f"trader_{trader_name.lower().replace(' ', '_')}",
+            content=content,
+            message_type="decision",
+            mentions=["@technical_analyst", "@risk_manager"],
+            metadata={
+                "trader_name": trader_name,
+                "agent_name": agent_name,
+                "symbol": symbol,
+                "side": side,
+                "quantity": quantity,
+                "price": price,
+                "sl_price": sl_price,
+                "tp_price": tp_price,
+                "_override_name": trader_name,
+                "_override_avatar": trader_avatar,
+            },
+        )
+
+    async def log_trade_blocked(
+        self,
+        trader_name: str,
+        trader_avatar: str,
+        agent_name: str,
+        symbol: str,
+        side: str,
+        reason: str,
+    ) -> None:
+        """Trader acknowledges a rejected trade and stands down."""
+        direction = "LONG" if side == "buy" else "SHORT"
+        content = (
+            f"Standing down on **{direction} {symbol}** for *{agent_name}*. "
+            f"Reason: {reason}. Will wait for better conditions. 🤝"
+        )
+        await self.add_message(
+            agent_role=f"trader_{trader_name.lower().replace(' ', '_')}",
+            content=content,
+            message_type="warning",
+            metadata={
+                "trader_name": trader_name,
+                "agent_name": agent_name,
+                "symbol": symbol,
+                "side": side,
+                "reason": reason,
+                "_override_name": trader_name,
+                "_override_avatar": trader_avatar,
+            },
         )
 
     async def log_strategy_review(self, review: Any) -> None:

@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import json
 import logging
 from app.config import settings
+from app.utils import fmt_price
 
 logger = logging.getLogger(__name__)
 
@@ -83,13 +84,13 @@ class LLMRegistry:
             'bio': 'Fund head overseeing all operations, generating reports, and making strategic decisions.'
         },
         'trading_agent': {
-            'name': 'Automated Trader',
-            'title': 'Trading Agent',
+            'name': 'Jordan Blake',
+            'title': 'Quantitative Trader',
             'model': 'mistralai/mixtral-8x7b-instruct',
             'temperature': 0.5,
             'max_tokens': 800,
-            'avatar': 'https://api.dicebear.com/7.x/avataaars/svg?seed=Trader&gender=male',
-            'bio': 'Individual trading agent executing strategies and generating signals.'
+            'avatar': 'https://api.dicebear.com/7.x/avataaars/svg?seed=Jordan%20Blake&gender=male',
+            'bio': 'Quantitative trader executing algorithmic strategies and generating entry/exit signals across all pairs.'
         }
     }
 
@@ -169,9 +170,20 @@ class LLMService:
         prompt = self._build_market_analysis_prompt(market_data)
         return await self._call_llm(prompt)
 
-    async def generate_signal(self, indicators: Dict[str, Any], price_data: Dict[str, Any], team_context: Optional[Dict[str, Any]] = None) -> LLMResponse:
+    async def generate_signal(
+        self,
+        indicators: Dict[str, Any],
+        price_data: Dict[str, Any],
+        team_context: Optional[Dict[str, Any]] = None,
+        agent_context: Optional[Dict[str, Any]] = None,
+    ) -> LLMResponse:
         prompt = self._build_signal_prompt(indicators, price_data, team_context)
-        return await self._call_llm(prompt)
+        system_prompt = (
+            self._build_trader_system_prompt(agent_context)
+            if agent_context
+            else self._build_generic_system_prompt()
+        )
+        return await self._call_llm(prompt, system_prompt=system_prompt)
 
     async def evaluate_strategy(self, strategy_config: Dict[str, Any], performance: Dict[str, Any]) -> LLMResponse:
         prompt = self._build_strategy_evaluation_prompt(strategy_config, performance)
@@ -200,15 +212,15 @@ Provide your analysis in JSON format:
 {{"trend": "bullish/bearish/neutral", "volatility": "high/medium/low", "momentum": "strong/moderate/weak", "recommendation": "buy/sell/hold", "confidence": 0.0-1.0, "reasoning": "brief explanation"}}
 """
 
-    async def _call_llm(self, prompt: str) -> LLMResponse:
+    async def _call_llm(self, prompt: str, system_prompt: Optional[str] = None) -> LLMResponse:
         if self._client is None:
             await self.initialize()
         
         try:
             if self.provider in ("openai", "openrouter", "azure"):
-                return await self._call_openai(prompt)
+                return await self._call_openai(prompt, system_prompt=system_prompt)
             elif self.provider == "anthropic":
-                return await self._call_anthropic(prompt)
+                return await self._call_anthropic(prompt, system_prompt=system_prompt)
             else:
                 raise ValueError(f"Unknown LLM provider: {self.provider}")
         except Exception as e:
@@ -252,10 +264,14 @@ Provide your analysis in JSON format:
             logger.error(f"LLM text call failed: {e}")
             return f"I'm sorry, I couldn't generate a response at this time. Error: {e}"
 
-    async def _call_openai(self, prompt: str) -> LLMResponse:
+    async def _call_openai(self, prompt: str, system_prompt: Optional[str] = None) -> LLMResponse:
+        messages: list = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
         response = await self._client.chat.completions.create(
             model=self.model,
-            messages=[{"role": "user", "content": prompt}],
+            messages=messages,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
             response_format={"type": "json_object"}
@@ -271,12 +287,12 @@ Provide your analysis in JSON format:
             action=data.get("recommendation", data.get("action", "hold"))
         )
 
-    async def _call_anthropic(self, prompt: str) -> LLMResponse:
+    async def _call_anthropic(self, prompt: str, system_prompt: Optional[str] = None) -> LLMResponse:
         response = await self._client.messages.create(
             model=self.model,
             max_tokens=self.max_tokens,
             temperature=self.temperature,
-            system="You are an expert cryptocurrency trading analyst. Always respond in JSON format.",
+            system=system_prompt or "You are an expert cryptocurrency trading analyst. Always respond in JSON format.",
             messages=[{"role": "user", "content": prompt}]
         )
         
@@ -290,8 +306,60 @@ Provide your analysis in JSON format:
             action=data.get("recommendation", data.get("action", "hold"))
         )
 
-    async def _call_azure(self, prompt: str) -> LLMResponse:
-        return await self._call_openai(prompt)
+    async def _call_azure(self, prompt: str, system_prompt: Optional[str] = None) -> LLMResponse:
+        return await self._call_openai(prompt, system_prompt=system_prompt)
+
+    def _build_generic_system_prompt(self) -> str:
+        return (
+            "You are a highly selective professional cryptocurrency trading analyst. "
+            "Your PRIMARY objective is profitable trades — measured on P&L, not trade count. "
+            "A missed trade costs nothing; a losing trade costs real money. "
+            "Always respond with valid JSON only."
+        )
+
+    def _build_trader_system_prompt(self, agent_context: Dict[str, Any]) -> str:
+        trader_name = agent_context.get("trader_name", "Anonymous Trader")
+        trader_style = agent_context.get("trader_style", "Balanced and disciplined.")
+        trader_bio = agent_context.get("trader_bio", "")
+        risk_tolerance = agent_context.get("risk_tolerance", "moderate")
+        preferred_strategies = agent_context.get("preferred_strategies", [])
+        agent_name = agent_context.get("agent_name", "Unnamed Strategy")
+        strategy_type = agent_context.get("strategy_type", "momentum")
+
+        strat_str = ", ".join(preferred_strategies) if preferred_strategies else strategy_type
+        risk_desc = {
+            "high":   "Willing to take larger positions on high-conviction setups and hold through volatility.",
+            "low":    "Capital preservation above all. Small positions, tight stops, consistent compounding over big swings.",
+            "moderate": "Balanced sizing relative to conviction. Respect stops, let winners run within reason.",
+        }.get(risk_tolerance, "Moderate risk approach.")
+
+        return f"""You are {trader_name}, a competing portfolio trader at a professional crypto hedge fund.
+
+IDENTITY: {trader_bio}
+
+TRADING PHILOSOPHY: {trader_style}
+
+RISK TOLERANCE — {risk_tolerance.upper()}: {risk_desc}
+
+CURRENT MANDATE: You are running "{agent_name}", a {strategy_type} strategy. Your preferred approaches: {strat_str}.
+
+CORE RULES (these define your edge — follow them without exception):
+1. DEFAULT TO HOLD — signal buy/sell only with HIGH conviction
+2. Require 3+ confluent signals before acting
+3. NEVER trade against the dominant trend; if unclear, HOLD
+4. Validate risk:reward first — require at least 2× reward vs risk (identify concrete S/R levels)
+5. RSI 35–65 + MACD histogram near zero = NO SIGNAL → HOLD
+6. Choppy/ranging markets = HOLD; only trade clear trends or extreme reversals
+7. Fee round-trip = 0.12% — your edge must exceed this
+8. A missed trade costs nothing; a losing trade costs real money
+
+CONFIDENCE CALIBRATION:
+- 0.8–1.0 → Strong trend + 3+ aligned indicators + clear levels + team agrees → BUY or SELL
+- 0.6–0.8 → Clear trend + 2 aligned indicators → BUY or SELL (cautious size)
+- < 0.6   → Insufficient evidence → HOLD, regardless of individual indicators
+
+RESPONSE: Valid JSON only — no markdown, no preamble.
+{{"action":"buy|sell|hold","confidence":0.0-1.0,"reasoning":"concise technical analysis","key_levels":{{"resistance":0.0,"support":0.0}},"risk_level":"low|medium|high"}}"""
 
     def _build_market_analysis_prompt(self, market_data: Dict[str, Any]) -> str:
         symbol = market_data.get('symbol', 'N/A')
@@ -359,11 +427,13 @@ Return JSON: {{"trend": "strong_bullish|bullish|neutral|bearish|strong_bearish",
             # Technical Analyst (Marcus) — patterns, S/R, multi-timeframe
             ta = team_context.get("ta")
             if ta:
+                _ta_support = ta.get('support', 0) or 0
+                _ta_resist  = ta.get('resistance', 0) or 0
                 parts.append(f"""TECHNICAL ANALYST (Marcus Webb) REPORT:
 - Overall Signal: {ta.get('signal', 'N/A')} (confidence: {ta.get('confidence', 0):.0%})
 - Multi-Timeframe Alignment: {ta.get('alignment', 'N/A')} (confluence: {ta.get('confluence_score', 0):.0%})
 - Patterns Detected: {ta.get('patterns_count', 0)} — {ta.get('patterns_summary', 'none')}
-- Key Support: ${ta.get('support', 0):,.2f} | Resistance: ${ta.get('resistance', 0):,.2f}
+- Key Support: {fmt_price(_ta_support)} | Resistance: {fmt_price(_ta_resist)}
 - Key Observations: {ta.get('observations', 'N/A')}""")
 
             # Research Analyst (Marina) — regime, sentiment
@@ -396,13 +466,46 @@ Return JSON: {{"trend": "strong_bullish|bullish|neutral|bearish|strong_bearish",
 
             # Trade retrospective insights — learnings from past trades
             patterns = team_context.get("trade_patterns")
-            if patterns and patterns.get("learning_summary"):
-                parts.append(f"""TRADE PATTERN ANALYSIS (learn from your past trades):
-- {patterns['learning_summary']}
-- Exit Efficiency: {patterns.get('avg_exit_efficiency', 'N/A')}
-- Best Setup: {patterns.get('best_pattern', 'N/A')}
-- Worst Setup: {patterns.get('worst_pattern', 'N/A')}
-APPLY THESE LEARNINGS: Favour your best setups, avoid your worst patterns, and adjust confidence accordingly.""")
+            if patterns and patterns.get("total_trades", 0) >= 2:
+                retro_rules = []
+
+                # ── Actionable rules derived from historical pattern data ──────────
+                best = patterns.get("best_pattern")
+                worst = patterns.get("worst_pattern")
+                exit_eff = patterns.get("avg_exit_efficiency")
+                avg_win_pct = patterns.get("avg_win_pct", 0) or 0
+                avg_loss_pct = patterns.get("avg_loss_pct", 0) or 0
+                win_rate = patterns.get("win_rate", 0) or 0
+                hold_win = patterns.get("avg_holding_win_hours", 0) or 0
+                hold_loss = patterns.get("avg_holding_loss_hours", 0) or 0
+                weaknesses = patterns.get("weaknesses", [])
+                strengths = patterns.get("strengths", [])
+
+                if best:
+                    retro_rules.append(f"✅ FAVOUR: '{best}' setups have been your most profitable — increase confidence when this pattern is present")
+                if worst:
+                    retro_rules.append(f"🚫 AVOID: '{worst}' setups have been your worst — reduce confidence or skip when this pattern is present")
+                if exit_eff is not None and exit_eff < 0.35:
+                    retro_rules.append(f"⚠️ EXIT EARLY: Your exit efficiency is only {exit_eff:.0%} — you are leaving significant profit on the table. Prefer HOLD to let winners run further before exiting")
+                elif exit_eff is not None and exit_eff > 0.70:
+                    retro_rules.append(f"✅ EXITS: Your exit timing is good ({exit_eff:.0%} efficiency) — maintain current exit discipline")
+                if avg_loss_pct and avg_win_pct and abs(avg_loss_pct) > avg_win_pct * 1.5:
+                    retro_rules.append(f"🚨 LOSS SIZE: Your average loss ({avg_loss_pct:.2f}%) is {abs(avg_loss_pct)/avg_win_pct:.1f}x your average win ({avg_win_pct:.2f}%) — be MORE selective, only trade your highest-conviction setups")
+                if hold_loss > 0 and hold_win > 0 and hold_loss > hold_win * 1.8:
+                    retro_rules.append(f"⚠️ HOLDING BIAS: You hold losers {hold_loss/hold_win:.1f}x longer than winners ({hold_loss:.1f}h vs {hold_win:.1f}h) — cut losing trades faster")
+                if win_rate < 0.35:
+                    retro_rules.append(f"⚠️ LOW WIN RATE: Only {win_rate:.0%} of your recent trades were profitable — require STRONGER confluence before entering. Raise your internal confidence threshold")
+                for w in weaknesses[:2]:
+                    retro_rules.append(f"⚠️ {w}")
+                for s in strengths[:1]:
+                    retro_rules.append(f"✅ {s}")
+
+                if retro_rules:
+                    parts.append(
+                        "YOUR PERSONAL TRADING RULES (derived from your last "
+                        f"{patterns['total_trades']} trades — MANDATORY to follow):\n"
+                        + "\n".join(f"  {r}" for r in retro_rules)
+                    )
 
             if parts:
                 team_section = "\n\nTEAM INTELLIGENCE (factor these into your decision):\n" + "\n\n".join(parts) + """
@@ -415,9 +518,20 @@ IMPORTANT: Weight your decision using team intelligence:
 - Look for CONFLUENCE across team signals — 3+ team members agreeing = high conviction
 """
 
-        return f"""You are a HIGHLY SELECTIVE professional cryptocurrency trading analyst. Your PRIMARY objective is PROFITABLE trades — you are measured on P&L, not trade count. A missed trade costs nothing; a losing trade costs real money.
+            # Re-entry context — inject AFTER team_section is built so it always surfaces
+            recent_stopout = team_context.get("recent_stopout") if team_context else None
+            if recent_stopout:
+                team_section += (
+                    f"\n⚠️  RE-ENTRY CONTEXT: Your last trade on {recent_stopout['symbol']} was stopped out "
+                    f"{recent_stopout['minutes_ago']} minutes ago (P&L: {recent_stopout['pnl']:+.2f}). "
+                    f"The stop-loss may have been too tight relative to current volatility. "
+                    f"If the underlying thesis (trend, mean-reversion setup, key level) is STILL INTACT, "
+                    f"this is a re-entry opportunity — not a reason to stand down. "
+                    f"Re-entries after tight stop-outs are a normal part of mean-reversion and trend strategies. "
+                    f"Evaluate the current setup on its own merits.\n"
+                )
 
-PRICE ACTION:
+        return f"""PRICE ACTION:
 - Current Price: ${price_data.get('current', 0)}
 - Price Change (24h): {price_data.get('change_pct', 0):.2f}%
 
@@ -433,25 +547,8 @@ VOLATILITY & SUPPORT/RESISTANCE:
 - ATR (Volatility): {atr:.2f}
 - Current position vs BB: {"Near resistance (upper band)" if price_data.get('current', 0) > bb_middle else "Near support (lower band)" if price_data.get('current', 0) < bb_middle else "Mid-range"}
 {team_section}
-TRADING RULES (MANDATORY):
-1. DEFAULT TO HOLD — only signal buy/sell when you have HIGH conviction
-2. Require 3+ confluent signals pointing the same direction before acting
-3. NEVER trade against the dominant trend. If trend is unclear, HOLD
-4. Validate risk:reward BEFORE recommending — identify a concrete stop-loss level (support/resistance) and ensure the target is at least 2x the risk
-5. If RSI is between 35-65 and MACD histogram is near zero, that is NO SIGNAL — return HOLD
-6. Choppy/ranging markets = HOLD. Only trade clear trends or extreme reversals
-7. Each fee round-trip costs 0.12% — your edge must exceed this
-8. It is BETTER to miss 10 good trades than to enter 1 bad trade
-
-CONFIDENCE CALIBRATION:
-- 0.8-1.0: Strong trend + 3+ aligned indicators + clear support/resistance + team agrees → BUY or SELL
-- 0.6-0.8: Clear trend + 2 aligned indicators + identifiable levels → BUY or SELL (cautious size)
-- Below 0.6: Insufficient evidence → MUST return HOLD regardless of indicators
-
-Return JSON: {{"action": "buy|sell|hold", "confidence": 0.0-1.0, "reasoning": "brief but specific technical analysis reasoning incorporating team intelligence", "key_levels": {{"resistance": 0.0, "support": 0.0}}, "risk_level": "low|medium|high"}}
-
-IMPORTANT: "sell" means SHORT if no long position exists. You can profit from downtrends by shorting. Use sell signals when bearish indicators are strong.
-IMPORTANT: When in doubt, ALWAYS return hold. Your job is to MAKE MONEY, not to trade."""
+NOTE: "sell" means SHORT when no long position exists — you can profit from downtrends.
+Analyse the data above and return your trading decision as JSON."""
 
     def _build_strategy_evaluation_prompt(self, strategy_config: Dict[str, Any], performance: Dict[str, Any]) -> str:
         total_trades = performance.get('total_trades', 0) or 0

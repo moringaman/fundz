@@ -25,6 +25,25 @@ class AgentConfig(BaseModel):
     trailing_stop_pct: Optional[float] = None
     run_interval_seconds: int = 3600
     indicators_config: dict = {}
+    timeframe: str = "1h"
+
+
+# Permitted timeframes per strategy — used for validation and UI hints
+STRATEGY_TIMEFRAMES: dict = {
+    "scalping":        {"default": "5m",  "allowed": ["1m", "5m", "15m"]},
+    "momentum":        {"default": "15m", "allowed": ["15m", "30m", "1h"]},
+    "mean_reversion":  {"default": "1h",  "allowed": ["15m", "30m", "1h", "4h"]},
+    "breakout":        {"default": "1h",  "allowed": ["30m", "1h", "4h"]},
+    "trend_following": {"default": "4h",  "allowed": ["1h", "4h", "1d"]},
+    "grid":            {"default": "15m", "allowed": ["5m", "15m", "30m", "1h"]},
+    "ai":              {"default": "1h",  "allowed": ["5m", "15m", "30m", "1h", "4h", "1d"]},
+}
+
+ALL_TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"]
+
+
+def default_timeframe_for(strategy_type: str) -> str:
+    return STRATEGY_TIMEFRAMES.get(strategy_type, {}).get("default", "1h")
 
 
 class Agent(BaseModel):
@@ -41,6 +60,8 @@ class Agent(BaseModel):
     trailing_stop_pct: Optional[float] = None
     run_interval_seconds: int = 3600
     indicators_config: dict = {}
+    timeframe: str = "1h"
+    trader_id: Optional[str] = None
     created_at: str
 
 
@@ -69,8 +90,16 @@ def agent_to_response(db_agent: DBAgent) -> Agent:
         trailing_stop_pct=db_agent.config.get("trailing_stop_pct"),
         run_interval_seconds=db_agent.run_interval_seconds,
         indicators_config=db_agent.config.get("indicators_config", {}),
+        timeframe=db_agent.config.get("timeframe", default_timeframe_for(db_agent.strategy_type)),
+        trader_id=db_agent.trader_id,
         created_at=db_agent.created_at.isoformat() if db_agent.created_at else datetime.now().isoformat()
     )
+
+
+@router.get("/strategy-timeframes")
+async def get_strategy_timeframes():
+    """Returns permitted timeframes and defaults per strategy type."""
+    return STRATEGY_TIMEFRAMES
 
 
 @router.get("", response_model=List[Agent])
@@ -95,6 +124,7 @@ async def create_agent(config: AgentConfig, db: AsyncSession = Depends(get_db)):
             "stop_loss_pct": config.stop_loss_pct,
             "take_profit_pct": config.take_profit_pct,
             "trailing_stop_pct": config.trailing_stop_pct,
+            "timeframe": config.timeframe or default_timeframe_for(config.strategy_type),
         },
         is_enabled=False,
         allocation_percentage=config.allocation_percentage,
@@ -132,6 +162,7 @@ async def update_agent(agent_id: str, config: AgentConfig, db: AsyncSession = De
         "stop_loss_pct": config.stop_loss_pct,
         "take_profit_pct": config.take_profit_pct,
         "trailing_stop_pct": config.trailing_stop_pct,
+        "timeframe": config.timeframe or default_timeframe_for(config.strategy_type),
     }
     agent.allocation_percentage = config.allocation_percentage
     agent.max_position_size = config.max_position_size
@@ -177,6 +208,7 @@ async def toggle_agent(agent_id: str, db: AsyncSession = Depends(get_db)):
             "is_enabled": True,
             "allocation_percentage": agent.allocation_percentage,
             "max_position_size": agent.max_position_size,
+            "trader_id": agent.trader_id,
         })
     else:
         agent_scheduler.unregister_agent(agent.id)

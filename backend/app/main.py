@@ -9,6 +9,7 @@ import logging
 from app.config import settings
 from app.api.routes import market, trading, agents, backtest, paper_trading, automation, llm, fund
 from app.api.routes import settings as settings_routes
+from app.api.routes import traders as traders_routes
 
 # Configure root logger so app.* loggers are visible
 logging.basicConfig(
@@ -19,6 +20,8 @@ logging.basicConfig(
 # Silence noisy SQLAlchemy echo (engine echo=True uses this logger)
 logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
 logging.getLogger("sqlalchemy.engine.Engine").setLevel(logging.WARNING)
+# Suppress uvicorn access log — 200s are noise; errors logged by middleware below
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +44,7 @@ api_router.include_router(automation.router)
 api_router.include_router(llm.router)
 api_router.include_router(fund.router)
 api_router.include_router(settings_routes.router)
+api_router.include_router(traders_routes.router)
 
 
 class ConnectionManager:
@@ -272,7 +276,7 @@ async def websocket_market(websocket: WebSocket):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from app.database import engine, Base
-    from app.models import AgentRunRecord, AgentMetricRecord, TeamChatMessageRecord, DailyReport  # noqa: F401
+    from app.models import AgentRunRecord, AgentMetricRecord, TeamChatMessageRecord, DailyReport, Trader  # noqa: F401
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -311,6 +315,16 @@ async def lifespan(app: FastAPI):
             ))
         except Exception:
             pass  # Index already exists or DB doesn't support IF NOT EXISTS
+
+        # Add trader_id columns to agents and trades (Multi-Trader Architecture)
+        if not await _column_exists(conn, "agents", "trader_id"):
+            await conn.execute(text(
+                "ALTER TABLE agents ADD COLUMN trader_id VARCHAR(36)"
+            ))
+        if not await _column_exists(conn, "trades", "trader_id"):
+            await conn.execute(text(
+                "ALTER TABLE trades ADD COLUMN trader_id VARCHAR(36)"
+            ))
 
     from app.services.llm import llm_service
     try:
@@ -354,6 +368,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+_access_logger = logging.getLogger("api.access")
+
+@app.middleware("http")
+async def _log_errors(request, call_next):
+    response = await call_next(request)
+    if response.status_code >= 400:
+        _access_logger.warning(
+            "%s %s → %d", request.method, request.url.path, response.status_code
+        )
+    return response
 
 app.include_router(api_router)
 

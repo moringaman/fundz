@@ -400,6 +400,121 @@ Determine optimal capital allocation. Return JSON:
                 based_on_market_condition=market_condition
             )
 
+    async def make_trader_allocation_decision(
+        self,
+        traders: List[Dict],
+        trader_performance: List[Dict],
+        market_condition: MarketCondition,
+        total_capital: float = 10000,
+        confluence_scores: Optional[Dict[str, Dict]] = None,
+    ) -> Dict[str, float]:
+        """
+        James (Portfolio Manager) allocates capital proportionately across traders
+        using LLM judgment based on trader performance and market conditions.
+        Returns {trader_id: allocation_pct}.
+        """
+        try:
+            if not traders:
+                return {}
+
+            # Build trader context for LLM
+            context_lines = []
+            for t in traders:
+                if not t.get("is_enabled", True):
+                    continue
+                perf = next((p for p in trader_performance if p.get("trader_id") == t["id"]), {})
+                agent_count = perf.get("agent_count", len([
+                    a for a in t.get("agents", []) if a
+                ]))
+                context_lines.append(f"\n{t.get('name', t['id'])} ({t.get('llm_provider','?')} / {t.get('llm_model','?')}):")
+                context_lines.append(f"  Current Allocation: {t.get('allocation_pct', 33.3):.1f}%")
+                context_lines.append(f"  Strategies Managed: {perf.get('agent_count', 0)}")
+                context_lines.append(f"  Total P&L: ${perf.get('total_pnl', 0):+.2f}")
+                context_lines.append(f"  Win Rate: {perf.get('win_rate', 0):.1%}")
+                context_lines.append(f"  Total Trades: {perf.get('total_trades', 0)}")
+                sharpe = perf.get("sharpe_ratio", None)
+                if sharpe is not None:
+                    context_lines.append(f"  Sharpe Ratio: {sharpe:.2f}")
+                if perf.get("total_trades", 0) == 0:
+                    context_lines.append(f"  Status: NEW TRADER (no live trades yet — give time to establish)")
+
+            trader_context = "\n".join(context_lines)
+
+            confluence_section = ""
+            if confluence_scores:
+                conf_lines = []
+                for sym, data in confluence_scores.items():
+                    conf_lines.append(
+                        f"  {sym}: signal={data.get('signal','?')}, "
+                        f"confluence={data.get('score',0):.0%}, "
+                        f"alignment={data.get('alignment','?')}"
+                    )
+                confluence_section = "\nTECHNICAL CONFLUENCE:\n" + "\n".join(conf_lines) + "\n"
+
+            trader_ids = [t["id"] for t in traders if t.get("is_enabled", True)]
+            trader_names = {t["id"]: t.get("name", t["id"]) for t in traders}
+
+            prompt = f"""You are James, the Portfolio Manager of an AI trading fund. You must allocate the fund's capital across competing trader AIs. Each trader manages their own pool of trading strategies.
+
+TOTAL FUND CAPITAL: ${total_capital:,.0f}
+
+MARKET CONDITIONS:
+Trend: {market_condition.trend}
+Volatility: {market_condition.volatility}
+RSI: {(market_condition.rsi or 50):.1f}
+Momentum: {market_condition.momentum}
+Recommendation: {market_condition.recommendation}
+{confluence_section}
+TRADER PERFORMANCE DATA:
+{trader_context}
+
+ALLOCATION RULES:
+1. Allocate more capital to traders with better P&L and win rates
+2. Never allocate less than 15% to any enabled trader (all traders need a minimum to operate)
+3. Never allocate more than 50% to any single trader (diversification requirement)
+4. New traders with no trades should receive close to equal allocation until they prove themselves
+5. Factor in market conditions — in volatile markets prefer traders with higher win rates
+6. Allocations must sum to exactly 100%
+
+Return JSON only:
+{{
+  "allocation_pct": {{"{trader_ids[0] if trader_ids else 'trader_id'}": percentage, ...}},
+  "reasoning": "brief explanation of your allocation logic"
+}}"""
+
+            response = await self.llm_service._call_llm(prompt)
+
+            try:
+                data = json.loads(response.content)
+                alloc_pct: Dict[str, float] = data.get("allocation_pct", {})
+
+                # Enforce min 15%, max 50%, only for enabled traders
+                for tid in trader_ids:
+                    pct = alloc_pct.get(tid, 100.0 / len(trader_ids))
+                    alloc_pct[tid] = max(15.0, min(50.0, pct))
+
+                # Normalise to 100
+                total = sum(alloc_pct.get(tid, 0) for tid in trader_ids)
+                if total > 0:
+                    alloc_pct = {tid: alloc_pct.get(tid, 0) / total * 100 for tid in trader_ids}
+
+                reasoning = data.get("reasoning", "LLM trader allocation")
+                logger.info(f"PM trader allocation: {reasoning[:120]}")
+                return alloc_pct
+
+            except (json.JSONDecodeError, ValueError):
+                logger.warning("PM trader allocation parse failed — using equal split")
+                equal = 100.0 / len(trader_ids) if trader_ids else 33.3
+                return {tid: equal for tid in trader_ids}
+
+        except Exception as e:
+            logger.error(f"PM trader allocation failed: {e}")
+            # Equal split fallback
+            enabled = [t["id"] for t in traders if t.get("is_enabled", True)]
+            equal = 100.0 / len(enabled) if enabled else 33.3
+            return {tid: equal for tid in enabled}
+
+
     async def recommend_rebalancing(
         self,
         agents: List[Dict],
@@ -608,6 +723,13 @@ Determine optimal capital allocation. Return JSON:
             if market.volatility == "high":
                 return {"match": True, "reason": "High volatility good for breakouts"}
             return {"match": False, "reason": "Low volatility limits breakout opportunities"}
+
+        elif strategy_type == "grid":
+            if market.trend == "sideways":
+                return {"match": True, "reason": "Grid strategy thrives in sideways/ranging market"}
+            elif market.volatility == "low":
+                return {"match": True, "reason": "Low volatility and tight range suits grid trading"}
+            return {"match": False, "reason": "Grid strategy less effective in trending market"}
         
         return {"match": True, "reason": "Neutral strategy fit"}
     

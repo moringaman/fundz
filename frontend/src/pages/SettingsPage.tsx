@@ -1,10 +1,11 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Key, Brain, Save, Eye, EyeOff, Check, RefreshCw, Info, AlertTriangle, TrendingUp, Shield, Mail, Send, Bell, Wallet, Plus, Minus } from 'lucide-react';
+import { Key, Brain, Save, Eye, EyeOff, Check, RefreshCw, Info, AlertTriangle, TrendingUp, Shield, Mail, Send, Bell, Wallet, Plus, Minus, MessageCircle, Volume2 } from 'lucide-react';
 import { useSettings } from '../hooks/useQueries';
 import { settingsApi, paperApi } from '../lib/api';
 import { notificationService, type NotificationPreferences } from '../lib/notifications';
+import { SoundSettings } from '../components/settings/SoundSettings';
 
-type SettingsTab = 'api' | 'risk' | 'trading' | 'llm' | 'email' | 'notifications';
+type SettingsTab = 'api' | 'risk' | 'trading' | 'llm' | 'email' | 'notifications' | 'telegram' | 'sounds';
 
 export function SettingsPage() {
   const { data: settingsData, refetch: refetchSettings } = useSettings();
@@ -70,6 +71,61 @@ export function SettingsPage() {
       }));
     }
   }, [settingsData]);
+
+  // ── Telegram state ──
+  const [telegramForm, setTelegramForm] = useState({
+    bot_token: '',
+    chat_id: '',
+    enabled: false,
+    trade_executed: true,
+    trade_rejected: true,
+    ta_veto: true,
+    daily_loss_limit: true,
+    position_closed: true,
+    take_profit_hit: true,
+    automation_start_stop: true,
+    agent_error: true,
+    api_error: true,
+    daily_report: true,
+    rebalance: false,
+  });
+  const [telegramLoaded, setTelegramLoaded] = useState(false);
+  const [testingTelegram, setTestingTelegram] = useState(false);
+
+  useEffect(() => {
+    if (activeTab === 'telegram' && !telegramLoaded) {
+      settingsApi.getTelegramSettings().then((data: unknown) => {
+        setTelegramForm(data as typeof telegramForm);
+        setTelegramLoaded(true);
+      }).catch(console.warn);
+    }
+  }, [activeTab, telegramLoaded]);
+
+  const handleSaveTelegram = async () => {
+    setSaving(true);
+    try {
+      await settingsApi.updateTelegramSettings(telegramForm);
+      showToast('Telegram settings saved', 'success');
+      setTelegramLoaded(false); // force reload on next visit
+    } catch {
+      showToast('Failed to save Telegram settings', 'error');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleTestTelegram = async () => {
+    setTestingTelegram(true);
+    try {
+      await settingsApi.testTelegram(telegramForm);
+      showToast('Test message sent! Check your Telegram.', 'success');
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail || 'Test failed — check token and chat ID';
+      showToast(msg, 'error');
+    } finally {
+      setTestingTelegram(false);
+    }
+  };
 
   // ── Notification Preferences state ──
   const [notifPrefs, setNotifPrefs] = useState<NotificationPreferences>(
@@ -219,6 +275,8 @@ export function SettingsPage() {
     { id: 'llm', label: 'AI / LLM', icon: <Brain size={14} /> },
     { id: 'email', label: 'Email', icon: <Mail size={14} /> },
     { id: 'notifications', label: 'Notifications', icon: <Bell size={14} /> },
+    { id: 'telegram', label: 'Telegram', icon: <MessageCircle size={14} /> },
+    { id: 'sounds', label: 'Sounds', icon: <Volume2 size={14} /> },
   ];
 
   const symbols = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT', 'ADAUSDT', 'AVAXUSDT'];
@@ -1165,6 +1223,164 @@ export function SettingsPage() {
             </button>
           )}
         </div>
+      )}
+
+      {/* ── Telegram Tab ── */}
+      {activeTab === 'telegram' && (
+        <div className="settings-panel" style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
+          <h3 className="settings-section-title"><MessageCircle size={15} /> Telegram Alerts</h3>
+
+          {/* Setup instructions */}
+          <div style={{
+            padding: '.75rem 1rem', borderRadius: 8,
+            background: 'rgba(0,149,255,.06)', border: '1px solid rgba(0,149,255,.2)',
+            fontSize: '.75rem', color: 'var(--text-secondary)', lineHeight: 1.6,
+          }}>
+            <span style={{ fontWeight: 600, color: 'var(--accent)' }}>Setup:</span>
+            {' '}1. Message <code style={{ background: 'var(--surface-2)', padding: '1px 4px', borderRadius: 3 }}>@BotFather</code> on Telegram → /newbot → copy the token.
+            {' '}2. Add the bot to a chat or channel.
+            {' '}3. Message <code style={{ background: 'var(--surface-2)', padding: '1px 4px', borderRadius: 3 }}>@userinfobot</code> to get your chat ID.
+          </div>
+
+          {/* Credentials */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '.75rem' }}>
+            <div>
+              <label className="settings-label">Bot Token</label>
+              <input
+                className="settings-input"
+                type="password"
+                placeholder="123456789:ABCdefGHI..."
+                value={telegramForm.bot_token}
+                onChange={e => setTelegramForm(f => ({ ...f, bot_token: e.target.value }))}
+              />
+            </div>
+            <div>
+              <label className="settings-label">Chat ID</label>
+              <input
+                className="settings-input"
+                type="text"
+                placeholder="-1001234567890"
+                value={telegramForm.chat_id}
+                onChange={e => setTelegramForm(f => ({ ...f, chat_id: e.target.value }))}
+              />
+              <div style={{ fontSize: '.68rem', color: 'var(--text-secondary)', marginTop: '.25rem' }}>
+                Use a negative number for groups/channels, positive for direct messages.
+              </div>
+            </div>
+          </div>
+
+          {/* Master enable toggle */}
+          <div style={{
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            padding: '.75rem 1rem', borderRadius: 8,
+            background: telegramForm.enabled ? 'rgba(0,230,118,.06)' : 'var(--surface-2, #2a2d35)',
+            border: `1px solid ${telegramForm.enabled ? 'rgba(0,230,118,.2)' : 'var(--border)'}`,
+            transition: 'all .2s',
+          }}>
+            <div>
+              <div style={{ fontWeight: 600, fontSize: '.85rem' }}>
+                {telegramForm.enabled ? '✅ Alerts Enabled' : '⏸ Alerts Disabled'}
+              </div>
+              <div style={{ fontSize: '.7rem', color: 'var(--text-secondary)', marginTop: '.15rem' }}>
+                Master switch — disables all Telegram notifications when off
+              </div>
+            </div>
+            <label style={{ position: 'relative', display: 'inline-block', width: 44, height: 24, cursor: 'pointer' }}>
+              <input type="checkbox" checked={telegramForm.enabled}
+                onChange={e => setTelegramForm(f => ({ ...f, enabled: e.target.checked }))}
+                style={{ opacity: 0, width: 0, height: 0 }} />
+              <span style={{
+                position: 'absolute', inset: 0, borderRadius: 12,
+                background: telegramForm.enabled ? 'var(--green, #00e676)' : 'var(--surface-2, #3a3d45)',
+                transition: 'background .2s',
+              }}>
+                <span style={{
+                  position: 'absolute', top: 2, left: telegramForm.enabled ? 22 : 2,
+                  width: 20, height: 20, borderRadius: '50%', background: '#fff', transition: 'left .2s',
+                }} />
+              </span>
+            </label>
+          </div>
+
+          {/* Per-event toggles */}
+          <div style={{ opacity: telegramForm.enabled ? 1 : 0.45, pointerEvents: telegramForm.enabled ? 'auto' : 'none', transition: 'opacity .2s' }}>
+            <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: '.6rem' }}>
+              Alert Types
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '.05rem' }}>
+              {([
+                { key: 'trade_executed', label: 'Trade Executed', desc: 'Position opened (paper or live)', icon: '📈' },
+                { key: 'trade_rejected', label: 'Trade Rejected', desc: 'Risk Manager blocks a trade', icon: '🚫' },
+                { key: 'ta_veto', label: 'TA Veto', desc: "Marcus's opposing signal blocks a trade", icon: '⚠️' },
+                { key: 'daily_loss_limit', label: 'Daily Loss Limit', desc: 'Daily loss cap reached — trading halted', icon: '🚨' },
+                { key: 'position_closed', label: 'Position Closed (SL)', desc: 'Stop-loss or trailing stop triggered', icon: '🔴' },
+                { key: 'take_profit_hit', label: 'Take Profit Hit', desc: 'Position closed at target price', icon: '💰' },
+                { key: 'automation_start_stop', label: 'Automation On/Off', desc: 'Trading engine started or stopped', icon: '🟢' },
+                { key: 'agent_error', label: 'Agent Errors', desc: 'Strategy crashes or encounters errors', icon: '❌' },
+                { key: 'api_error', label: 'API Errors', desc: 'Exchange connection issues', icon: '🔌' },
+                { key: 'daily_report', label: 'Daily Report', desc: 'End-of-day P&L summary', icon: '📊' },
+                { key: 'rebalance', label: 'Portfolio Rebalance', desc: "James's allocation changes (can be noisy)", icon: '⚖️' },
+              ] as { key: keyof typeof telegramForm; label: string; desc: string; icon: string }[]).map(item => (
+                <div key={item.key} style={{
+                  display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                  padding: '.55rem .25rem', borderBottom: '1px solid var(--border)',
+                }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '.6rem' }}>
+                    <span style={{ fontSize: '1rem', width: 22, textAlign: 'center' }}>{item.icon}</span>
+                    <div>
+                      <div style={{ fontWeight: 600, fontSize: '.8rem' }}>{item.label}</div>
+                      <div style={{ fontSize: '.67rem', color: 'var(--text-secondary)' }}>{item.desc}</div>
+                    </div>
+                  </div>
+                  <label style={{ position: 'relative', display: 'inline-block', width: 40, height: 22, cursor: 'pointer', flexShrink: 0 }}>
+                    <input type="checkbox"
+                      checked={telegramForm[item.key] as boolean}
+                      onChange={e => setTelegramForm(f => ({ ...f, [item.key]: e.target.checked }))}
+                      style={{ opacity: 0, width: 0, height: 0 }} />
+                    <span style={{
+                      position: 'absolute', inset: 0, borderRadius: 11,
+                      background: (telegramForm[item.key] as boolean) ? 'var(--accent)' : 'var(--surface-2, #3a3d45)',
+                      transition: 'background .2s',
+                    }}>
+                      <span style={{
+                        position: 'absolute', top: 2, left: (telegramForm[item.key] as boolean) ? 20 : 2,
+                        width: 18, height: 18, borderRadius: '50%', background: '#fff', transition: 'left .2s',
+                      }} />
+                    </span>
+                  </label>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Action buttons */}
+          <div style={{ display: 'flex', gap: '.75rem', marginTop: '.25rem' }}>
+            <button
+              type="button"
+              className="settings-btn"
+              onClick={handleTestTelegram}
+              disabled={testingTelegram || !telegramForm.chat_id}
+              style={{ display: 'flex', alignItems: 'center', gap: '.35rem' }}
+            >
+              {testingTelegram ? <RefreshCw size={13} style={{ animation: 'spin 1s linear infinite' }} /> : <Send size={13} />}
+              Send Test Message
+            </button>
+            <button
+              type="button"
+              className="settings-btn settings-btn-primary"
+              onClick={handleSaveTelegram}
+              disabled={saving}
+              style={{ display: 'flex', alignItems: 'center', gap: '.35rem' }}
+            >
+              {saving ? <RefreshCw size={13} style={{ animation: 'spin 1s linear infinite' }} /> : <Save size={13} />}
+              Save Settings
+            </button>
+          </div>
+        </div>
+      )}
+
+      {activeTab === 'sounds' && (
+        <SoundSettings />
       )}
     </div>
   );

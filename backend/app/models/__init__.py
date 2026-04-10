@@ -60,11 +60,30 @@ class TradingPair(Base):
     klines = relationship("Kline", back_populates="trading_pair", cascade="all, delete-orphan")
 
 
+class Trader(Base):
+    """A competing trader in the fund, each backed by a different LLM."""
+    __tablename__ = "traders"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    name = Column(String(100), nullable=False, unique=True)
+    llm_provider = Column(String(50), nullable=False, default="openrouter")
+    llm_model = Column(String(150), nullable=False)
+    allocation_pct = Column(Float, default=33.3)
+    is_enabled = Column(Boolean, default=True)
+    config = Column(JSON, default=dict)
+    performance_metrics = Column(JSON, default=dict)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    agents = relationship("Agent", back_populates="trader", cascade="all, delete-orphan")
+
+
 class Agent(Base):
     __tablename__ = "agents"
 
     id = Column(String(36), primary_key=True, default=generate_uuid)
     user_id = Column(String(36), ForeignKey("users.id"), nullable=False)
+    trader_id = Column(String(36), ForeignKey("traders.id", ondelete="SET NULL"), nullable=True)
     name = Column(String(100), nullable=False)
     strategy_type = Column(String(50), nullable=False)
     config = Column(JSON, default=dict)
@@ -78,6 +97,7 @@ class Agent(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     user = relationship("User", back_populates="agents")
+    trader = relationship("Trader", back_populates="agents")
     pairs = relationship("AgentPair", back_populates="agent", cascade="all, delete-orphan")
     signals = relationship("AgentSignal", back_populates="agent", cascade="all, delete-orphan")
     trades = relationship("Trade", back_populates="agent", cascade="all, delete-orphan")
@@ -135,6 +155,7 @@ class Trade(Base):
     id = Column(String(36), primary_key=True, default=generate_uuid)
     user_id = Column(String(36), ForeignKey("users.id"), nullable=False)
     agent_id = Column(String(36), ForeignKey("agents.id"), nullable=True)
+    trader_id = Column(String(36), ForeignKey("traders.id", ondelete="SET NULL"), nullable=True)
     symbol = Column(String(20), nullable=False)
     side = Column(Enum(OrderSide), nullable=False)
     quantity = Column(Float, nullable=False)
@@ -508,7 +529,7 @@ class StrategyAction(Base):
     )
 
 
-from app.models import User, ApiKey, TradingPair, Agent, AgentPair, AgentSignal, Trade, Position, Balance, Kline
+from app.models import User, ApiKey, TradingPair, Trader, Agent, AgentPair, AgentSignal, Trade, Position, Balance, Kline
 from app.models import SignalType, OrderSide, OrderStatus
 from app.models import AgentRunRecord, AgentMetricRecord
 from app.models import AnalystReport, PortfolioDecision, RiskAssessmentRecord, ExecutionPlan, CIOReport, AgentDecision

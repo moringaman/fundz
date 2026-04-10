@@ -12,12 +12,15 @@ import {
   useAutomationMetrics,
   useAutomationRuns,
   useFundTeamStatus,
+  useTraderLeaderboard,
+  useTradingPairs,
 } from '../hooks/useQueries';
 import { WsIndicator } from '../components/common/WsIndicator';
 import { MiniChart } from '../components/common/MiniChart';
+import { PerformanceCharts } from '../components/PerformanceCharts';
 import { timeAgo } from '../utils/timeAgo';
 
-const SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'ADAUSDT'];
+const FALLBACK_SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'ADAUSDT'];
 
 export function DashboardPage() {
   const navigate = useNavigate();
@@ -37,6 +40,9 @@ export function DashboardPage() {
   const { data: metricsData = [] } = useAutomationMetrics();
   const { data: runsData = [] } = useAutomationRuns(undefined, 12);
   const { data: teamStatus } = useFundTeamStatus();
+  const { data: traderLeaderboard = [] } = useTraderLeaderboard();
+  const { data: tradingPairsData = [] } = useTradingPairs();
+  const SYMBOLS = (tradingPairsData.length > 0 ? tradingPairsData : FALLBACK_SYMBOLS) as string[];
 
   const paperEnabled = paperStatus?.enabled ?? false;
   const agents: any[] = Array.isArray(agentsData) ? agentsData : [];
@@ -219,6 +225,51 @@ export function DashboardPage() {
               </div>
             </div>
           )}
+
+          {/* Trader Leaderboard */}
+          <div className="panel">
+            <div className="panel-header">
+              <div style={{ display: 'flex', alignItems: 'center', gap: '.5rem' }}>
+                <span className="panel-title">Trader Leaderboard</span>
+                <span title="Competing traders backed by different LLMs. Each manages its own agents and capital pool.">
+                  <HelpCircle size={14} style={{ color: 'var(--text-dim)', cursor: 'help' }} />
+                </span>
+              </div>
+              <button type="button" onClick={() => navigate('/agents')} style={{ fontSize: '.65rem', color: 'var(--accent)', background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'var(--mono)' }}>
+                VIEW →
+              </button>
+            </div>
+            <div className="panel-body-compact">
+              {(traderLeaderboard as any[]).length === 0 ? (
+                <p style={{ fontSize: '.75rem', color: 'var(--text-dim)', textAlign: 'center', padding: '.75rem 0' }}>No traders yet</p>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '.4rem' }}>
+                  {(traderLeaderboard as any[]).map((t: any, i: number) => (
+                    <div key={t.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '.4rem .5rem', background: 'var(--bg-elevated)', borderRadius: '6px', border: '1px solid var(--border)' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '.4rem' }}>
+                        <span style={{ fontSize: '.85rem' }}>{t.config?.avatar || ['🥇','🥈','🥉'][i] || '🏅'}</span>
+                        <div>
+                          <div style={{ fontSize: '.75rem', fontWeight: 600, color: 'var(--text-primary)' }}>{t.name}</div>
+                          <div style={{ fontSize: '.6rem', fontFamily: 'var(--mono)', color: 'var(--text-dim)' }}>
+                            {t.agent_count} agents · {t.allocation_pct?.toFixed(0)}%
+                          </div>
+                        </div>
+                      </div>
+                      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', fontFamily: 'var(--mono)', fontSize: '.72rem' }}>
+                        <span className={t.total_pnl >= 0 ? 'positive' : 'negative'}>
+                          {t.total_pnl >= 0 ? '+' : ''}${t.total_pnl?.toFixed(2)}
+                        </span>
+                        <span style={{ fontSize: '.6rem', color: 'var(--text-secondary)' }}>
+                          {(t.win_rate * 100).toFixed(0)}% win
+                        </span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+
         </div>
 
         {/* Column 2 — Agent Activity + Performance/Team */}
@@ -226,8 +277,8 @@ export function DashboardPage() {
         <div className="panel" style={{ display: 'flex', flexDirection: 'column' }}>
           <div className="panel-header">
             <div style={{ display: 'flex', alignItems: 'center', gap: '.5rem' }}>
-              <span className="panel-title">Agent Activity</span>
-              <span title="Real-time feed of AI agent signals and executions. Shows which agents are active, what signals they've generated, and whether trades were executed.">
+              <span className="panel-title">Strategy Activity</span>
+              <span title="Real-time feed of AI strategy signals and executions. Shows which strategies are active, what signals they've generated, and whether trades were executed.">
                 <HelpCircle
                   size={14}
                   style={{ color: 'var(--text-dim)', cursor: 'help' }}
@@ -242,7 +293,7 @@ export function DashboardPage() {
           {/* Agent status row */}
           <div style={{ padding: '.6rem 1.1rem', borderBottom: '1px solid var(--border)', display: 'flex', gap: '.5rem', flexWrap: 'wrap' }}>
             {agents.length === 0 ? (
-              <span style={{ fontSize: '.75rem', color: 'var(--text-dim)' }}>No agents configured</span>
+              <span style={{ fontSize: '.75rem', color: 'var(--text-dim)' }}>No strategies configured</span>
             ) : agents.map((a) => (
               <span
                 key={a.id}
@@ -265,7 +316,7 @@ export function DashboardPage() {
           <div className="activity-feed" style={{ flex: 1 }}>
             {runs.length === 0 ? (
               <div style={{ padding: '1.5rem', textAlign: 'center', color: 'var(--text-dim)', fontSize: '.78rem' }}>
-                No agent runs yet. Start the scheduler to see activity.
+                No strategy runs yet. Start the scheduler to see activity.
               </div>
             ) : runs.map((run: any, i: number) => {
               const agent = agents.find((a) => a.id === run.agent_id);
@@ -290,32 +341,24 @@ export function DashboardPage() {
 
           {/* Quick actions */}
           <div style={{ padding: '.75rem 1.1rem', borderTop: '1px solid var(--border)', display: 'flex', gap: '.5rem' }}>
-            <button type="button" className="qa-btn qa-btn-primary" onClick={() => navigate('/agents')}>Agents</button>
+            <button type="button" className="qa-btn qa-btn-primary" onClick={() => navigate('/agents')}>Strategies</button>
             <button type="button" className="qa-btn qa-btn-primary" onClick={() => navigate('/automation')}>Scheduler</button>
             <button type="button" className="qa-btn qa-btn-ghost" onClick={() => navigate('/trading')}>Trade</button>
           </div>
         </div>
 
-        {/* Agent Performance + Fund Team side by side */}
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '.75rem' }}>
+          <PerformanceCharts />
 
-          {/* Agent Performance Summary */}
+          {/* Agent Performance */}
           <div className="panel">
             <div className="panel-header">
               <div style={{ display: 'flex', alignItems: 'center', gap: '.5rem' }}>
-                <span className="panel-title">Agent Performance</span>
-                <span title="Historical P&L and win rate for each AI agent. Shows which agents are most profitable and accurate over time.">
-                  <HelpCircle
-                    size={14}
-                    style={{ color: 'var(--text-dim)', cursor: 'help' }}
-                  />
+                <span className="panel-title">Strategy Performance</span>
+                <span title="Historical P&L and win rate for each AI strategy.">
+                  <HelpCircle size={14} style={{ color: 'var(--text-dim)', cursor: 'help' }} />
                 </span>
               </div>
-              <button
-                type="button"
-                onClick={() => navigate('/automation')}
-                style={{ fontSize: '.65rem', color: 'var(--accent)', background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'var(--mono)' }}
-              >
+              <button type="button" onClick={() => navigate('/automation')} style={{ fontSize: '.65rem', color: 'var(--accent)', background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'var(--mono)' }}>
                 DETAILS →
               </button>
             </div>
@@ -353,75 +396,7 @@ export function DashboardPage() {
             </div>
           </div>
 
-          {/* Team Status Summary */}
-          <div className="panel">
-            <div className="panel-header">
-              <div style={{ display: 'flex', alignItems: 'center', gap: '.5rem' }}>
-                <Users size={14} />
-                <span className="panel-title">Fund Team</span>
-              </div>
-              <button
-                type="button"
-                onClick={() => navigate('/fundteam')}
-                style={{ fontSize: '.65rem', color: 'var(--accent)', background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'var(--mono)' }}
-              >
-                DETAILS →
-              </button>
-            </div>
-            <div className="panel-body-compact">
-              {teamStatus ? (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '.4rem' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '.35rem .5rem', background: 'var(--bg-elevated)', borderRadius: 6, border: '1px solid var(--border)' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '.4rem' }}>
-                      <Shield size={13} />
-                      <span style={{ fontSize: '.75rem', color: 'var(--text-secondary)' }}>Risk Level</span>
-                    </div>
-                    <span style={{
-                      fontSize: '.75rem',
-                      fontWeight: 700,
-                      fontFamily: 'var(--mono)',
-                      color: teamStatus.risk_level === 'danger' ? 'var(--red)' : teamStatus.risk_level === 'caution' ? 'var(--amber)' : 'var(--green)',
-                    }}>
-                      {(teamStatus.risk_level ?? 'unknown').toUpperCase()}
-                    </span>
-                  </div>
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '.35rem' }}>
-                    <div className="stat-card">
-                      <div className="stat-label">Market</div>
-                      <div className="stat-value" style={{ fontSize: '.78rem', textTransform: 'capitalize' }}>
-                        {teamStatus.market_sentiment ?? '—'}
-                      </div>
-                    </div>
-                    <div className="stat-card">
-                      <div className="stat-label">CIO View</div>
-                      <div className="stat-value" style={{ fontSize: '.78rem', textTransform: 'capitalize' }}>
-                        {teamStatus.cio_sentiment ?? '—'}
-                      </div>
-                    </div>
-                    <div className="stat-card">
-                      <div className="stat-label">Fund P&L</div>
-                      <div className={`stat-value ${(teamStatus.fund_pnl ?? 0) >= 0 ? 'positive' : 'negative'}`} style={{ fontSize: '.78rem' }}>
-                        {(teamStatus.fund_pnl ?? 0) >= 0 ? '+' : ''}${(teamStatus.fund_pnl ?? 0).toFixed(2)}
-                      </div>
-                    </div>
-                    <div className="stat-card">
-                      <div className="stat-label">Top Agent</div>
-                      <div className="stat-value" style={{ fontSize: '.72rem' }}>
-                        {teamStatus.top_agent ?? '—'}
-                      </div>
-                    </div>
-                  </div>
-                  <div style={{ fontSize: '.68rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)', textAlign: 'right' }}>
-                    {teamStatus.agents_active ?? 0} agents active
-                  </div>
-                </div>
-              ) : (
-                <p style={{ fontSize: '.75rem', color: 'var(--text-dim)', textAlign: 'center', padding: '.75rem 0' }}>Loading team status…</p>
-              )}
-            </div>
-          </div>
 
-        </div>
         </div>
 
         {/* Column 3 — Portfolio & Paper P&L */}
@@ -569,8 +544,73 @@ export function DashboardPage() {
               )}
             </div>
           </div>
+
+          {/* Fund Team */}
+          <div className="panel">
+            <div className="panel-header">
+              <div style={{ display: 'flex', alignItems: 'center', gap: '.5rem' }}>
+                <Users size={14} />
+                <span className="panel-title">Fund Team</span>
+              </div>
+              <button type="button" onClick={() => navigate('/fundteam')} style={{ fontSize: '.65rem', color: 'var(--accent)', background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'var(--mono)' }}>
+                DETAILS →
+              </button>
+            </div>
+            <div className="panel-body-compact">
+              {teamStatus ? (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '.4rem' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '.35rem .5rem', background: 'var(--bg-elevated)', borderRadius: 6, border: '1px solid var(--border)' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '.4rem' }}>
+                      <Shield size={13} />
+                      <span style={{ fontSize: '.75rem', color: 'var(--text-secondary)' }}>Risk Level</span>
+                    </div>
+                    <span style={{
+                      fontSize: '.75rem', fontWeight: 700, fontFamily: 'var(--mono)',
+                      color: teamStatus.risk_level === 'danger' ? 'var(--red)' : teamStatus.risk_level === 'caution' ? 'var(--amber)' : 'var(--green)',
+                    }}>
+                      {(teamStatus.risk_level ?? 'unknown').toUpperCase()}
+                    </span>
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '.35rem' }}>
+                    <div className="stat-card">
+                      <div className="stat-label">Market</div>
+                      <div className="stat-value" style={{ fontSize: '.78rem', textTransform: 'capitalize' }}>
+                        {teamStatus.market_sentiment ?? '—'}
+                      </div>
+                    </div>
+                    <div className="stat-card">
+                      <div className="stat-label">CIO View</div>
+                      <div className="stat-value" style={{ fontSize: '.78rem', textTransform: 'capitalize' }}>
+                        {teamStatus.cio_sentiment ?? '—'}
+                      </div>
+                    </div>
+                    <div className="stat-card">
+                      <div className="stat-label">Fund P&L</div>
+                      <div className={`stat-value ${(teamStatus.fund_pnl ?? 0) >= 0 ? 'positive' : 'negative'}`} style={{ fontSize: '.78rem' }}>
+                        {(teamStatus.fund_pnl ?? 0) >= 0 ? '+' : ''}${(teamStatus.fund_pnl ?? 0).toFixed(2)}
+                      </div>
+                    </div>
+                    <div className="stat-card">
+                      <div className="stat-label">Top Strategy</div>
+                      <div className="stat-value" style={{ fontSize: '.72rem' }}>
+                        {teamStatus.top_agent ?? '—'}
+                      </div>
+                    </div>
+                  </div>
+                  <div style={{ fontSize: '.68rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)', textAlign: 'right' }}>
+                    {teamStatus.agents_active ?? 0} strategies active
+                  </div>
+                </div>
+              ) : (
+                <p style={{ fontSize: '.75rem', color: 'var(--text-dim)', textAlign: 'center', padding: '.75rem 0' }}>Loading team status…</p>
+              )}
+            </div>
+          </div>
+
+
         </div>
-      </div>
+
+      </div>{/* end dash-grid */}
     </div>
   );
 }

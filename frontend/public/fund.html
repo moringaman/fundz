@@ -1,0 +1,963 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Nexus AI Capital — Intelligence-Driven Fund Management</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Cormorant:ital,wght@0,300;0,400;0,500;0,600;0,700;1,300;1,400&family=Syne:wght@400;500;600;700;800&family=JetBrains+Mono:wght@300;400;500&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #07080A;
+      --surface: #0D0F15;
+      --surface-2: #131620;
+      --border: rgba(200,169,110,.12);
+      --border-bright: rgba(200,169,110,.3);
+      --gold: #C8A96E;
+      --gold-bright: #E8C987;
+      --gold-dim: #8A7248;
+      --teal: #00D4FF;
+      --teal-dim: rgba(0,212,255,.12);
+      --green: #00E87A;
+      --red: #FF4B4B;
+      --blue: #3B82F6;
+      --purple: #9B59B6;
+      --text: #F0EDE8;
+      --text-secondary: #9A9390;
+      --text-dim: #5A5754;
+    }
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Syne', sans-serif;
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ── NAV ── */
+    nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      padding: 1.1rem 3rem;
+      display: flex; justify-content: space-between; align-items: center;
+      background: rgba(7,8,10,.88);
+      backdrop-filter: blur(20px);
+      border-bottom: 1px solid var(--border);
+      transition: box-shadow .3s;
+    }
+    .nav-logo {
+      font-family: 'Cormorant', serif;
+      font-size: 1.3rem; font-weight: 600; letter-spacing: .1em;
+      color: var(--gold); text-decoration: none;
+    }
+    .nav-logo span { color: var(--text); }
+    .nav-links { display: flex; gap: 2.5rem; list-style: none; }
+    .nav-links a {
+      font-size: .68rem; font-weight: 700; letter-spacing: .18em;
+      text-transform: uppercase; color: var(--text-secondary);
+      text-decoration: none; transition: color .2s;
+    }
+    .nav-links a:hover { color: var(--gold); }
+    .nav-cta {
+      font-size: .68rem; font-weight: 700; letter-spacing: .14em;
+      text-transform: uppercase; padding: .55rem 1.4rem;
+      border: 1px solid var(--gold-dim); color: var(--gold);
+      text-decoration: none; transition: all .2s;
+    }
+    .nav-cta:hover { background: var(--gold); color: var(--bg); }
+
+    /* ── HERO ── */
+    .hero {
+      position: relative; min-height: 100vh;
+      display: flex; align-items: center; justify-content: center;
+      padding: 9rem 3rem 6rem; overflow: hidden;
+    }
+    .hero-bg {
+      position: absolute; inset: 0;
+      background:
+        radial-gradient(ellipse 80% 65% at 15% 25%, rgba(200,169,110,.09) 0%, transparent 60%),
+        radial-gradient(ellipse 55% 50% at 85% 75%, rgba(0,212,255,.06) 0%, transparent 60%),
+        radial-gradient(ellipse 40% 35% at 50% 50%, rgba(200,169,110,.04) 0%, transparent 70%);
+      animation: bgDrift 14s ease-in-out infinite alternate;
+    }
+    @keyframes bgDrift { to { transform: scale(1.04) rotate(.8deg); } }
+    .hero-grid {
+      position: absolute; inset: 0;
+      background-image:
+        linear-gradient(rgba(200,169,110,.025) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(200,169,110,.025) 1px, transparent 1px);
+      background-size: 72px 72px;
+      mask-image: radial-gradient(ellipse 85% 85% at 50% 50%, black 30%, transparent 100%);
+    }
+    .hero-content { position: relative; z-index: 2; max-width: 1100px; width: 100%; text-align: center; }
+    .hero-badge {
+      display: inline-flex; align-items: center; gap: .5rem;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: .62rem; letter-spacing: .22em; text-transform: uppercase;
+      color: var(--teal); border: 1px solid rgba(0,212,255,.2);
+      padding: .38rem 1rem; margin-bottom: 2.5rem;
+      animation: fadeUp .8s ease both;
+    }
+    .hero-badge::before {
+      content: ''; width: 5px; height: 5px; background: var(--teal);
+      border-radius: 50%; animation: blink 2s ease-in-out infinite;
+    }
+    @keyframes blink { 0%,100% { opacity:1; } 50% { opacity:.3; } }
+    .hero-headline {
+      font-family: 'Cormorant', serif;
+      font-size: clamp(3.8rem, 8.5vw, 8rem);
+      font-weight: 300; line-height: .93; letter-spacing: -.02em;
+      margin-bottom: .85rem;
+      animation: fadeUp .8s ease .1s both;
+    }
+    .hero-headline em { font-style: italic; color: var(--gold); }
+    .hero-subhead {
+      font-family: 'Cormorant', serif;
+      font-size: clamp(1.3rem, 2.8vw, 2rem);
+      font-weight: 300; color: var(--text-secondary);
+      letter-spacing: .03em; margin-bottom: 3.5rem;
+      animation: fadeUp .8s ease .2s both;
+    }
+    .hero-stats {
+      display: flex; justify-content: center; gap: 0;
+      margin-bottom: 3.5rem; border: 1px solid var(--border);
+      animation: fadeUp .8s ease .3s both;
+    }
+    .hero-stat {
+      flex: 1; text-align: center; padding: 1.5rem 2rem;
+      border-right: 1px solid var(--border);
+    }
+    .hero-stat:last-child { border-right: none; }
+    .hero-stat-value {
+      display: block; font-family: 'JetBrains Mono', monospace;
+      font-size: 2rem; color: var(--gold); line-height: 1;
+      margin-bottom: .4rem;
+    }
+    .hero-stat-label {
+      font-size: .6rem; font-weight: 700; letter-spacing: .18em;
+      text-transform: uppercase; color: var(--text-dim);
+    }
+    .hero-actions {
+      display: flex; justify-content: center; gap: 1rem;
+      animation: fadeUp .8s ease .4s both;
+    }
+    .btn-gold {
+      padding: .9rem 2.4rem; background: var(--gold); color: var(--bg);
+      font-family: 'Syne', sans-serif; font-size: .72rem;
+      font-weight: 700; letter-spacing: .14em; text-transform: uppercase;
+      text-decoration: none; transition: all .2s;
+    }
+    .btn-gold:hover { background: var(--gold-bright); transform: translateY(-1px); }
+    .btn-outline {
+      padding: .9rem 2.4rem; background: transparent; color: var(--text);
+      font-family: 'Syne', sans-serif; font-size: .72rem;
+      font-weight: 700; letter-spacing: .14em; text-transform: uppercase;
+      text-decoration: none; border: 1px solid rgba(240,237,232,.18);
+      transition: all .2s;
+    }
+    .btn-outline:hover { border-color: var(--gold-dim); color: var(--gold); }
+    .scroll-hint {
+      position: absolute; bottom: 2.5rem; left: 50%; transform: translateX(-50%);
+      display: flex; flex-direction: column; align-items: center; gap: .5rem;
+      color: var(--text-dim); font-size: .58rem; letter-spacing: .2em;
+      text-transform: uppercase; animation: fadeUp 1s ease .8s both;
+    }
+    .scroll-line {
+      width: 1px; height: 38px;
+      background: linear-gradient(to bottom, var(--gold-dim), transparent);
+      animation: linePulse 2s ease-in-out infinite;
+    }
+    @keyframes linePulse { 0%,100% { opacity:.3; } 50% { opacity:1; } }
+    @keyframes fadeUp { from { opacity:0; transform:translateY(22px); } to { opacity:1; transform:none; } }
+
+    /* ── TICKER ── */
+    .ticker {
+      background: var(--surface-2);
+      border-top: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+      padding: 0; overflow: hidden;
+    }
+    .ticker-inner {
+      display: flex; align-items: stretch;
+      max-width: none;
+    }
+    .ticker-item {
+      flex: 1; display: flex; align-items: center; gap: 1rem;
+      padding: 1.4rem 2.5rem;
+      border-right: 1px solid var(--border);
+    }
+    .ticker-item:last-child { border-right: none; }
+    .ticker-value {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 1.5rem; color: var(--gold); flex-shrink: 0;
+    }
+    .ticker-meta { display: flex; flex-direction: column; }
+    .ticker-label {
+      font-size: .58rem; font-weight: 700; letter-spacing: .18em;
+      text-transform: uppercase; color: var(--text-dim); margin-bottom: .2rem;
+    }
+    .ticker-sub {
+      font-family: 'JetBrains Mono', monospace; font-size: .62rem; color: var(--green);
+    }
+
+    /* ── SECTION SHARED ── */
+    .rule { border: none; border-top: 1px solid var(--border); }
+    .section-label {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: .6rem; letter-spacing: .3em; text-transform: uppercase;
+      color: var(--gold-dim); margin-bottom: .85rem;
+    }
+    .section-title {
+      font-family: 'Cormorant', serif;
+      font-size: clamp(2.4rem, 4vw, 3.8rem);
+      font-weight: 400; line-height: 1.1; margin-bottom: 1.25rem;
+    }
+    .section-title em { font-style: italic; color: var(--gold); }
+    .section-body {
+      font-size: 1rem; line-height: 1.8; color: var(--text-secondary);
+    }
+
+    /* ── PHILOSOPHY ── */
+    .philosophy {
+      display: grid; grid-template-columns: 1fr 1fr;
+      gap: 6rem; align-items: center;
+      padding: 7rem 3rem; max-width: 1300px; margin: 0 auto;
+    }
+    .phil-card {
+      background: var(--surface); border: 1px solid var(--border);
+      position: relative; overflow: hidden;
+    }
+    .phil-card::before {
+      content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px;
+      background: linear-gradient(90deg, transparent, var(--gold), transparent);
+    }
+    .phil-row {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: .9rem 1.5rem; border-bottom: 1px solid var(--border);
+    }
+    .phil-row:last-child { border-bottom: none; }
+    .phil-key {
+      font-size: .68rem; font-weight: 700; letter-spacing: .1em;
+      text-transform: uppercase; color: var(--text-dim);
+    }
+    .phil-val {
+      display: flex; align-items: center; gap: .75rem;
+    }
+    .phil-bar {
+      width: 72px; height: 3px; background: var(--surface-2);
+      border-radius: 2px; overflow: hidden;
+    }
+    .phil-fill {
+      height: 100%; width: 0;
+      background: linear-gradient(90deg, var(--gold-dim), var(--gold));
+      transition: width 1.4s cubic-bezier(.4,0,.2,1);
+    }
+    .phil-num {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: .82rem; color: var(--gold); min-width: 6rem; text-align: right;
+    }
+
+    /* ── ORG CHART ── */
+    .orgchart-section {
+      padding: 7rem 3rem; max-width: 1300px; margin: 0 auto; text-align: center;
+    }
+    .orgchart-intro {
+      font-size: .95rem; color: var(--text-secondary);
+      max-width: 560px; margin: 0 auto 4rem; line-height: 1.75;
+    }
+    .org-wrap { overflow-x: auto; padding-bottom: 1rem; }
+    .org-tree {
+      display: flex; flex-direction: column; align-items: center;
+      min-width: 920px; padding: 1rem 0;
+    }
+    .org-row {
+      display: flex; justify-content: center;
+      gap: 1.5rem; position: relative; width: 100%;
+    }
+    /* connector lines */
+    .org-line-v {
+      width: 1px; height: 44px;
+      background: var(--gold-dim); opacity: .45; margin: 0 auto;
+    }
+    .org-line-h-wrap {
+      position: relative; height: 44px; width: 100%;
+      display: flex; flex-direction: column; align-items: center;
+    }
+    .org-line-h-wrap .top { width: 1px; height: 22px; background: var(--gold-dim); opacity: .45; }
+    .org-line-h-wrap .hbar {
+      position: absolute; top: 22px; height: 1px;
+      background: var(--gold-dim); opacity: .45;
+    }
+    .org-line-h-wrap .vbottom {
+      position: absolute; bottom: 0; width: 1px; height: 22px;
+      background: var(--gold-dim); opacity: .45;
+    }
+    /* node */
+    .org-node {
+      background: var(--surface); border: 1px solid var(--border);
+      padding: 1.2rem 1.4rem; min-width: 168px; max-width: 210px;
+      text-align: left; position: relative;
+      opacity: 0; transform: translateY(14px);
+      transition: opacity .5s, transform .5s, border-color .25s, box-shadow .25s;
+    }
+    .org-node.on { opacity: 1; transform: none; }
+    .org-node:hover { border-color: var(--gold-dim); box-shadow: 0 10px 36px rgba(200,169,110,.1); }
+    .org-node-accent {
+      position: absolute; top: 0; left: 0; right: 0; height: 2px;
+    }
+    .org-avatar {
+      width: 36px; height: 36px; border-radius: 50%;
+      background: var(--surface-2); border: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 1.1rem; margin-bottom: .7rem;
+    }
+    .org-name {
+      font-family: 'Cormorant', serif; font-size: 1rem;
+      font-weight: 600; margin-bottom: .15rem;
+    }
+    .org-role {
+      font-size: .56rem; font-weight: 700; letter-spacing: .15em;
+      text-transform: uppercase; color: var(--text-dim); margin-bottom: .55rem;
+    }
+    .org-model {
+      font-family: 'JetBrains Mono', monospace; font-size: .58rem;
+      color: var(--teal); background: var(--teal-dim);
+      padding: .18rem .45rem; border-radius: 2px; display: inline-block;
+    }
+    .org-desc {
+      font-size: .65rem; color: var(--text-dim); line-height: 1.55; margin-top: .5rem;
+    }
+    /* strategy tags */
+    .strat-row {
+      display: flex; flex-wrap: wrap; justify-content: center;
+      gap: .5rem; margin-top: .5rem;
+    }
+    .strat-tag {
+      font-family: 'JetBrains Mono', monospace; font-size: .58rem;
+      letter-spacing: .08em; color: var(--text-dim);
+      background: var(--surface-2); border: 1px solid var(--border);
+      padding: .28rem .65rem; transition: all .2s;
+    }
+    .strat-tag:hover { border-color: var(--gold-dim); color: var(--gold); }
+
+    /* ── SERVICES ── */
+    .services-section {
+      background: var(--surface);
+      border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
+      padding: 7rem 3rem;
+    }
+    .services-inner { max-width: 1300px; margin: 0 auto; }
+    .services-head {
+      display: flex; justify-content: space-between; align-items: flex-end;
+      margin-bottom: 3.5rem; gap: 2rem;
+    }
+    .services-head-right {
+      font-size: .8rem; color: var(--text-secondary); max-width: 300px;
+      text-align: right; line-height: 1.7;
+    }
+    .services-grid {
+      display: grid; grid-template-columns: repeat(3, 1fr);
+      gap: 1px; background: var(--border);
+      border: 1px solid var(--border);
+    }
+    .svc-card {
+      background: var(--surface); padding: 2.4rem 2rem;
+      position: relative; overflow: hidden; transition: background .3s;
+    }
+    .svc-card::after {
+      content: ''; position: absolute; inset: 0;
+      background: radial-gradient(ellipse 80% 80% at 50% 0%, rgba(200,169,110,.07), transparent 70%);
+      opacity: 0; transition: opacity .3s;
+    }
+    .svc-card:hover { background: var(--surface-2); }
+    .svc-card:hover::after { opacity: 1; }
+    .svc-num {
+      font-family: 'Cormorant', serif; font-size: 3.2rem; font-weight: 300;
+      color: var(--border); line-height: 1; margin-bottom: 1.25rem;
+      transition: color .3s;
+    }
+    .svc-card:hover .svc-num { color: rgba(200,169,110,.18); }
+    .svc-icon { font-size: 1.4rem; margin-bottom: .85rem; }
+    .svc-title {
+      font-size: .95rem; font-weight: 700; letter-spacing: .02em;
+      margin-bottom: .65rem;
+    }
+    .svc-desc { font-size: .8rem; line-height: 1.72; color: var(--text-secondary); }
+    .svc-tag {
+      display: inline-block; margin-top: 1.2rem;
+      font-family: 'JetBrains Mono', monospace; font-size: .56rem;
+      letter-spacing: .15em; text-transform: uppercase;
+      color: var(--gold-dim); border: 1px solid var(--border);
+      padding: .22rem .55rem;
+    }
+
+    /* ── FLOW ── */
+    .flow-section { padding: 7rem 3rem; max-width: 1300px; margin: 0 auto; }
+    .flow-steps {
+      display: flex; gap: 0; margin-top: 3.5rem; overflow-x: auto;
+    }
+    .flow-step {
+      flex: 1; min-width: 148px; padding: 1.6rem 1.2rem;
+      background: var(--surface); border: 1px solid var(--border); border-right: none;
+      position: relative; transition: border-color .2s;
+    }
+    .flow-step:last-child { border-right: 1px solid var(--border); }
+    .flow-step::after {
+      content: '→'; position: absolute; right: -13px; top: 50%;
+      transform: translateY(-50%); font-size: .9rem; color: var(--gold-dim);
+      z-index: 2; background: var(--bg); padding: 0 2px; line-height: 1;
+    }
+    .flow-step:last-child::after { display: none; }
+    .flow-step:hover { border-color: var(--gold-dim); }
+    .flow-num {
+      font-family: 'JetBrains Mono', monospace; font-size: .52rem;
+      color: var(--gold-dim); letter-spacing: .2em; margin-bottom: .6rem;
+    }
+    .flow-title { font-size: .8rem; font-weight: 700; margin-bottom: .45rem; }
+    .flow-desc { font-size: .67rem; color: var(--text-dim); line-height: 1.6; }
+
+    /* ── CTA ── */
+    .cta-section {
+      padding: 8rem 3rem; text-align: center; position: relative; overflow: hidden;
+    }
+    .cta-section::before {
+      content: ''; position: absolute; inset: 0;
+      background: radial-gradient(ellipse 65% 55% at 50% 50%, rgba(200,169,110,.07), transparent 70%);
+    }
+    .cta-section .section-title {
+      text-align: center;
+      font-size: clamp(2.5rem, 5vw, 4.5rem); margin-bottom: 1.4rem;
+    }
+    .cta-body {
+      font-size: 1rem; line-height: 1.8; color: var(--text-secondary);
+      max-width: 520px; margin: 0 auto 3rem;
+    }
+    .cta-btns { display: flex; justify-content: center; gap: 1rem; }
+
+    /* ── FOOTER ── */
+    footer {
+      background: var(--surface); border-top: 1px solid var(--border);
+      padding: 2.5rem 3rem;
+    }
+    .footer-inner {
+      max-width: 1300px; margin: 0 auto;
+      display: flex; justify-content: space-between; align-items: center; gap: 2rem;
+    }
+    .footer-logo {
+      font-family: 'Cormorant', serif; font-size: 1.1rem;
+      font-weight: 600; color: var(--gold); white-space: nowrap;
+    }
+    .footer-disc {
+      font-size: .6rem; color: var(--text-dim); max-width: 440px;
+      text-align: center; line-height: 1.7;
+    }
+    .footer-links { display: flex; gap: 1.5rem; }
+    .footer-links a {
+      font-size: .62rem; letter-spacing: .12em; text-transform: uppercase;
+      color: var(--text-dim); text-decoration: none; transition: color .2s;
+    }
+    .footer-links a:hover { color: var(--gold); }
+
+    /* ── REVEAL ── */
+    .reveal { opacity: 0; transform: translateY(28px); transition: opacity .7s ease, transform .7s ease; }
+    .reveal.v { opacity: 1; transform: none; }
+    .d1 { transition-delay: .1s; }
+    .d2 { transition-delay: .2s; }
+    .d3 { transition-delay: .3s; }
+    .d4 { transition-delay: .4s; }
+  </style>
+</head>
+<body>
+
+<!-- NAV -->
+<nav id="nav">
+  <a href="#" class="nav-logo">NEXUS <span>AI CAPITAL</span></a>
+  <ul class="nav-links">
+    <li><a href="#philosophy">Philosophy</a></li>
+    <li><a href="#team">The Team</a></li>
+    <li><a href="#services">Services</a></li>
+    <li><a href="#technology">Technology</a></li>
+  </ul>
+  <a href="http://localhost:3000" class="nav-cta">Open Dashboard</a>
+</nav>
+
+<!-- HERO -->
+<section class="hero">
+  <div class="hero-bg"></div>
+  <div class="hero-grid"></div>
+  <div class="hero-content">
+    <div class="hero-badge">Live System · AI-Powered · 24/7 Active</div>
+    <h1 class="hero-headline">
+      Intelligence-<em>Driven</em><br>Alpha Generation
+    </h1>
+    <p class="hero-subhead">Where competing artificial minds collaborate to outperform the market</p>
+
+    <div class="hero-stats">
+      <div class="hero-stat">
+        <span class="hero-stat-value" data-count="11">0</span>
+        <span class="hero-stat-label">AI Team Members</span>
+      </div>
+      <div class="hero-stat">
+        <span class="hero-stat-value" data-count="3">0</span>
+        <span class="hero-stat-label">Competing LLM Traders</span>
+      </div>
+      <div class="hero-stat">
+        <span class="hero-stat-value" data-count="5">0</span>
+        <span class="hero-stat-label">Min Decision Cycles</span>
+      </div>
+      <div class="hero-stat">
+        <span class="hero-stat-value" data-count="24">0</span>
+        <span class="hero-stat-label">Hours Active Daily</span>
+      </div>
+    </div>
+
+    <div class="hero-actions">
+      <a href="#services" class="btn-gold">Explore Services</a>
+      <a href="#team" class="btn-outline">Meet the Team</a>
+    </div>
+  </div>
+  <div class="scroll-hint">
+    <span>Scroll</span>
+    <div class="scroll-line"></div>
+  </div>
+</section>
+
+<!-- TICKER -->
+<div class="ticker">
+  <div class="ticker-inner">
+    <div class="ticker-item">
+      <span class="ticker-value">5</span>
+      <div class="ticker-meta">
+        <span class="ticker-label">Trading Pairs</span>
+        <span class="ticker-sub">BTC · ETH · SOL · XRP · ADA</span>
+      </div>
+    </div>
+    <div class="ticker-item">
+      <span class="ticker-value">3</span>
+      <div class="ticker-meta">
+        <span class="ticker-label">LLM Providers</span>
+        <span class="ticker-sub">Claude · GPT-4o · Gemini</span>
+      </div>
+    </div>
+    <div class="ticker-item">
+      <span class="ticker-value">5</span>
+      <div class="ticker-meta">
+        <span class="ticker-label">Strategy Types</span>
+        <span class="ticker-sub">Momentum · Grid · Breakout · Mean Rev · AI</span>
+      </div>
+    </div>
+    <div class="ticker-item">
+      <span class="ticker-value">100%</span>
+      <div class="ticker-meta">
+        <span class="ticker-label">Automated</span>
+        <span class="ticker-sub">Zero manual intervention required</span>
+      </div>
+    </div>
+    <div class="ticker-item">
+      <span class="ticker-value">15–50%</span>
+      <div class="ticker-meta">
+        <span class="ticker-label">Per Trader Bounds</span>
+        <span class="ticker-sub">Enforced by Portfolio Manager</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- PHILOSOPHY -->
+<div class="philosophy" id="philosophy">
+  <div>
+    <p class="section-label reveal">Our Approach</p>
+    <h2 class="section-title reveal">Markets are <em>complex</em>.<br>So is our team.</h2>
+    <p class="section-body reveal" style="margin-bottom:1.25rem;">
+      Traditional algorithmic trading relies on a single model, a single strategy, a single point of failure. We built something fundamentally different: a hierarchy of specialised AI minds that compete, collaborate, and check each other — exactly as a world-class fund management team would.
+    </p>
+    <p class="section-body reveal d1">
+      Capital flows from our Portfolio Manager to competing Trader AIs, each backed by a different frontier language model. Traders that perform earn more capital. Traders that underperform are reallocated. The fund evolves — continuously.
+    </p>
+  </div>
+  <div class="reveal d2">
+    <div class="phil-card">
+      <div class="phil-row">
+        <span class="phil-key">Allocation Method</span>
+        <div class="phil-val">
+          <div class="phil-bar"><div class="phil-fill" data-w="85"></div></div>
+          <span class="phil-num">LLM-Driven</span>
+        </div>
+      </div>
+      <div class="phil-row">
+        <span class="phil-key">Risk Management</span>
+        <div class="phil-val">
+          <div class="phil-bar"><div class="phil-fill" data-w="100"></div></div>
+          <span class="phil-num">Portfolio-Level</span>
+        </div>
+      </div>
+      <div class="phil-row">
+        <span class="phil-key">Decision Frequency</span>
+        <div class="phil-val">
+          <div class="phil-bar"><div class="phil-fill" data-w="70"></div></div>
+          <span class="phil-num">Every 5 min</span>
+        </div>
+      </div>
+      <div class="phil-row">
+        <span class="phil-key">Strategy Diversity</span>
+        <div class="phil-val">
+          <div class="phil-bar"><div class="phil-fill" data-w="90"></div></div>
+          <span class="phil-num">5 Types</span>
+        </div>
+      </div>
+      <div class="phil-row">
+        <span class="phil-key">Market Adaptation</span>
+        <div class="phil-val">
+          <div class="phil-bar"><div class="phil-fill" data-w="95"></div></div>
+          <span class="phil-num">Continuous</span>
+        </div>
+      </div>
+      <div class="phil-row">
+        <span class="phil-key">Human Intervention</span>
+        <div class="phil-val">
+          <div class="phil-bar"><div class="phil-fill" data-w="2"></div></div>
+          <span class="phil-num">Near Zero</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<hr class="rule">
+
+<!-- ORG CHART -->
+<div class="orgchart-section" id="team">
+  <p class="section-label">Fund Structure</p>
+  <h2 class="section-title">Meet <em>The Team</em></h2>
+  <p class="orgchart-intro">
+    A purpose-built hierarchy of AI specialists. Each layer has a defined mandate. Capital and intelligence flow down. Performance data flows up. No single model rules — they compete for your capital.
+  </p>
+
+  <div class="org-wrap">
+    <div class="org-tree">
+
+      <!-- CIO -->
+      <div class="org-row">
+        <div class="org-node" id="n-cio" style="min-width:240px;max-width:270px;">
+          <div class="org-node-accent" style="background:var(--gold);"></div>
+          <div class="org-avatar">🎯</div>
+          <div class="org-name">Chief Investment Officer</div>
+          <div class="org-role">Strategic Oversight</div>
+          <span class="org-model">claude-3-opus</span>
+          <p class="org-desc">Publishes fund health reports every 20 min. Ranks trader and strategy performance. Issues high-conviction strategic directives executed across the fund.</p>
+        </div>
+      </div>
+
+      <div class="org-line-v"></div>
+
+      <!-- Portfolio Manager -->
+      <div class="org-row">
+        <div class="org-node" id="n-pm" style="min-width:240px;max-width:270px;">
+          <div class="org-node-accent" style="background:var(--gold);"></div>
+          <div class="org-avatar">💼</div>
+          <div class="org-name">James</div>
+          <div class="org-role">Portfolio Manager</div>
+          <span class="org-model">claude-3-sonnet</span>
+          <p class="org-desc">Allocates fund capital to competing traders every 5 minutes. Min 15% / max 50% per trader. Decisions informed by TA confluence, market regime, and trader P&L history.</p>
+        </div>
+      </div>
+
+      <!-- Branch to 3 traders -->
+      <div class="org-line-h-wrap" style="position:relative;">
+        <div class="top"></div>
+        <div class="hbar" id="hbar-traders"></div>
+        <!-- three drop lines rendered by JS -->
+      </div>
+
+      <!-- 3 Traders -->
+      <div class="org-row" style="gap:3.5rem;" id="traders-row">
+        <div class="org-node" id="n-alpha">
+          <div class="org-node-accent" style="background:var(--teal);"></div>
+          <div class="org-avatar">🐺</div>
+          <div class="org-name">Trader Alpha</div>
+          <div class="org-role">AI Trader</div>
+          <span class="org-model">claude-3-sonnet</span>
+          <p class="org-desc">Manages up to 4 strategies. Sub-allocates capital using performance-weighted scoring. Conducts own strategy review every 20 min.</p>
+        </div>
+        <div class="org-node" id="n-beta">
+          <div class="org-node-accent" style="background:var(--blue);"></div>
+          <div class="org-avatar">🦅</div>
+          <div class="org-name">Trader Beta</div>
+          <div class="org-role">AI Trader</div>
+          <span class="org-model">gpt-4o</span>
+          <p class="org-desc">Independent strategy pool. Competes with Alpha and Gamma for fund allocation based on risk-adjusted returns and win rate.</p>
+        </div>
+        <div class="org-node" id="n-gamma">
+          <div class="org-node-accent" style="background:var(--purple);"></div>
+          <div class="org-avatar">🦉</div>
+          <div class="org-name">Trader Gamma</div>
+          <div class="org-role">AI Trader</div>
+          <span class="org-model">gemini-flash</span>
+          <p class="org-desc">Fast, data-driven decision-making. Specialises in volatility analysis and cross-pair correlation to find edges in ranging markets.</p>
+        </div>
+      </div>
+
+      <div class="org-line-h-wrap" style="position:relative;">
+        <div class="top"></div>
+        <div class="hbar" id="hbar-support"></div>
+      </div>
+
+      <!-- Support roles -->
+      <div class="org-row" style="gap:1rem;flex-wrap:wrap;" id="support-row">
+        <div class="org-node" id="n-ra" style="min-width:148px;max-width:168px;">
+          <div class="org-node-accent" style="background:var(--green);"></div>
+          <div class="org-avatar" style="font-size:.95rem;width:30px;height:30px;">📊</div>
+          <div class="org-name" style="font-size:.88rem;">Research Analyst</div>
+          <div class="org-role">Market Intelligence</div>
+          <p class="org-desc" style="font-size:.6rem;">Regime, trend, sentiment analysis every 5 min</p>
+        </div>
+        <div class="org-node" id="n-ta" style="min-width:148px;max-width:168px;">
+          <div class="org-node-accent" style="background:var(--gold);"></div>
+          <div class="org-avatar" style="font-size:.95rem;width:30px;height:30px;">📐</div>
+          <div class="org-name" style="font-size:.88rem;">Technical Analyst</div>
+          <div class="org-role">Confluence Scoring</div>
+          <p class="org-desc" style="font-size:.6rem;">RSI · MACD · BB · ATR per symbol per cycle</p>
+        </div>
+        <div class="org-node" id="n-rm" style="min-width:148px;max-width:168px;">
+          <div class="org-node-accent" style="background:var(--red);"></div>
+          <div class="org-avatar" style="font-size:.95rem;width:30px;height:30px;">🛡️</div>
+          <div class="org-name" style="font-size:.88rem;">Risk Manager</div>
+          <div class="org-role">Portfolio Gate</div>
+          <p class="org-desc" style="font-size:.6rem;">Daily loss limit · concentration · circuit breaker</p>
+        </div>
+        <div class="org-node" id="n-ec" style="min-width:148px;max-width:168px;">
+          <div class="org-node-accent" style="background:var(--blue);"></div>
+          <div class="org-avatar" style="font-size:.95rem;width:30px;height:30px;">⚡</div>
+          <div class="org-name" style="font-size:.88rem;">Exec Co-ordinator</div>
+          <div class="org-role">Order Management</div>
+          <p class="org-desc" style="font-size:.6rem;">Slippage estimation · order timing · batching</p>
+        </div>
+        <div class="org-node" id="n-tr" style="min-width:148px;max-width:168px;">
+          <div class="org-node-accent" style="background:var(--purple);"></div>
+          <div class="org-avatar" style="font-size:.95rem;width:30px;height:30px;">🔍</div>
+          <div class="org-name" style="font-size:.88rem;">Trade Retro</div>
+          <div class="org-role">Learning Engine</div>
+          <p class="org-desc" style="font-size:.6rem;">Tunes SL/TP params from every closed trade</p>
+        </div>
+      </div>
+
+      <div class="org-line-v" style="height:32px;"></div>
+
+      <!-- Strategy tags -->
+      <div class="strat-row">
+        <div class="strat-tag">momentum</div>
+        <div class="strat-tag">mean_reversion</div>
+        <div class="strat-tag">breakout</div>
+        <div class="strat-tag">grid</div>
+        <div class="strat-tag">ai_signal</div>
+        <div class="strat-tag">trend_following</div>
+        <div class="strat-tag">scalping</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<hr class="rule">
+
+<!-- SERVICES -->
+<div class="services-section" id="services">
+  <div class="services-inner">
+    <div class="services-head">
+      <div>
+        <p class="section-label reveal">What We Offer</p>
+        <h2 class="section-title reveal">Fund Management <em>Services</em></h2>
+      </div>
+      <p class="services-head-right reveal">
+        Built on institutional-grade infrastructure. Powered by frontier AI. Available 24/7 across all market conditions.
+      </p>
+    </div>
+    <div class="services-grid">
+      <div class="svc-card reveal">
+        <div class="svc-num">01</div>
+        <div class="svc-icon">🧠</div>
+        <div class="svc-title">AI-Driven Capital Allocation</div>
+        <p class="svc-desc">James, our Portfolio Manager, uses large language model reasoning to allocate capital across competing trader pools every 5 minutes. Decisions factor in market regime, technical confluence, and historical trader performance. Min 15%, max 50% per trader.</p>
+        <span class="svc-tag">Portfolio Management</span>
+      </div>
+      <div class="svc-card reveal d1">
+        <div class="svc-num">02</div>
+        <div class="svc-icon">⚔️</div>
+        <div class="svc-title">Competing Trader Architecture</div>
+        <p class="svc-desc">Three independent trader AIs — each backed by a different frontier LLM (Claude, GPT-4o, Gemini) — compete for capital allocation. Poor performers are reduced. Strong performers are rewarded. Darwinian selection in the market.</p>
+        <span class="svc-tag">Multi-Model Trading</span>
+      </div>
+      <div class="svc-card reveal d2">
+        <div class="svc-num">03</div>
+        <div class="svc-icon">🛡️</div>
+        <div class="svc-title">Intelligent Risk Management</div>
+        <p class="svc-desc">A dedicated Risk Manager AI enforces portfolio-level circuit breakers. If daily losses exceed configured limits or concentration risk spikes, all execution is paused automatically. No emotion, no hesitation, no exceptions.</p>
+        <span class="svc-tag">Risk Control</span>
+      </div>
+      <div class="svc-card reveal">
+        <div class="svc-num">04</div>
+        <div class="svc-icon">📡</div>
+        <div class="svc-title">Multi-Strategy Signal Generation</div>
+        <p class="svc-desc">Strategies run independently across five types: momentum for trending markets, mean reversion at price extremes, breakout on volatility events, grid trading in ranging conditions, and pure AI signal generation using LLM-driven market analysis.</p>
+        <span class="svc-tag">Signal Intelligence</span>
+      </div>
+      <div class="svc-card reveal d1">
+        <div class="svc-num">05</div>
+        <div class="svc-icon">📈</div>
+        <div class="svc-title">Performance Attribution & Analytics</div>
+        <p class="svc-desc">Full P&L tracking per strategy, per trader, per trade. Win rate, drawdown, and fee impact tracked in real-time. The CIO publishes fund health reports every 20 minutes with a ranked leaderboard and strategic directives.</p>
+        <span class="svc-tag">Analytics</span>
+      </div>
+      <div class="svc-card reveal d2">
+        <div class="svc-num">06</div>
+        <div class="svc-icon">🔁</div>
+        <div class="svc-title">Continuous Learning Engine</div>
+        <p class="svc-desc">A Trade Retrospective AI analyses every closed position, adjusting stop-loss and take-profit parameters for each strategy based on what has actually worked. Agent performance metrics persist across restarts. The fund learns continuously.</p>
+        <span class="svc-tag">Adaptive Learning</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- FLOW / TECHNOLOGY -->
+<div class="flow-section" id="technology">
+  <p class="section-label reveal">How It Works</p>
+  <h2 class="section-title reveal">Every 5 minutes. <em>Relentlessly.</em></h2>
+  <p class="section-body reveal">The fund's decision engine runs a complete analysis and reallocation cycle every 5 minutes, with deeper strategic reviews every 20 minutes.</p>
+  <div class="flow-steps">
+    <div class="flow-step reveal">
+      <div class="flow-num">STEP 01</div>
+      <div class="flow-title">Market Analysis</div>
+      <p class="flow-desc">Research Analyst determines market regime: trending, ranging, or volatile across all active pairs</p>
+    </div>
+    <div class="flow-step reveal d1">
+      <div class="flow-num">STEP 02</div>
+      <div class="flow-title">TA Confluence</div>
+      <p class="flow-desc">Technical Analyst scores each symbol: RSI, MACD, Bollinger Bands, ATR, pattern count</p>
+    </div>
+    <div class="flow-step reveal d2">
+      <div class="flow-num">STEP 03</div>
+      <div class="flow-title">PM Allocates to Traders</div>
+      <p class="flow-desc">James allocates 15–50% to each trader based on performance, market fit, and strategy type</p>
+    </div>
+    <div class="flow-step reveal d3">
+      <div class="flow-num">STEP 04</div>
+      <div class="flow-title">Trader Sub-Allocation</div>
+      <p class="flow-desc">Each trader distributes its budget across its own strategies using win-rate weighting</p>
+    </div>
+    <div class="flow-step reveal d4">
+      <div class="flow-num">STEP 05</div>
+      <div class="flow-title">Risk Gate</div>
+      <p class="flow-desc">Risk Manager checks daily P&L, exposure, and concentration. Blocks all execution if danger level</p>
+    </div>
+    <div class="flow-step reveal">
+      <div class="flow-num">STEP 06</div>
+      <div class="flow-title">Signal + Execute</div>
+      <p class="flow-desc">Strategies generate buy/sell signals. Trade gates verify TP covers fees + 0.5% minimum net profit</p>
+    </div>
+    <div class="flow-step reveal d1">
+      <div class="flow-num">STEP 07</div>
+      <div class="flow-title">Learn & Adapt</div>
+      <p class="flow-desc">Closed trades feed the Retrospective AI. SL/TP parameters updated per strategy. Metrics persisted to DB</p>
+    </div>
+  </div>
+</div>
+
+<!-- CTA -->
+<div class="cta-section" id="contact">
+  <p class="section-label">Get Started</p>
+  <h2 class="section-title reveal">Ready to let <em>intelligence</em><br>trade for you?</h2>
+  <p class="cta-body reveal">
+    Nexus AI Capital is currently in private beta. Request access to explore the live dashboard, configure your own trading strategies, and watch the AI fund team work in real-time.
+  </p>
+  <div class="cta-btns reveal">
+    <a href="http://localhost:3000" class="btn-gold">Open Dashboard</a>
+    <a href="mailto:trading@phemex-ai-trader.com" class="btn-outline">Contact Us</a>
+  </div>
+</div>
+
+<!-- FOOTER -->
+<footer>
+  <div class="footer-inner">
+    <div class="footer-logo">NEXUS AI CAPITAL</div>
+    <p class="footer-disc">This platform is for research and educational purposes. Cryptocurrency trading involves significant risk of loss. Past performance of AI models does not guarantee future results. Not financial advice.</p>
+    <div class="footer-links">
+      <a href="http://localhost:8000/docs">API Docs</a>
+      <a href="http://localhost:3000">Dashboard</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+  // ── Scroll-triggered reveals ──
+  const obs = new IntersectionObserver(entries => {
+    entries.forEach(e => { if (e.isIntersecting) { e.target.classList.add('v'); obs.unobserve(e.target); } });
+  }, { threshold: 0.1, rootMargin: '0px 0px -40px 0px' });
+  document.querySelectorAll('.reveal').forEach(el => obs.observe(el));
+
+  // ── Org chart cascade ──
+  const nodes = [
+    { id: 'n-cio', d: 0 }, { id: 'n-pm', d: 180 },
+    { id: 'n-alpha', d: 380 }, { id: 'n-beta', d: 480 }, { id: 'n-gamma', d: 580 },
+    { id: 'n-ra', d: 750 }, { id: 'n-ta', d: 840 }, { id: 'n-rm', d: 930 },
+    { id: 'n-ec', d: 1020 }, { id: 'n-tr', d: 1110 },
+  ];
+  const orgTrigger = new IntersectionObserver(entries => {
+    if (entries[0].isIntersecting) {
+      nodes.forEach(({ id, d }) => setTimeout(() => {
+        const el = document.getElementById(id);
+        if (el) el.classList.add('on');
+      }, d));
+      orgTrigger.disconnect();
+    }
+  }, { threshold: 0.1 });
+  const cioEl = document.getElementById('n-cio');
+  if (cioEl) orgTrigger.observe(cioEl.closest('.org-tree'));
+
+  // ── Fix horizontal connector bars ──
+  function setHbar(id, leftPct, rightPct) {
+    const el = document.getElementById(id);
+    if (el) { el.style.left = leftPct + '%'; el.style.right = rightPct + '%'; el.style.height = '1px'; }
+  }
+  setHbar('hbar-traders', 17, 17);
+  setHbar('hbar-support', 8, 8);
+
+  // ── Philosophy bars ──
+  const barObs = new IntersectionObserver(entries => {
+    entries.forEach(e => {
+      if (e.isIntersecting) {
+        e.target.querySelectorAll('.phil-fill').forEach(f => {
+          const w = f.dataset.w;
+          setTimeout(() => { f.style.width = w + '%'; }, 300);
+        });
+        barObs.unobserve(e.target);
+      }
+    });
+  }, { threshold: 0.3 });
+  document.querySelectorAll('.phil-card').forEach(el => barObs.observe(el));
+
+  // ── Hero counters ──
+  function count(el) {
+    const target = parseFloat(el.dataset.count);
+    const dur = 1400;
+    const start = performance.now();
+    (function tick(now) {
+      const p = Math.min((now - start) / dur, 1);
+      const e = 1 - Math.pow(1 - p, 3);
+      el.textContent = Number.isInteger(target) ? Math.round(e * target) : (e * target).toFixed(1);
+      if (p < 1) requestAnimationFrame(tick);
+    })(start);
+  }
+  window.addEventListener('load', () => {
+    setTimeout(() => document.querySelectorAll('[data-count]').forEach(count), 500);
+  });
+
+  // ── Navbar shadow on scroll ──
+  window.addEventListener('scroll', () => {
+    document.getElementById('nav').style.boxShadow =
+      window.scrollY > 60 ? '0 4px 48px rgba(0,0,0,.55)' : 'none';
+  }, { passive: true });
+</script>
+</body>
+</html>

@@ -161,10 +161,15 @@ async def get_team_roster():
 @router.get("/market-analysis", response_model=AnalystReportResponse)
 async def get_market_analysis(symbols: Optional[List[str]] = None):
     """
-    Get research analyst's market analysis and opportunity identification
+    Get research analyst's market analysis. Serves the scheduler's cached report
+    (updated every 5 min). Falls back to a fresh analysis only on first load.
     """
     try:
-        report = await research_analyst.analyze_markets(symbols=symbols)
+        cached = agent_scheduler.get_current_analyst_report()
+        if cached:
+            report = cached
+        else:
+            report = await research_analyst.analyze_markets(symbols=symbols)
 
         return AnalystReportResponse(
             timestamp=report.timestamp,
@@ -238,6 +243,9 @@ class MultiTimeframeResponse(BaseModel):
     alignment: str
     trend_confirmation: bool
     confluence_score: float
+    tf_primary: str = "1h"
+    tf_mid: str = "4h"
+    tf_high: str = "1d"
 
 
 class TechnicalAnalysisResponse(BaseModel):
@@ -253,14 +261,15 @@ class TechnicalAnalysisResponse(BaseModel):
 
 
 @router.get("/technical-analysis", response_model=TechnicalAnalysisResponse)
-async def get_technical_analysis(symbol: str = "BTCUSDT"):
+async def get_technical_analysis(symbol: str = "BTCUSDT", timeframe: str = "1h"):
     """
-    Get technical analyst's chart analysis with price levels, patterns, and multi-timeframe
+    Get technical analyst's chart analysis with price levels, patterns, and multi-timeframe.
+    Pass ?timeframe=4h to get analysis scaled to the strategy's timeframe.
     """
     try:
         from app.services.technical_analyst import technical_analyst
 
-        report = await technical_analyst.analyze(symbol)
+        report = await technical_analyst.analyze(symbol, timeframe=timeframe)
 
         return _report_to_response(report)
     except Exception as e:
@@ -300,7 +309,10 @@ def _report_to_response(report) -> TechnicalAnalysisResponse:
             timeframe_1d=report.multi_timeframe.timeframe_1d,
             alignment=report.multi_timeframe.alignment,
             trend_confirmation=report.multi_timeframe.trend_confirmation,
-            confluence_score=report.multi_timeframe.confluence_score
+            confluence_score=report.multi_timeframe.confluence_score,
+            tf_primary=report.multi_timeframe.tf_primary,
+            tf_mid=report.multi_timeframe.tf_mid,
+            tf_high=report.multi_timeframe.tf_high,
         ) if report.multi_timeframe else None,
         overall_signal=report.overall_signal,
         confidence=report.confidence,
@@ -321,21 +333,31 @@ async def get_technical_analysis_batch():
     try:
         agents = await get_agents_from_db()
 
-        symbols = set()
+        # Group symbols by the most common agent timeframe trading that pair
+        from collections import Counter, defaultdict
+        symbol_tfs: dict = defaultdict(list)
         for agent in agents:
             pairs = agent.get("trading_pairs") or ["BTCUSDT"]
             if isinstance(pairs, str):
                 pairs = [pairs]
-            symbols.update(pairs)
-        symbols = list(symbols) or ["BTCUSDT"]
+            tf = agent.get("timeframe", "1h")
+            for pair in pairs:
+                symbol_tfs[pair].append(tf)
 
-        async def analyze_safe(sym: str):
+        if not symbol_tfs:
+            symbol_tfs["BTCUSDT"] = ["1h"]
+
+        async def analyze_safe(sym: str, tf: str):
             try:
-                return await technical_analyst.analyze(sym)
+                return await technical_analyst.analyze(sym, timeframe=tf)
             except Exception:
                 return None
 
-        reports = await asyncio.gather(*[analyze_safe(s) for s in symbols])
+        tasks = [
+            analyze_safe(sym, Counter(tfs).most_common(1)[0][0])
+            for sym, tfs in symbol_tfs.items()
+        ]
+        reports = await asyncio.gather(*tasks)
         results = [_report_to_response(r) for r in reports if r is not None]
         return results
     except Exception as e:
@@ -497,17 +519,15 @@ async def get_risk_assessment():
             for p in positions_live
         ]
 
-        # Compute real total capital (USDT balance + positions value)
+        # Compute real total capital using the scheduler helper (live or paper)
         try:
-            balances = await paper_trading.get_all_balances()
-            usdt_balance = next((b.available for b in balances if b.asset == "USDT"), 10000.0)
             positions_value = sum(
                 p.get("quantity", 0) * p.get("current_price", p.get("entry_price", 0))
                 for p in positions_live
             )
-            total_capital = usdt_balance + positions_value
+            total_capital = await agent_scheduler._get_total_capital(positions_value=positions_value)
         except Exception:
-            total_capital = 10000.0
+            total_capital = agent_scheduler._total_capital or 50_000.0
 
         # Compute daily P&L from DB (FIFO-matched sells today)
         try:
@@ -564,34 +584,35 @@ async def get_execution_plan():
 @router.get("/cio-report", response_model=FundHealthReportResponse)
 async def get_cio_report(period: str = "daily"):
     """
-    Get CIO agent's comprehensive fund health report and strategic recommendations
+    Get CIO agent's comprehensive fund health report. Serves the scheduler's cached
+    report (updated every 5 min). Falls back to a fresh report only on first load.
     """
     try:
-        from app.api.routes.agents import get_agents_from_db
+        cached = agent_scheduler.get_current_cio_report()
+        if cached:
+            report = cached
+        else:
+            from app.api.routes.agents import get_agents_from_db
 
-        agents = await get_agents_from_db()
-        metrics_data = await agent_scheduler.get_all_metrics()
-
-        # Create agent_id to name mapping
-        agent_name_map = {agent['id']: agent['name'] for agent in agents}
-
-        agent_metrics = [
-            {
-                'agent_id': m.agent_id,
-                'agent_name': agent_name_map.get(m.agent_id, m.agent_id),
-                'total_runs': m.total_runs,
-                'successful_runs': m.successful_runs,
-                'total_pnl': m.total_pnl,
-                'win_rate': m.win_rate,
-                'strategy_type': 'unknown'
-            }
-            for m in metrics_data
-        ]
-
-        report = await cio_agent.generate_fund_report(
-            agent_metrics=agent_metrics,
-            period=period
-        )
+            agents = await get_agents_from_db()
+            metrics_data = await agent_scheduler.get_all_metrics()
+            agent_name_map = {agent['id']: agent['name'] for agent in agents}
+            agent_metrics = [
+                {
+                    'agent_id': m.agent_id,
+                    'agent_name': agent_name_map.get(m.agent_id, m.agent_id),
+                    'total_runs': m.total_runs,
+                    'successful_runs': m.successful_runs,
+                    'total_pnl': m.total_pnl,
+                    'win_rate': m.win_rate,
+                    'strategy_type': 'unknown'
+                }
+                for m in metrics_data
+            ]
+            report = await cio_agent.generate_fund_report(
+                agent_metrics=agent_metrics,
+                period=period
+            )
 
         return FundHealthReportResponse(
             timestamp=report.timestamp,
@@ -875,3 +896,108 @@ async def get_trade_retrospective():
 
     fresh = await trade_retrospective.analyze_recent_trades(agents_list)
     return fresh or {"trade_analyses": [], "agent_insights": {}, "parameter_adjustments": [], "summary": "No trades to analyse yet."}
+
+
+# ==================== Trader Endpoints ====================
+
+@router.get("/traders/leaderboard")
+async def get_trader_leaderboard():
+    """Get trader leaderboard with allocation and performance data.
+
+    P&L and win rate are sourced from actual closed DB trades (net of fees),
+    not the in-memory agent metrics buffer which is pruned and mixes bootstrap
+    backtest data with live trade results.
+    """
+    from app.services.trader_service import trader_service
+    from app.services.paper_trading import paper_trading
+
+    traders = agent_scheduler.get_traders()
+    allocations = agent_scheduler.get_trader_allocations()
+    total_capital = agent_scheduler._total_capital or 0.0
+
+    # Pull per-agent performance from DB (authoritative, net-of-fees)
+    db_perf = await paper_trading.get_agent_performance_from_db()
+
+    leaderboard = []
+    for t in traders:
+        t_agents = [
+            cfg for cfg in agent_scheduler._enabled_agents.values()
+            if cfg.get("trader_id") == t["id"]
+        ]
+
+        # Aggregate DB-sourced metrics across all agents for this trader
+        total_pnl = 0.0
+        total_trades = 0
+        winning_trades = 0
+        for a in t_agents:
+            ap = db_perf.get(a["id"])
+            if ap:
+                total_pnl += ap["net_pnl"]
+                total_trades += ap["total_trades"]
+                winning_trades += int(ap["total_trades"] * (ap["win_rate"] or 0))
+
+        win_rate = winning_trades / total_trades if total_trades > 0 else None
+
+        # Fall back to in-memory metrics only when there are no DB trades yet
+        # (e.g., brand-new agents that haven't closed a trade)
+        if total_trades == 0:
+            agent_metrics_list = []
+            for a in t_agents:
+                m = agent_scheduler._agent_metrics.get(a["id"])
+                if m:
+                    agent_metrics_list.append({
+                        "agent_id": a["id"],
+                        "total_pnl": m.total_pnl,
+                        "win_rate": m.win_rate,
+                        "total_runs": m.total_runs,
+                    })
+            perf = trader_service.get_trader_performance(t, t_agents, agent_metrics_list)
+            total_pnl = perf.total_pnl
+            win_rate = perf.win_rate
+            total_trades = perf.total_trades
+
+        alloc_pct = allocations.get(t["id"], t.get("allocation_pct", 33.3))
+        leaderboard.append({
+            "id": t["id"],
+            "name": t["name"],
+            "llm_model": t.get("llm_model", ""),
+            "allocation_pct": alloc_pct,
+            "allocation_dollars": total_capital * alloc_pct / 100,
+            "total_capital": total_capital,
+            "is_enabled": t.get("is_enabled", True),
+            "config": t.get("config", {}),
+            "total_pnl": round(total_pnl, 2),
+            "win_rate": win_rate,
+            "total_trades": total_trades,
+            "agent_count": len(t_agents),
+        })
+
+    leaderboard.sort(key=lambda x: x["total_pnl"], reverse=True)
+    return leaderboard
+
+
+@router.get("/trader-allocation")
+async def get_trader_allocation():
+    """
+    James's (Portfolio Manager) current capital allocation across traders.
+    Returns trader_id → pct, plus trader name and reasoning for display.
+    """
+    traders = agent_scheduler.get_traders()
+    allocations = agent_scheduler.get_trader_allocations()
+    reasoning = agent_scheduler._current_allocation_reasoning or ""
+
+    result = []
+    for t in traders:
+        if not t.get("is_enabled", True):
+            continue
+        result.append({
+            "id": t["id"],
+            "name": t.get("name", t["id"]),
+            "avatar": t.get("config", {}).get("avatar", "🤖"),
+            "llm_model": t.get("llm_model", ""),
+            "allocation_pct": allocations.get(t["id"], t.get("allocation_pct", 33.3)),
+        })
+
+    # Sort by allocation descending
+    result.sort(key=lambda x: x["allocation_pct"], reverse=True)
+    return {"traders": result, "reasoning": reasoning}

@@ -19,9 +19,13 @@ from app.config import settings
 
 
 class PaperTradingService:
-    # Configurable fee rate — Phemex taker rate is ~0.06%, we default to
-    # the same so paper trading P&L is realistic.
-    FEE_RATE = 0.0006  # 0.06% per side (entry and exit)
+    # Fee rates — Phemex spot taker: 0.1%, contract taker: 0.06%
+    SPOT_FEE_RATE = 0.001    # 0.10% for USDT spot pairs
+    CONTRACT_FEE_RATE = 0.0006  # 0.06% for coin-margined contracts
+
+    @classmethod
+    def fee_rate_for(cls, symbol: str) -> float:
+        return cls.SPOT_FEE_RATE if symbol.endswith("USDT") else cls.CONTRACT_FEE_RATE
 
     def __init__(self, phemex_client: Optional[PhemexClient] = None):
         self.logger = logging.getLogger(__name__)
@@ -104,6 +108,7 @@ class PaperTradingService:
         quantity: float,
         price: Optional[float] = None,
         agent_id: Optional[str] = None,
+        trader_id: Optional[str] = None,
         stop_loss_price: Optional[float] = None,
         take_profit_price: Optional[float] = None,
         trailing_stop_pct: Optional[float] = None,
@@ -151,12 +156,13 @@ class PaperTradingService:
                 await db.flush()
 
             notional = quantity * price
-            fee = notional * self.FEE_RATE
+            fee = notional * self.fee_rate_for(symbol)
 
             order = PaperOrder(
                 id=str(uuid.uuid4()),
                 user_id="default-user",
                 agent_id=agent_id,
+                trader_id=trader_id,
                 symbol=symbol,
                 side=side,
                 quantity=quantity,
@@ -623,9 +629,10 @@ class PaperTradingService:
                     fill = min(remaining, buy_remaining)
                     buy = buys[buy_idx]
                     pnl = fill * (sell.price - buy.price)
-                    pnl_pct = ((sell.price - buy.price) / buy.price * 100) if buy.price else 0
                     fee = (buy.fee or 0) * (fill / buy.quantity) + (sell.fee or 0) * (fill / sell.quantity)
                     net_pnl = pnl - fee
+                    entry_notional = fill * buy.price
+                    pnl_pct = (net_pnl / entry_notional * 100) if entry_notional else 0
 
                     closed.append({
                         "symbol": sym,
@@ -636,10 +643,10 @@ class PaperTradingService:
                         "exit_price": sell.price,
                         "entry_time": buy.created_at.isoformat() if buy.created_at else None,
                         "exit_time": sell.created_at.isoformat() if sell.created_at else None,
-                        "gross_pnl": round(pnl, 4),
-                        "fee": round(fee, 4),
-                        "net_pnl": round(net_pnl, 4),
-                        "pnl_pct": round(pnl_pct, 2),
+                        "gross_pnl": round(pnl, 6),
+                        "fee": round(fee, 6),
+                        "net_pnl": round(net_pnl, 6),
+                        "pnl_pct": round(pnl_pct, 4),
                         "result": "win" if net_pnl > 0 else ("loss" if net_pnl < 0 else "breakeven"),
                     })
 
@@ -683,9 +690,10 @@ class PaperTradingService:
                         if cover > 1e-12:
                             entry_order = sr["order"]
                             pnl = cover * (entry_order.price - o.price)  # short P&L
-                            pnl_pct = ((entry_order.price - o.price) / entry_order.price * 100) if entry_order.price else 0
                             fee = (entry_order.fee or 0) * (cover / entry_order.quantity) + (o.fee or 0) * (cover / o.quantity)
                             net_pnl = pnl - fee
+                            entry_notional = cover * entry_order.price
+                            pnl_pct = (net_pnl / entry_notional * 100) if entry_notional else 0
 
                             closed.append({
                                 "symbol": sym,
@@ -696,10 +704,10 @@ class PaperTradingService:
                                 "exit_price": o.price,
                                 "entry_time": entry_order.created_at.isoformat() if entry_order.created_at else None,
                                 "exit_time": o.created_at.isoformat() if o.created_at else None,
-                                "gross_pnl": round(pnl, 4),
-                                "fee": round(fee, 4),
-                                "net_pnl": round(net_pnl, 4),
-                                "pnl_pct": round(pnl_pct, 2),
+                                "gross_pnl": round(pnl, 6),
+                                "fee": round(fee, 6),
+                                "net_pnl": round(net_pnl, 6),
+                                "pnl_pct": round(pnl_pct, 4),
                                 "result": "win" if net_pnl > 0 else ("loss" if net_pnl < 0 else "breakeven"),
                             })
                             sr["remaining"] -= cover
@@ -713,9 +721,38 @@ class PaperTradingService:
         closed.sort(key=lambda t: t["exit_time"] or "", reverse=True)
         return closed[:limit]
 
-    # ------------------------------------------------------------------
-    # P&L
-    # ------------------------------------------------------------------
+    async def get_agent_performance_from_db(self) -> dict[str, dict]:
+        """Return per-agent net P&L, win rate, and trade count from closed DB trades.
+
+        This is the authoritative source for leaderboard metrics — it uses the
+        actual matched round-trip trades (net of fees) rather than the in-memory
+        buffer which is pruned and mixes bootstrap backtest data with live trades.
+
+        Returns: {agent_id: {"net_pnl": float, "win_rate": float, "total_trades": int}}
+        """
+        # Fetch all closed trades with no limit (we need full history for accuracy)
+        all_closed = await self.get_closed_trades(limit=999_999)
+        perf: dict[str, dict] = {}
+        for trade in all_closed:
+            aid = trade.get("agent_id")
+            if not aid:
+                continue
+            if aid not in perf:
+                perf[aid] = {"net_pnl": 0.0, "wins": 0, "total": 0}
+            perf[aid]["net_pnl"] += trade.get("net_pnl", 0.0)
+            perf[aid]["total"] += 1
+            if trade.get("net_pnl", 0.0) > 0:
+                perf[aid]["wins"] += 1
+        return {
+            aid: {
+                "net_pnl": v["net_pnl"],
+                "win_rate": v["wins"] / v["total"] if v["total"] > 0 else None,
+                "total_trades": v["total"],
+            }
+            for aid, v in perf.items()
+        }
+
+
 
     async def calculate_pnl(self) -> dict:
         """Calculate paper trading performance metrics."""
@@ -794,7 +831,7 @@ class PaperTradingService:
         open_exit_fees = 0.0
         for pos in positions:
             cp = current_prices.get(pos.symbol, pos.entry_price or 0.0)
-            open_exit_fees += (pos.quantity or 0) * cp * self.FEE_RATE
+            open_exit_fees += (pos.quantity or 0) * cp * self.fee_rate_for(pos.symbol)
 
         return {
             "total_pnl": closed_pnl + unrealized_pnl - total_fees - open_exit_fees,

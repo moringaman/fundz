@@ -11,9 +11,10 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class RiskConfig:
-    stop_loss_pct: float = 2.0
-    take_profit_pct: float = 4.0
-    max_daily_loss: float = 5.0
+    stop_loss_pct: float = 3.5
+    take_profit_pct: float = 7.0
+    max_daily_loss: float = 5.0       # percentage of total capital (e.g. 5.0 = 5%)
+    total_capital: float = 0.0        # used to convert max_daily_loss % → dollar threshold
     max_position_size: float = 1000.0
     trailing_stop_pct: Optional[float] = None
     max_open_positions: int = 3
@@ -90,11 +91,18 @@ class RiskManager:
             )
         
         daily_loss = self._daily_pnl.get('today', 0)
-        if daily_loss <= -risk_config.max_daily_loss:
+        # Convert percentage limit to a dollar threshold using total_capital.
+        # daily_loss is in dollars; max_daily_loss is a percentage (e.g. 5.0 = 5%).
+        if risk_config.total_capital > 0:
+            daily_loss_limit_dollars = risk_config.total_capital * risk_config.max_daily_loss / 100
+        else:
+            # Fallback: treat as dollar value if total_capital not provided (legacy behaviour)
+            daily_loss_limit_dollars = risk_config.max_daily_loss
+        if daily_loss <= -daily_loss_limit_dollars:
             return RiskCheckResult(
                 allowed=False,
                 action="stop",
-                reason=f"Daily loss limit reached: {risk_config.max_daily_loss}%"
+                reason=f"Daily loss limit reached: {risk_config.max_daily_loss}% (${daily_loss_limit_dollars:,.0f})"
             )
         
         if side.lower() == 'buy':

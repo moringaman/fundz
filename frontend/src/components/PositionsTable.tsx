@@ -12,39 +12,83 @@ interface Position {
 }
 
 const PositionsContainer = styled.div`
-  background-color: #f9f9f9;
-  border-radius: 8px;
-  padding: 20px;
-  margin: 20px 0;
+  background: var(--bg-panel, #0d1220);
+  border: 1px solid var(--border-mid, #243650);
+  border-radius: 10px;
+  padding: 1.25rem;
+  margin: 1rem 0;
 `;
 
-const PositionsTable = styled.table`
+const TableTitle = styled.h3`
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-primary, #e8f0fe);
+  letter-spacing: 0.02em;
+  margin-bottom: 1rem;
+  text-transform: uppercase;
+`;
+
+const StyledTable = styled.table`
   width: 100%;
   border-collapse: collapse;
-  
-  th, td {
-    border: 1px solid #ddd;
-    padding: 12px;
-    text-align: left;
-  }
-  
+
   th {
-    background-color: #f2f2f2;
-    font-weight: bold;
+    font-size: 0.68rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--text-secondary, #8ba3c7);
+    padding: 0.5rem 0.75rem;
+    border-bottom: 1px solid var(--border, #1c2b42);
+    text-align: left;
+    white-space: nowrap;
   }
-  
-  tr:nth-child(even) {
-    background-color: #f8f8f8;
+
+  td {
+    font-size: 0.82rem;
+    color: var(--text-primary, #e8f0fe);
+    padding: 0.6rem 0.75rem;
+    border-bottom: 1px solid var(--border, #1c2b42);
+    font-family: 'Share Tech Mono', monospace;
+  }
+
+  tr:last-child td {
+    border-bottom: none;
+  }
+
+  tr:hover td {
+    background: var(--bg-hover, #1a2438);
   }
 `;
 
-interface ProfitCellProps {
-  profit: number;
-}
+const SideBadge = styled.span<{ side: 'buy' | 'sell' }>`
+  display: inline-block;
+  padding: 0.2rem 0.55rem;
+  border-radius: 4px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  background: ${({ side }) => side === 'buy'
+    ? 'rgba(0,230,118,.14)'
+    : 'rgba(255,83,112,.14)'};
+  color: ${({ side }) => side === 'buy'
+    ? 'var(--green, #00e676)'
+    : 'var(--red, #ff5370)'};
+`;
 
-const ProfitCell = styled.td<ProfitCellProps>`
-  color: ${({ profit }) => profit >= 0 ? 'green' : 'red'};
-  font-weight: bold;
+const PnlCell = styled.td<{ profit: number }>`
+  font-weight: 700 !important;
+  color: ${({ profit }) => profit >= 0
+    ? 'var(--green, #00e676) !important'
+    : 'var(--red, #ff5370) !important'};
+`;
+
+const StateMessage = styled.div`
+  font-size: 0.82rem;
+  color: var(--text-secondary, #8ba3c7);
+  padding: 0.5rem 0;
+  font-style: italic;
 `;
 
 export const PositionsTableComponent: React.FC = () => {
@@ -72,39 +116,42 @@ export const PositionsTableComponent: React.FC = () => {
     return () => clearInterval(intervalId);
   }, [fetchPositions]);
 
-  if (loading) return <div>Loading positions...</div>;
-  if (error) return <div>Error: {error}</div>;
-  if (positions.length === 0) return <div>No open positions</div>;
-
   return (
     <PositionsContainer>
-      <h2>Open Positions</h2>
-      <PositionsTable>
-        <thead>
-          <tr>
-            <th>Symbol</th>
-            <th>Side</th>
-            <th>Quantity</th>
-            <th>Entry Price</th>
-            <th>Current Price</th>
-            <th>Unrealized P&L</th>
-          </tr>
-        </thead>
-        <tbody>
-          {positions.map((position) => (
-            <tr key={position.symbol}>
-              <td>{position.symbol}</td>
-              <td>{position.side.toUpperCase()}</td>
-              <td>{position.quantity.toFixed(4)}</td>
-              <td>${position.entry_price.toFixed(2)}</td>
-              <td>${position.current_price.toFixed(2)}</td>
-              <ProfitCell profit={position.unrealized_pnl}>
-                ${position.unrealized_pnl.toFixed(2)}
-              </ProfitCell>
+      <TableTitle>Open Positions</TableTitle>
+      {loading && <StateMessage>Loading positions…</StateMessage>}
+      {error && <StateMessage style={{ color: 'var(--red, #ff5370)' }}>{error}</StateMessage>}
+      {!loading && !error && positions.length === 0 && (
+        <StateMessage>There are currently no open positions.</StateMessage>
+      )}
+      {!loading && !error && positions.length > 0 && (
+        <StyledTable>
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Side</th>
+              <th>Quantity</th>
+              <th>Entry Price</th>
+              <th>Current Price</th>
+              <th>Unrealised P&amp;L</th>
             </tr>
-          ))}
-        </tbody>
-      </PositionsTable>
+          </thead>
+          <tbody>
+            {positions.map((position) => (
+              <tr key={position.symbol}>
+                <td>{position.symbol}</td>
+                <td><SideBadge side={position.side}>{position.side}</SideBadge></td>
+                <td>{position.quantity.toFixed(4)}</td>
+                <td>${position.entry_price.toFixed(2)}</td>
+                <td>${position.current_price.toFixed(2)}</td>
+                <PnlCell profit={position.unrealized_pnl}>
+                  {position.unrealized_pnl >= 0 ? '+' : ''}${position.unrealized_pnl.toFixed(2)}
+                </PnlCell>
+              </tr>
+            ))}
+          </tbody>
+        </StyledTable>
+      )}
     </PositionsContainer>
   );
 };

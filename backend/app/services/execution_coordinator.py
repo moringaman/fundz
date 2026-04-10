@@ -1,6 +1,6 @@
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from datetime import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 
 logger = logging.getLogger(__name__)
@@ -39,15 +39,175 @@ class ExecutionPlan:
     reasoning: str
 
 
+@dataclass
+class CycleTradeRecord:
+    """A trade that has already been executed or is intended in the current scheduler cycle."""
+    agent_id: str
+    agent_name: str
+    symbol: str
+    side: str          # "buy" or "sell"
+    quantity: float
+    executed: bool = False   # True = already filled; False = intended but not yet fired
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+
+
+@dataclass
+class ConflictCheckResult:
+    """Result of Alex's pre-execution conflict check."""
+    approved: bool
+    verdict: str        # "approved" | "blocked" | "size_reduced"
+    reason: str
+    size_multiplier: float = 1.0   # applied to quantity before execution
+    chat_message: Optional[str] = None   # post to team chat if not None
+
+
 class ExecutionCoordinator:
     """
-    Execution Coordinator: Optimizes order execution timing, routing, and
-    slippage management. Responsible for determining execution priority
-    across multiple pending orders from different agents.
+    Execution Coordinator (Alex Liu): Reviews intended trades before they fire.
+    Checks for:
+      - Opposing positions on the same symbol in the same cycle (blocks the second)
+      - Concentration: same symbol appears ≥3 times (reduces size on 3rd+)
+      - Same-side pile-on: 2 agents already long/short a symbol (soft-warn, reduce size)
+    Also tracks real execution history for slippage analysis.
     """
 
+    # Max fraction of cycle trade count on one symbol before concentration warning
+    CONCENTRATION_THRESHOLD = 2   # 3rd agent on same symbol triggers size reduction
+    OPPOSE_BLOCK = True           # Block trades that directly oppose a same-cycle trade
+
     def __init__(self):
-        self.order_history = []  # Track recent executions for slippage analysis
+        self.order_history: List[dict] = []
+
+    # ── Pre-execution conflict gate ──────────────────────────────────────
+
+    def check_intended_trade(
+        self,
+        agent_id: str,
+        agent_name: str,
+        symbol: str,
+        side: str,
+        quantity: float,
+        cycle_trades: List[CycleTradeRecord],
+    ) -> ConflictCheckResult:
+        """
+        Called before each order fires. Examines cycle_trades (already executed
+        or approved this cycle) and returns an approval decision.
+        """
+        same_symbol = [t for t in cycle_trades if t.symbol == symbol]
+        opposing_side = "sell" if side == "buy" else "buy"
+        conflicts = [t for t in same_symbol if t.side == opposing_side]
+        same_side   = [t for t in same_symbol if t.side == side]
+
+        # ── Rule 1: Hard block opposing trades on same symbol ────────────
+        if self.OPPOSE_BLOCK and conflicts:
+            names = ", ".join(t.agent_name for t in conflicts)
+            return ConflictCheckResult(
+                approved=False,
+                verdict="blocked",
+                reason=(
+                    f"Opposing position conflict on {symbol}: "
+                    f"{names} already went {'LONG' if opposing_side == 'buy' else 'SHORT'} "
+                    f"this cycle. Blocking {side.upper()} to avoid self-opposing exposure."
+                ),
+                chat_message=(
+                    f"🚫 **Execution conflict blocked**: {agent_name} wanted to "
+                    f"**{side.upper()} {symbol}** but {names} already "
+                    f"{'bought' if opposing_side == 'buy' else 'sold'} it this cycle. "
+                    f"Opposing positions on the same symbol cancelled."
+                ),
+            )
+
+        # ── Rule 2: Concentration — 2+ agents already on same side ──────
+        if len(same_side) >= self.CONCENTRATION_THRESHOLD:
+            names = ", ".join(t.agent_name for t in same_side)
+            return ConflictCheckResult(
+                approved=True,
+                verdict="size_reduced",
+                reason=(
+                    f"Concentration limit: {names} already {side.upper()} {symbol} "
+                    f"this cycle. Reducing {agent_name}'s position by 50%."
+                ),
+                size_multiplier=0.5,
+                chat_message=(
+                    f"⚠️ **Concentration warning** on {symbol}: {names} and now "
+                    f"{agent_name} all want to {side.upper()}. "
+                    f"Reducing {agent_name}'s size by 50% to limit correlated exposure."
+                ),
+            )
+
+        # ── Rule 3: First same-side duplicate — info only ─────────────────
+        if len(same_side) == 1:
+            names = same_side[0].agent_name
+            return ConflictCheckResult(
+                approved=True,
+                verdict="approved",
+                reason=f"{names} also {side.upper()} {symbol} this cycle — proceeding at full size.",
+                chat_message=(
+                    f"📋 **Execution note**: {names} and {agent_name} both "
+                    f"{'going long' if side == 'buy' else 'shorting'} {symbol} this cycle. "
+                    f"Correlated bet — proceeding at full size."
+                ),
+            )
+
+        # ── All clear ─────────────────────────────────────────────────────
+        return ConflictCheckResult(
+            approved=True,
+            verdict="approved",
+            reason=f"No conflicts. {symbol} {side.upper()} cleared for execution.",
+        )
+
+    def record_cycle_trade(
+        self,
+        agent_id: str,
+        agent_name: str,
+        symbol: str,
+        side: str,
+        quantity: float,
+        cycle_trades: List[CycleTradeRecord],
+    ) -> None:
+        """Record a trade that has been approved and executed into the cycle buffer."""
+        cycle_trades.append(CycleTradeRecord(
+            agent_id=agent_id,
+            agent_name=agent_name,
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
+            executed=True,
+        ))
+
+    # ── Legacy pending-orders path (kept for API compatibility) ─────────
+
+    async def optimize_execution_plan(
+        self,
+        pending_orders: List[PendingOrder]
+    ) -> ExecutionPlan:
+        timestamp = datetime.utcnow()
+        if not pending_orders:
+            return ExecutionPlan(
+                timestamp=timestamp,
+                pending_orders_count=0,
+                execution_sequence=[],
+                priorities=[],
+                aggregate_slippage_estimate=0.0,
+                recommended_action="wait",
+                reasoning="No pending orders to execute",
+            )
+        priorities = sorted(
+            [self._calculate_priority(o, pending_orders) for o in pending_orders],
+            key=lambda p: p.priority_score, reverse=True
+        )
+        aggregate_slippage = sum(p.estimated_slippage for p in priorities) / len(priorities)
+        return ExecutionPlan(
+            timestamp=timestamp,
+            pending_orders_count=len(pending_orders),
+            execution_sequence=[p.order_id for p in priorities],
+            priorities=priorities,
+            aggregate_slippage_estimate=aggregate_slippage,
+            recommended_action=self._recommend_action(pending_orders, aggregate_slippage),
+            reasoning=self._build_reasoning(pending_orders, priorities, aggregate_slippage),
+        )
+
+
 
     async def optimize_execution_plan(
         self,

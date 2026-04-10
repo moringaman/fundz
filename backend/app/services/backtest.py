@@ -45,15 +45,16 @@ class BacktestConfig:
     stop_loss_pct: float = 0.02
     take_profit_pct: float = 0.05
     strategy: str = "momentum"
-    # Fee modeling
-    maker_fee_pct: float = 0.01   # 0.01% maker fee (Phemex contract)
-    taker_fee_pct: float = 0.06   # 0.06% taker fee
+    # Fee modeling — defaults to spot USDT rates (most agents trade USDT pairs)
+    # Phemex spot taker: 0.10% | Phemex contract taker: 0.06%
+    maker_fee_pct: float = 0.10   # 0.10% spot maker/taker (conservative)
+    taker_fee_pct: float = 0.10   # 0.10% spot taker fee
     slippage_pct: float = 0.02    # 0.02% estimated slippage
     # Trailing stop
     use_trailing_stop: bool = False
     trailing_stop_pct: float = 0.03  # 3% trailing stop
-    # Data window
-    candle_limit: int = 500       # configurable, supports >500 via pagination
+    # Data window — 1000 candles: ~42 days on 1h, ~10 days on 15m, ~167 days on 4h
+    candle_limit: int = 1000      # configurable, supports >500 via pagination
 
 
 class BacktestEngine:
@@ -156,7 +157,6 @@ class BacktestEngine:
                     pnl_pct <= -config.stop_loss_pct
                     or pnl_pct >= config.take_profit_pct
                     or trailing_stop_hit
-                    or (signal_action == 'sell' if position['side'] == 'buy' else signal_action == 'buy')
                 )
 
                 if should_exit:

@@ -63,7 +63,7 @@ export function AutomationPage() {
 
   return (
     <div className="space-y-6">
-      <h1 className="page-title">Agent Automation</h1>
+      <h1 className="page-title">Strategy Automation</h1>
 
       <div className="card">
         <div className="card-header-row">
@@ -95,7 +95,7 @@ export function AutomationPage() {
           <p className="stat-value">{status?.total_runs || 0}</p>
         </div>
         <div className="stat-card">
-          <p className="stat-label">Tracked Agents</p>
+          <p className="stat-label">Tracked Strategies</p>
           <p className="stat-value">{status?.tracked_agents || 0}</p>
         </div>
         <div className="stat-card">
@@ -127,7 +127,7 @@ export function AutomationPage() {
             </span>
           </div>
           <div className="setup-item">
-            <span className="setup-label">Active Agents</span>
+            <span className="setup-label">Active Strategies</span>
             <span className="setup-value">{agents.filter((a) => a.is_enabled).length}</span>
           </div>
           <div className="setup-item">
@@ -156,9 +156,9 @@ export function AutomationPage() {
       )}
 
       <div className="card">
-        <h2 className="card-title">Agent Performance</h2>
+        <h2 className="card-title">Strategy Performance</h2>
         {metrics.length === 0 ? (
-          <p className="text-gray-400">No agent metrics yet. Run agents to see performance data.</p>
+          <p className="text-gray-400">No strategy metrics yet. Run strategies to see performance data.</p>
         ) : (
           <div className="metrics-table">
             {metrics.map((m: any) => (

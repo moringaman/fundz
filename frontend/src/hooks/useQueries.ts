@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient, QueryClient, useMutation } from '@tanstack/react-query';
-import { tradingApi, agentApi, paperApi, automationApi, settingsApi, fundApi } from '../lib/api';
+import { tradingApi, agentApi, paperApi, automationApi, settingsApi, fundApi, traderApi } from '../lib/api';
 import { wsClient } from '../lib/websocket';
 import { useEffect } from 'react';
 
@@ -195,6 +195,15 @@ export function useClosedTrades(symbol?: string, limit = 100) {
     queryKey: ['closedTrades', symbol, limit],
     queryFn: () => paperApi.getClosedTrades(symbol, limit).then((r) => r.data),
     refetchInterval: 30_000,
+  });
+}
+
+export function usePerformanceChart() {
+  return useQuery({
+    queryKey: ['performanceChart'],
+    queryFn: () => paperApi.getPerformanceChart().then((r) => r.data),
+    refetchInterval: 60_000,
+    staleTime: 30_000,
   });
 }
 
@@ -425,4 +434,42 @@ export function useWsQueryInvalidation() {
       wsClient.off('team_chat', onTeamChat);
     };
   }, [qc]);
+}
+
+// ─── Traders ──────────────────────────────────────────────────────────────────
+export function useTraders() {
+  return useQuery({
+    queryKey: ['traders'],
+    queryFn: () => traderApi.list().then(r => r.data),
+    staleTime: 60_000,
+    refetchInterval: 60_000,
+  });
+}
+
+export function useTraderLeaderboard() {
+  return useQuery({
+    queryKey: ['traderLeaderboard'],
+    queryFn: () => traderApi.getLeaderboard().then(r => r.data),
+    staleTime: 120_000,
+    refetchInterval: 120_000,
+  });
+}
+
+export function useTraderAllocation() {
+  return useQuery({
+    queryKey: ['traderAllocation'],
+    queryFn: () => fetch('/api/fund/trader-allocation').then(r => r.json()),
+    staleTime: 30_000,
+    refetchInterval: 30_000,
+  });
+}
+
+export function useTraderPerformance(traderId?: string) {
+  return useQuery({
+    queryKey: ['traderPerformance', traderId],
+    queryFn: () => traderApi.getPerformance(traderId!).then(r => r.data),
+    enabled: !!traderId,
+    staleTime: 60_000,
+    refetchInterval: 60_000,
+  });
 }

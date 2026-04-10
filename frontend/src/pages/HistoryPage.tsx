@@ -9,9 +9,11 @@ import {
   useAgents,
   useUpdatePositionSlTp,
   useClosePosition,
+  useTraders,
 } from '../hooks/useQueries';
 import { timeAgo } from '../utils/timeAgo';
-import { formatPrice } from '../utils/formatPrice';
+import { formatPrice, formatPnl, formatPnlPct } from '../utils/formatPrice';
+import { usePagination, Paginator } from '../components/common/Paginator';
 
 export function HistoryPage() {
   const [tab, setTab] = useState<'paper' | 'live'>('paper');
@@ -24,6 +26,7 @@ export function HistoryPage() {
   const { data: paperPositions = [] } = usePaperPositions();
   const { data: closedTrades = [] } = useClosedTrades();
   const { data: agentsData = [] } = useAgents();
+  const { data: tradersData = [] } = useTraders();
 
   // SL/TP inline editing
   const updateSlTp = useUpdatePositionSlTp();
@@ -57,6 +60,10 @@ export function HistoryPage() {
   const positions: any[] = Array.isArray(paperPositions) ? paperPositions : [];
   const closed: any[] = Array.isArray(closedTrades) ? closedTrades : [];
 
+  // Pagination
+  const closedPager = usePagination(closed, 10);
+  const ordersPager = usePagination(activeTrades, 10);
+
   const agentName = (id: string | null) => {
     if (!id) return '-';
     return agents.find((a: any) => a.id === id)?.name || id.slice(0, 8) + '...';
@@ -65,6 +72,18 @@ export function HistoryPage() {
   const agentStrategy = (id: string | null) => {
     if (!id) return '-';
     return agents.find((a: any) => a.id === id)?.strategy_type || '-';
+  };
+
+  const traders: any[] = Array.isArray(tradersData) ? tradersData : [];
+  const traderMap: Record<string, any> = {};
+  for (const t of traders) traderMap[t.id] = t;
+
+  const traderName = (agentId: string | null) => {
+    if (!agentId) return '-';
+    const agent = agents.find((a: any) => a.id === agentId);
+    if (!agent?.trader_id) return '-';
+    const t = traderMap[agent.trader_id];
+    return t ? `${t.config?.avatar || '🤖'} ${t.name}` : '-';
   };
 
   // Closed-trade stats
@@ -118,11 +137,11 @@ export function HistoryPage() {
               </div>
               <div className="stat-card">
                 <p className="stat-label">Avg Win</p>
-                <p className="stat-value positive">+${avgWin.toFixed(2)}</p>
+                <p className="stat-value positive">{formatPnl(avgWin)}</p>
               </div>
               <div className="stat-card">
                 <p className="stat-label">Avg Loss</p>
-                <p className="stat-value negative">${avgLoss.toFixed(2)}</p>
+                <p className="stat-value negative">{formatPnl(avgLoss)}</p>
               </div>
             </>
           )}
@@ -130,18 +149,23 @@ export function HistoryPage() {
       )}
 
       {/* Open Positions */}
-      {tab === 'paper' && positions.length > 0 && (
+      {tab === 'paper' && (
         <div className="card">
           <h2 className="card-title">Open Positions ({positions.length})</h2>
+          {positions.length === 0 ? (
+            <div style={{ padding: '2rem', textAlign: 'center', color: 'var(--text-muted)', fontSize: '.9rem' }}>
+              There are currently no open positions
+            </div>
+          ) : (
           <div className="trades-table">
-            <div className="trades-header" style={{ gridTemplateColumns: '1fr 0.5fr 0.7fr 0.9fr 0.9fr 1fr 1fr 0.9fr 0.7fr 0.7fr 0.6fr' }}>
+            <div className="trades-header" style={{ gridTemplateColumns: '1fr 0.5fr 0.7fr 0.9fr 0.9fr 1fr 1fr 0.9fr 0.7fr 0.7fr 0.7fr 0.6fr' }}>
               <span>Symbol</span><span>Side</span><span>Qty</span>
               <span>Entry Price</span><span>Current Price</span>
               <span>Stop Loss</span><span>Take Profit</span>
-              <span>Unrealized P&L</span><span>P&L %</span><span>Agent</span><span></span>
+              <span>Unrealized P&L</span><span>P&L %</span><span>Trader</span><span>Strategy</span><span></span>
             </div>
             {positions.map((pos: any) => (
-              <div key={pos.id || pos.symbol} className="trades-row" style={{ gridTemplateColumns: '1fr 0.5fr 0.7fr 0.9fr 0.9fr 1fr 1fr 0.9fr 0.7fr 0.7fr 0.6fr' }}>
+              <div key={pos.id || pos.symbol} className="trades-row" style={{ gridTemplateColumns: '1fr 0.5fr 0.7fr 0.9fr 0.9fr 1fr 1fr 0.9fr 0.7fr 0.7fr 0.7fr 0.6fr' }}>
                 <span style={{ fontWeight: 600 }}>{pos.symbol}</span>
                 <span className={pos.side === 'buy' ? 'positive' : 'negative'}>{pos.side?.toUpperCase()}</span>
                 <span>{pos.quantity?.toFixed(6)}</span>
@@ -230,6 +254,7 @@ export function HistoryPage() {
                 <span className={pos.unrealized_pnl_pct >= 0 ? 'positive' : 'negative'}>
                   {pos.unrealized_pnl_pct >= 0 ? '+' : ''}{pos.unrealized_pnl_pct?.toFixed(2)}%
                 </span>
+                <span style={{ fontSize: '.68rem', color: 'var(--accent)' }}>{traderName(pos.agent_id)}</span>
                 <span className="text-gray-300" style={{ fontSize: '.72rem' }}>{agentName(pos.agent_id)}</span>
                 <span style={{ display: 'flex', justifyContent: 'center' }}>
                   <button
@@ -263,6 +288,7 @@ export function HistoryPage() {
               </div>
             ))}
           </div>
+          )}
         </div>
       )}
 
@@ -305,7 +331,7 @@ export function HistoryPage() {
             {view === 'closed' && closed.length > 0 && (
               <span style={{ marginLeft: 'auto', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
                 <span className={totalNetPnl >= 0 ? 'positive' : 'negative'} style={{ fontWeight: 700 }}>
-                  Net: {totalNetPnl >= 0 ? '+' : ''}${totalNetPnl.toFixed(2)}
+                  Net: {formatPnl(totalNetPnl)}
                 </span>
                 {' · '}
                 <span className="positive">{wins.length}W</span>
@@ -319,45 +345,49 @@ export function HistoryPage() {
             closed.length === 0 ? (
               <p className="text-gray-400">No closed trades yet. Trades appear here once a sell closes a buy position.</p>
             ) : (
-              <div className="trades-table">
-                <div className="trades-header" style={{ gridTemplateColumns: '0.6fr 0.9fr 0.6fr 0.9fr 0.9fr 0.9fr 0.7fr 0.9fr 0.7fr 0.6fr' }}>
-                  <span>Result</span><span>Symbol</span><span>Qty</span>
-                  <span>Entry</span><span>Exit</span><span>Net P&L</span>
-                  <span>P&L %</span><span>Closed</span><span>Agent</span><span>Fees</span>
-                </div>
-                {closed.map((t: any, i: number) => (
-                  <div
-                    key={`${t.symbol}-${t.exit_time}-${i}`}
-                    className="trades-row"
-                    style={{
-                      gridTemplateColumns: '0.6fr 0.9fr 0.6fr 0.9fr 0.9fr 0.9fr 0.7fr 0.9fr 0.7fr 0.6fr',
-                      borderLeft: `3px solid ${t.result === 'win' ? 'var(--green)' : t.result === 'loss' ? 'var(--red)' : 'var(--text-secondary)'}`,
-                    }}
-                  >
-                    <span style={{
-                      fontWeight: 700,
-                      fontSize: '0.75rem',
-                      color: t.result === 'win' ? 'var(--green)' : t.result === 'loss' ? 'var(--red)' : 'var(--text-secondary)',
-                      textTransform: 'uppercase',
-                    }}>
-                      {t.result === 'win' ? '✓ WIN' : t.result === 'loss' ? '✗ LOSS' : '— EVEN'}
-                    </span>
-                    <span style={{ fontWeight: 600 }}>{t.symbol}</span>
-                    <span>{t.quantity}</span>
-                    <span style={{ fontFamily: 'var(--mono)', fontSize: '0.78rem' }}>${formatPrice(t.entry_price)}</span>
-                    <span style={{ fontFamily: 'var(--mono)', fontSize: '0.78rem' }}>${formatPrice(t.exit_price)}</span>
-                    <span className={t.net_pnl >= 0 ? 'positive' : 'negative'} style={{ fontWeight: 700 }}>
-                      {t.net_pnl >= 0 ? '+' : ''}${t.net_pnl?.toFixed(2)}
-                    </span>
-                    <span className={t.pnl_pct >= 0 ? 'positive' : 'negative'}>
-                      {t.pnl_pct >= 0 ? '+' : ''}{t.pnl_pct?.toFixed(2)}%
-                    </span>
-                    <span title={t.exit_time ? new Date(t.exit_time).toLocaleString() : ''}>{t.exit_time ? timeAgo(t.exit_time) : '-'}</span>
-                    <span className="text-gray-300">{agentName(t.agent_id)}</span>
-                    <span className="text-gray-400" style={{ fontSize: '0.72rem' }}>${t.fee?.toFixed(4)}</span>
+              <>
+                <div className="trades-table">
+                  <div className="trades-header" style={{ gridTemplateColumns: '0.6fr 0.9fr 0.6fr 0.9fr 0.9fr 0.9fr 0.7fr 0.9fr 0.7fr 0.7fr 0.6fr' }}>
+                    <span>Result</span><span>Symbol</span><span>Qty</span>
+                    <span>Entry</span><span>Exit</span><span>Net P&L</span>
+                    <span>P&L %</span><span>Closed</span><span>Trader</span><span>Strategy</span><span>Fees</span>
                   </div>
-                ))}
-              </div>
+                  {closedPager.pageItems.map((t: any, i: number) => (
+                    <div
+                      key={`${t.symbol}-${t.exit_time}-${i}`}
+                      className="trades-row"
+                      style={{
+                        gridTemplateColumns: '0.6fr 0.9fr 0.6fr 0.9fr 0.9fr 0.9fr 0.7fr 0.9fr 0.7fr 0.7fr 0.6fr',
+                        borderLeft: `3px solid ${t.result === 'win' ? 'var(--green)' : t.result === 'loss' ? 'var(--red)' : 'var(--text-secondary)'}`,
+                      }}
+                    >
+                      <span style={{
+                        fontWeight: 700,
+                        fontSize: '0.75rem',
+                        color: t.result === 'win' ? 'var(--green)' : t.result === 'loss' ? 'var(--red)' : 'var(--text-secondary)',
+                        textTransform: 'uppercase',
+                      }}>
+                        {t.result === 'win' ? '✓ WIN' : t.result === 'loss' ? '✗ LOSS' : '— EVEN'}
+                      </span>
+                      <span style={{ fontWeight: 600 }}>{t.symbol}</span>
+                      <span>{t.quantity}</span>
+                      <span style={{ fontFamily: 'var(--mono)', fontSize: '0.78rem' }}>${formatPrice(t.entry_price)}</span>
+                      <span style={{ fontFamily: 'var(--mono)', fontSize: '0.78rem' }}>${formatPrice(t.exit_price)}</span>
+                      <span className={t.net_pnl >= 0 ? 'positive' : 'negative'} style={{ fontWeight: 700 }}>
+                        {formatPnl(t.net_pnl)}
+                      </span>
+                      <span className={t.pnl_pct >= 0 ? 'positive' : 'negative'}>
+                        {formatPnlPct(t.pnl_pct)}
+                      </span>
+                      <span title={t.exit_time ? new Date(t.exit_time).toLocaleString() : ''}>{t.exit_time ? timeAgo(t.exit_time) : '-'}</span>
+                      <span style={{ fontSize: '.68rem', color: 'var(--accent)' }}>{traderName(t.agent_id)}</span>
+                      <span className="text-gray-300">{agentName(t.agent_id)}</span>
+                      <span className="text-gray-400" style={{ fontSize: '0.72rem' }}>${formatPrice(t.fee)}</span>
+                    </div>
+                  ))}
+                </div>
+                <Paginator page={closedPager.page} totalPages={closedPager.totalPages} total={closedPager.total} pageSize={10} onPage={closedPager.setPage} label="trades" />
+              </>
             )
           ) : (
             /* Order Log (existing trades table) */
@@ -365,12 +395,50 @@ export function HistoryPage() {
               <p className="text-gray-400">No {tab} orders yet.</p>
             ) : (
               <div className="trades-table">
+                <div className="trades-header" style={{ gridTemplateColumns: 'repeat(11, 1fr)' }}>
+                  <span>Time</span><span>Symbol</span><span>Side</span><span>Qty</span>
+                  <span>Price</span><span>Total</span><span>Fee</span>
+                  <span>Trader</span><span>Strategy</span><span>Type</span><span>Status</span>
+                </div>
+                {ordersPager.pageItems.map((trade: any) => (
+                  <div key={trade.id} className="trades-row" style={{ gridTemplateColumns: 'repeat(11, 1fr)' }}>
+                    <span title={new Date(trade.created_at).toLocaleString()}>{timeAgo(trade.created_at)}</span>
+                    <span>{trade.symbol}</span>
+                    <span className={trade.side === 'buy' ? 'positive' : 'negative'}>{trade.side?.toUpperCase()}</span>
+                    <span>{trade.quantity}</span>
+                    <span>${formatPrice(trade.price)}</span>
+                    <span>${trade.total?.toFixed(2)}</span>
+                    <span className="text-gray-400">${trade.fee?.toFixed(4) || '0.0000'}</span>
+                    <span style={{ fontSize: '.68rem', color: 'var(--accent)' }}>{traderName(trade.agent_id)}</span>
+                    <span className="text-gray-300">{agentName(trade.agent_id)}</span>
+                    <span className="strategy-tag" style={{ fontSize: '0.7rem' }}>{agentStrategy(trade.agent_id)}</span>
+                    <span className={`status-${trade.status}`}>{trade.status}</span>
+                  </div>
+                ))}
+              </div>
+            )
+          )}
+          {view === 'orders' && activeTrades.length > 0 && (
+            <Paginator page={ordersPager.page} totalPages={ordersPager.totalPages} total={ordersPager.total} pageSize={10} onPage={ordersPager.setPage} label="orders" />
+          )}
+        </div>
+      )}
+
+      {/* Live trades tab */}
+      {tab === 'live' && (
+        <div className="card">
+          <h2 className="card-title">Live Trades</h2>
+          {activeTrades.length === 0 ? (
+            <p className="text-gray-400">No live trades yet.</p>
+          ) : (
+            <>
+              <div className="trades-table">
                 <div className="trades-header" style={{ gridTemplateColumns: 'repeat(10, 1fr)' }}>
                   <span>Time</span><span>Symbol</span><span>Side</span><span>Qty</span>
                   <span>Price</span><span>Total</span><span>Fee</span>
-                  <span>Agent</span><span>Strategy</span><span>Status</span>
+                  <span>Strategy</span><span>Type</span><span>Status</span>
                 </div>
-                {activeTrades.map((trade: any) => (
+                {ordersPager.pageItems.map((trade: any) => (
                   <div key={trade.id} className="trades-row" style={{ gridTemplateColumns: 'repeat(10, 1fr)' }}>
                     <span title={new Date(trade.created_at).toLocaleString()}>{timeAgo(trade.created_at)}</span>
                     <span>{trade.symbol}</span>
@@ -385,39 +453,8 @@ export function HistoryPage() {
                   </div>
                 ))}
               </div>
-            )
-          )}
-        </div>
-      )}
-
-      {/* Live trades tab — unchanged */}
-      {tab === 'live' && (
-        <div className="card">
-          <h2 className="card-title">Live Trades</h2>
-          {activeTrades.length === 0 ? (
-            <p className="text-gray-400">No live trades yet.</p>
-          ) : (
-            <div className="trades-table">
-              <div className="trades-header" style={{ gridTemplateColumns: 'repeat(10, 1fr)' }}>
-                <span>Time</span><span>Symbol</span><span>Side</span><span>Qty</span>
-                <span>Price</span><span>Total</span><span>Fee</span>
-                <span>Agent</span><span>Strategy</span><span>Status</span>
-              </div>
-              {activeTrades.map((trade: any) => (
-                <div key={trade.id} className="trades-row" style={{ gridTemplateColumns: 'repeat(10, 1fr)' }}>
-                  <span title={new Date(trade.created_at).toLocaleString()}>{timeAgo(trade.created_at)}</span>
-                  <span>{trade.symbol}</span>
-                  <span className={trade.side === 'buy' ? 'positive' : 'negative'}>{trade.side?.toUpperCase()}</span>
-                  <span>{trade.quantity}</span>
-                  <span>${formatPrice(trade.price)}</span>
-                  <span>${trade.total?.toFixed(2)}</span>
-                  <span className="text-gray-400">${trade.fee?.toFixed(4) || '0.0000'}</span>
-                  <span className="text-gray-300">{agentName(trade.agent_id)}</span>
-                  <span className="strategy-tag" style={{ fontSize: '0.7rem' }}>{agentStrategy(trade.agent_id)}</span>
-                  <span className={`status-${trade.status}`}>{trade.status}</span>
-                </div>
-              ))}
-            </div>
+              <Paginator page={ordersPager.page} totalPages={ordersPager.totalPages} total={ordersPager.total} pageSize={10} onPage={ordersPager.setPage} label="trades" />
+            </>
           )}
         </div>
       )}

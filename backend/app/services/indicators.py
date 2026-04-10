@@ -153,6 +153,10 @@ class IndicatorService:
             signals = self._breakout_signals(
                 rsi, price, bb_lower, bb_upper, sma_20, sma_50, atr, macd, macd_signal_val
             )
+        elif strategy == "grid":
+            signals = self._grid_signals(
+                rsi, price, bb_lower, bb_upper, bb_middle, sma_20, atr
+            )
         else:
             signals = self._default_signals(
                 rsi, price, bb_lower, bb_upper, sma_20, sma_50, macd, macd_signal_val
@@ -206,6 +210,12 @@ class IndicatorService:
             elif strategy == "mean_reversion" and regime in ("trending_up", "trending_down"):
                 confidence *= 0.7
                 adjustments.append(f"reduced confidence (trending market vs mean_reversion)")
+            elif strategy == "grid" and regime in ("ranging",):
+                confidence = min(confidence * 1.2, 1.0)
+                adjustments.append("boosted confidence (grid strategy thrives in ranging market)")
+            elif strategy == "grid" and regime in ("trending_up", "trending_down"):
+                confidence *= 0.6
+                adjustments.append("reduced confidence (grid strategy in trending market — caution)")
             elif strategy in ("momentum",) and regime in ("trending_up",) and final_signal == Signal.BUY:
                 confidence = min(confidence * 1.15, 1.0)
                 adjustments.append("boosted confidence (momentum + trending_up + buy)")
@@ -347,6 +357,54 @@ class IndicatorService:
                 signals.append((Signal.BUY, 0.2, "MACD positive and above signal"))
             elif macd < macd_signal_val and macd < 0:
                 signals.append((Signal.SELL, 0.2, "MACD negative and below signal"))
+
+        return signals
+
+    def _grid_signals(self, rsi, price, bb_lower, bb_upper, bb_middle, sma_20, atr):
+        """Grid trading: buy at lower grid lines, sell at upper grid lines.
+
+        Divides the Bollinger Band range into a grid. Generates BUY signals
+        near the lower third of the range and SELL signals near the upper third.
+        Strongest signals at the band extremes. Designed for ranging markets —
+        the scheduler automatically reduces confidence in trending regimes.
+        """
+        signals = []
+
+        if bb_lower and bb_upper and bb_middle:
+            bb_range = bb_upper - bb_lower
+            if bb_range > 0:
+                # Position within the band: 0 = at lower band, 1 = at upper band
+                pos = (price - bb_lower) / bb_range
+
+                # Lower grid zone: buy when price dips below midpoint
+                if pos <= 0.20:
+                    signals.append((Signal.BUY, 0.55, f"Grid: price at bottom of range ({pos:.0%}) — buy level"))
+                elif pos <= 0.35:
+                    signals.append((Signal.BUY, 0.40, f"Grid: price in lower zone ({pos:.0%}) — buy level"))
+                # Upper grid zone: sell when price rises above midpoint
+                elif pos >= 0.80:
+                    signals.append((Signal.SELL, 0.55, f"Grid: price at top of range ({pos:.0%}) — sell level"))
+                elif pos >= 0.65:
+                    signals.append((Signal.SELL, 0.40, f"Grid: price in upper zone ({pos:.0%}) — sell level"))
+                # Near midpoint: hold — wait for clearer grid level
+                else:
+                    signals.append((Signal.HOLD, 0.0, f"Grid: price near midpoint ({pos:.0%}) — waiting for grid level"))
+
+        # RSI confirmation — grid buys need RSI not overbought, sells not oversold
+        if rsi is not None:
+            has_buy = any(s[0] == Signal.BUY for s in signals)
+            has_sell = any(s[0] == Signal.SELL for s in signals)
+            if has_buy and rsi < 45:
+                signals.append((Signal.BUY, 0.20, f"RSI confirms grid buy ({rsi:.1f} — not overbought)"))
+            elif has_sell and rsi > 55:
+                signals.append((Signal.SELL, 0.20, f"RSI confirms grid sell ({rsi:.1f} — not oversold)"))
+
+        # ATR range filter: only trade when market is not too volatile (grid needs tight range)
+        if atr and bb_upper and bb_lower:
+            bb_range = bb_upper - bb_lower
+            # If ATR > 60% of BB range the market is too volatile for grid
+            if atr > bb_range * 0.6:
+                signals = [(s, w * 0.5, r + " [ATR high — volatility caution]") for s, w, r in signals]
 
         return signals
 

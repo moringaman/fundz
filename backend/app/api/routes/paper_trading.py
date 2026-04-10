@@ -5,6 +5,8 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
+from datetime import datetime, timezone
+from collections import defaultdict
 
 from app.database import get_db
 from app.services.paper_trading import paper_trading
@@ -285,3 +287,72 @@ async def close_position(position_id: str):
     if result is None:
         raise HTTPException(status_code=404, detail="Position not found")
     return result
+
+
+@router.get("/performance-chart")
+async def get_performance_chart(limit: int = 2000):
+    """Return daily-aggregated performance metrics for charting.
+
+    Each entry covers one calendar day and includes cumulative P&L,
+    rolling win rate, trade count, average win, and average loss.
+    """
+    trades = await paper_trading.get_closed_trades(limit=limit)
+
+    # Sort ascending by exit time
+    def _exit_ts(t: dict) -> str:
+        return t.get("exit_time") or ""
+
+    trades_sorted = sorted(
+        [t for t in trades if t.get("exit_time")],
+        key=_exit_ts,
+    )
+
+    if not trades_sorted:
+        return []
+
+    # Group trades by UTC date
+    by_day: dict[str, list[dict]] = defaultdict(list)
+    for t in trades_sorted:
+        try:
+            dt = datetime.fromisoformat(t["exit_time"].replace("Z", "+00:00"))
+            day_key = dt.strftime("%Y-%m-%d")
+        except (ValueError, AttributeError):
+            continue
+        by_day[day_key].append(t)
+
+    rows = []
+    cum_pnl = 0.0
+    total_wins = 0
+    total_losses = 0
+    sum_win_pnl = 0.0
+    sum_loss_pnl = 0.0  # stored as negative values
+
+    for day in sorted(by_day.keys()):
+        day_trades = by_day[day]
+        day_pnl = sum(t.get("net_pnl", 0) for t in day_trades)
+        cum_pnl += day_pnl
+
+        for t in day_trades:
+            pnl = t.get("net_pnl", 0)
+            if pnl > 0:
+                total_wins += 1
+                sum_win_pnl += pnl
+            elif pnl < 0:
+                total_losses += 1
+                sum_loss_pnl += pnl  # negative
+
+        total_trades = total_wins + total_losses
+        win_rate = (total_wins / total_trades * 100) if total_trades else 0
+        avg_win = (sum_win_pnl / total_wins) if total_wins else 0
+        avg_loss = (sum_loss_pnl / total_losses) if total_losses else 0  # negative
+
+        rows.append({
+            "date": day,
+            "cumulative_pnl": round(cum_pnl, 2),
+            "win_rate": round(win_rate, 1),
+            "daily_trades": len(day_trades),
+            "avg_win": round(avg_win, 2),
+            "avg_loss": round(avg_loss, 2),
+        })
+
+    return rows

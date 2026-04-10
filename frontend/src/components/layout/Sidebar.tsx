@@ -1,9 +1,10 @@
-import { Activity, Bot, Wallet, Settings, X, TrendingUp, History, Zap, Users, MessageCircle } from 'lucide-react';
+import { Activity, Bot, Wallet, Settings, X, TrendingUp, History, Zap, Users, MessageCircle, BarChart2 } from 'lucide-react';
 import { useAppSelector, useAppDispatch } from '../../store/hooks';
 import { setSidebarOpen } from '../../store/slices/uiSlice';
 import { useAutomationStatus, useAgents, usePaperOrders, useTradeHistory, useFundTeamStatus } from '../../hooks/useQueries';
 import { NavBadge } from '../common/NavBadge';
 import { SidebarTicker } from '../common/SidebarTicker';
+import { SidebarTeamFeed } from '../common/SidebarTeamFeed';
 
 interface SidebarProps {
   activePage: string;
@@ -85,7 +86,7 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
           {/* Agents */}
           <button type="button" onClick={() => navigate('agents')} className={`nav-item ${activePage === 'agents' ? 'active' : ''}`}>
             <Bot size={16} />
-            <span>Agents</span>
+            <span>Strategies</span>
             {enabledAgentCount > 0
               ? <NavBadge variant="green">{enabledAgentCount} ON</NavBadge>
               : <NavBadge>0 ON</NavBadge>
@@ -122,6 +123,12 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
             )}
           </button>
 
+          {/* Traders */}
+          <button type="button" onClick={() => navigate('traders')} className={`nav-item ${activePage === 'traders' ? 'active' : ''}`}>
+            <BarChart2 size={16} />
+            <span>Traders</span>
+          </button>
+
           {/* Firm Advisor */}
           <button type="button" onClick={() => navigate('advisor')} className={`nav-item ${activePage === 'advisor' ? 'active' : ''}`}>
             <MessageCircle size={16} />
@@ -140,6 +147,8 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
             <span>Settings</span>
           </button>
         </nav>
+
+        <SidebarTeamFeed onNavigate={navigate} />
 
         <SidebarTicker />
       </aside>

@@ -216,11 +216,13 @@ class DailyReportService:
         try:
             from app.services.agent_scheduler import agent_scheduler
             metrics = agent_scheduler._agent_metrics
+            # Build name map from registered agents
+            name_map = {a_id: cfg.get("name", a_id) for a_id, cfg in agent_scheduler._enabled_agents.items()}
             agents_list = []
             for agent_id, m in metrics.items():
                 agents_list.append({
                     "agent_id": agent_id,
-                    "name": getattr(m, "agent_id", agent_id),
+                    "name": name_map.get(agent_id, agent_id),
                     "total_pnl": m.total_pnl,
                     "win_rate": m.win_rate,
                     "total_runs": m.total_runs,

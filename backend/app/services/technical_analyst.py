@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime
 from dataclasses import dataclass
 import pandas as pd
@@ -7,8 +7,30 @@ import logging
 from app.clients.phemex import PhemexClient
 from app.config import settings
 from app.services.indicators import IndicatorService
+from app.utils import fmt_price
 
 logger = logging.getLogger(__name__)
+
+# Maps each primary timeframe to (primary, mid, high) analysis frames.
+# Phemex interval strings: 1m 3m 5m 15m 30m 1h 2h 3h 4h 6h 12h 1d 3d 1w 1M
+_TF_LADDER: Dict[str, Tuple[str, str, str]] = {
+    "1m":  ("1m",  "5m",  "15m"),
+    "3m":  ("3m",  "15m", "1h"),
+    "5m":  ("5m",  "15m", "1h"),
+    "15m": ("15m", "1h",  "4h"),
+    "30m": ("30m", "1h",  "4h"),
+    "1h":  ("1h",  "4h",  "1d"),
+    "2h":  ("2h",  "4h",  "1d"),
+    "3h":  ("3h",  "4h",  "1d"),
+    "4h":  ("4h",  "1d",  "1w"),
+    "6h":  ("6h",  "1d",  "1w"),
+    "12h": ("12h", "1d",  "1w"),
+    "1d":  ("1d",  "1w",  "1M"),
+    "3d":  ("3d",  "1w",  "1M"),
+    "1w":  ("1w",  "1M",  "1M"),
+    "1M":  ("1M",  "1M",  "1M"),
+}
+_DEFAULT_LADDER = _TF_LADDER["1h"]
 
 
 @dataclass
@@ -43,6 +65,10 @@ class MultiTimeframeAnalysis:
     trend_confirmation: bool
     confluence_score: float
     trade_setup: Optional[PatternSignal]
+    # Actual timeframe labels used for primary/mid/high tiers
+    tf_primary: str = "1h"
+    tf_mid: str = "4h"
+    tf_high: str = "1d"
 
 
 @dataclass
@@ -67,26 +93,32 @@ class TechnicalAnalyst:
             testnet=settings.phemex_testnet
         )
     
-    async def analyze(self, symbol: str = "BTCUSDT") -> TechnicalAnalystReport:
+    async def analyze(self, symbol: str = "BTCUSDT", timeframe: str = "1h") -> TechnicalAnalystReport:
         try:
-            klines_1h = await self.phemex.get_klines(symbol, "1h", 200)
-            klines_4h = await self.phemex.get_klines(symbol, "4h", 200)
-            klines_1d = await self.phemex.get_klines(symbol, "1d", 100)
+            tf_primary, tf_mid, tf_high = _TF_LADDER.get(timeframe, _DEFAULT_LADDER)
+            # Use enough candles for reliable indicators; higher frames need fewer
+            bars_primary = 200
+            bars_mid = 200
+            bars_high = 100
 
-            data_1h = self._parse_klines(klines_1h)
-            data_4h = self._parse_klines(klines_4h)
-            data_1d = self._parse_klines(klines_1d)
+            klines_primary = await self.phemex.get_klines(symbol, tf_primary, bars_primary)
+            klines_mid     = await self.phemex.get_klines(symbol, tf_mid,     bars_mid)
+            klines_high    = await self.phemex.get_klines(symbol, tf_high,    bars_high)
 
-            if data_1h is None or (isinstance(data_1h, pd.DataFrame) and data_1h.empty) or (not isinstance(data_1h, pd.DataFrame) and not data_1h):
+            data_primary = self._parse_klines(klines_primary)
+            data_mid     = self._parse_klines(klines_mid)
+            data_high    = self._parse_klines(klines_high)
+
+            if data_primary is None or (isinstance(data_primary, pd.DataFrame) and data_primary.empty) or (not isinstance(data_primary, pd.DataFrame) and not data_primary):
                 return self._empty_report(symbol)
-            if len(data_1h) < 50:
+            if len(data_primary) < 50:
                 return self._empty_report(symbol)
 
-            current_price = data_1h['close'].iloc[-1]
+            current_price = data_primary['close'].iloc[-1]
 
-            price_levels = self._calculate_price_levels(data_1h)
-            patterns = self._identify_patterns(data_1h, current_price)
-            multi_tf = self._analyze_multitimeframe(data_1h, data_4h, data_1d, current_price, symbol)
+            price_levels = self._calculate_price_levels(data_primary)
+            patterns = self._identify_patterns(data_primary, current_price)
+            multi_tf = self._analyze_multitimeframe(data_primary, data_mid, data_high, current_price, symbol, tf_primary, tf_mid, tf_high)
 
             signal, confidence = self._generate_overall_signal(
                 patterns, multi_tf, price_levels, current_price
@@ -283,7 +315,10 @@ class TechnicalAnalyst:
         df_4h: pd.DataFrame, 
         df_1d: pd.DataFrame,
         current_price: float,
-        symbol: str = "BTCUSDT"
+        symbol: str = "BTCUSDT",
+        tf_primary: str = "1h",
+        tf_mid: str = "4h",
+        tf_high: str = "1d",
     ) -> Optional[MultiTimeframeAnalysis]:
         if df_4h.empty or df_1d.empty:
             return None
@@ -328,7 +363,10 @@ class TechnicalAnalyst:
             alignment=alignment,
             trend_confirmation=confirmation,
             confluence_score=confidence,
-            trade_setup=None
+            trade_setup=None,
+            tf_primary=tf_primary,
+            tf_mid=tf_mid,
+            tf_high=tf_high,
         )
 
     def _generate_overall_signal(
@@ -367,17 +405,17 @@ class TechnicalAnalyst:
         if levels.support:
             nearest_support = min(levels.support, key=lambda x: abs(x - current_price))
             dist_pct = ((current_price - nearest_support) / current_price) * 100
-            obs.append(f"Nearest support: ${nearest_support:,.0f} ({dist_pct:.1f}% below)")
+            obs.append(f"Nearest support: {fmt_price(nearest_support)} ({dist_pct:.1f}% below)")
 
         if levels.resistance:
             nearest_res = min(levels.resistance, key=lambda x: abs(x - current_price))
             dist_pct = ((nearest_res - current_price) / current_price) * 100
-            obs.append(f"Nearest resistance: ${nearest_res:,.0f} ({dist_pct:.1f}% above)")
+            obs.append(f"Nearest resistance: {fmt_price(nearest_res)} ({dist_pct:.1f}% above)")
 
         if levels.fibonacci_retracements:
             fib_618 = levels.fibonacci_retracements.get("62%")
             if fib_618:
-                obs.append(f"61.8% Fibonacci retracement: ${fib_618:,.0f}")
+                obs.append(f"61.8% Fibonacci retracement: {fmt_price(fib_618)}")
 
         if patterns:
             best = max(patterns, key=lambda p: p.confidence)
@@ -407,19 +445,22 @@ class TechnicalAnalyst:
             key_observations=[]
         )
 
-    async def get_confluence_scores(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+    async def get_confluence_scores(self, symbols: List[str], timeframe: str = "1h") -> Dict[str, Dict[str, Any]]:
         """
         For each symbol, compute a confluence score combining:
         - Multi-timeframe alignment (bullish/bearish/mixed)
         - Pattern count and average confidence
         - Overall signal strength
 
+        Uses the three analysis frames derived from *timeframe* so scores are
+        relevant to the strategies that will consume them.
+
         Returns: {symbol: {score: float, signal: str, patterns: int, alignment: str, details: str}}
         """
         results = {}
         for symbol in symbols:
             try:
-                report = await self.analyze(symbol)
+                report = await self.analyze(symbol, timeframe=timeframe)
 
                 # Base: multi-timeframe confluence (0-1)
                 mtf_score = 0.4
