@@ -10,6 +10,10 @@ from app.config import settings
 from app.api.routes import market, trading, agents, backtest, paper_trading, automation, llm, fund
 from app.api.routes import settings as settings_routes
 from app.api.routes import traders as traders_routes
+from app.api.routes import whale as whale_routes
+from app.api.routes import grid as grid_routes
+from app.api.routes import live_trading as live_trading_routes
+from app.api.routes import strategies as strategies_routes
 
 # Configure root logger so app.* loggers are visible
 logging.basicConfig(
@@ -17,11 +21,39 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-# Silence noisy SQLAlchemy echo (engine echo=True uses this logger)
+
+# ── Noise reduction ───────────────────────────────────────────────────────────
+# Only show WARNING+ for high-volume modules that produce per-cycle INFO spam.
+# Errors, circuit breaker events, trade executions and blocks all use WARNING
+# or higher so they remain visible.
+
+# SQLAlchemy — suppress per-query echo
 logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
 logging.getLogger("sqlalchemy.engine.Engine").setLevel(logging.WARNING)
-# Suppress uvicorn access log — 200s are noise; errors logged by middleware below
+
+# uvicorn — suppress 200 OK access lines; errors surface naturally
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
+
+# httpx / httpcore — suppress connection pool chatter
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+# Agent scheduler — fires every 5 min per agent; per-cycle INFO is noise.
+# WARNING+ covers: trade blocked, circuit breaker, gate blocks, errors.
+logging.getLogger("app.services.agent_scheduler").setLevel(logging.WARNING)
+
+# Team chat — persists every message to DB; INFO confirmation is noise
+logging.getLogger("app.services.team_chat").setLevel(logging.WARNING)
+
+# Whale intelligence — 60s broadcast loop
+logging.getLogger("app.services.whale_intelligence").setLevel(logging.WARNING)
+
+# Position sync — runs continuously in background
+logging.getLogger("app.services.position_sync").setLevel(logging.WARNING)
+
+# Market data broadcast — runs every 5s
+logging.getLogger("app.services.market_data").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +77,10 @@ api_router.include_router(llm.router)
 api_router.include_router(fund.router)
 api_router.include_router(settings_routes.router)
 api_router.include_router(traders_routes.router)
+api_router.include_router(whale_routes.router)
+api_router.include_router(grid_routes.router)
+api_router.include_router(live_trading_routes.router)
+api_router.include_router(strategies_routes.router)
 
 
 class ConnectionManager:
@@ -233,6 +269,82 @@ async def _market_broadcast_loop():
                 logger.debug(f"Klines fetch failed for {symbol}: {e}")
 
 
+async def _whale_broadcast_loop():
+    """
+    Background task: every 60 seconds, fetch whale intelligence and broadcast
+    to all connected WS clients. Respects Hyperliquid API rate limits via cache.
+    """
+    from datetime import timezone
+    from app.services.whale_intelligence import whale_intelligence
+    from app.services.team_chat import team_chat
+    from app.database import get_async_session
+
+    previous_report = None
+
+    _snapshot_cycle = 0
+
+    while True:
+        await asyncio.sleep(60)
+        if not manager.active_connections:
+            continue
+        try:
+            async with get_async_session() as db:
+                report = await whale_intelligence.fetch_whale_report(db)
+
+            if report is None:
+                continue
+
+            # Alert team chat on significant position changes
+            if previous_report is not None:
+                await whale_intelligence.check_and_alert_significant_moves(
+                    previous_report, report, team_chat
+                )
+            previous_report = report
+
+            await manager.broadcast({
+                "type": "whale_intelligence",
+                "data": {
+                    "timestamp": report.timestamp.isoformat(),
+                    "coin_biases": {
+                        coin: {
+                            "bias": bias.bias,
+                            "long_notional": bias.long_notional,
+                            "short_notional": bias.short_notional,
+                            "net_notional": bias.net_notional,
+                            "whale_count": bias.whale_count,
+                            "avg_leverage": bias.avg_leverage,
+                        }
+                        for coin, bias in report.coin_biases.items()
+                    },
+                    "total_whales_tracked": report.total_whales_tracked,
+                    "total_whales_with_positions": report.total_whales_with_positions,
+                },
+            })
+
+            # Persist snapshots every 10 minutes (not every 60s) to avoid
+            # constant checkpoint pressure — 25 rows * 60s = 1500 rows/hr otherwise.
+            _snapshot_cycle += 1
+            if report.all_positions and _snapshot_cycle >= 10:
+                _snapshot_cycle = 0
+                try:
+                    async with get_async_session() as snap_db:
+                        await whale_intelligence.persist_snapshots(report, snap_db)
+                        # Prune snapshots older than 7 days to keep the table lean
+                        from sqlalchemy import text as _text
+                        from datetime import timedelta
+                        cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+                        await snap_db.execute(
+                            _text("DELETE FROM whale_snapshots WHERE captured_at < :cutoff"),
+                            {"cutoff": cutoff},
+                        )
+                        await snap_db.commit()
+                except Exception as e:
+                    logger.debug(f"Whale snapshot persist/prune failed: {e}")
+
+        except Exception as e:
+            logger.debug(f"Whale broadcast failed: {e}")
+
+
 @api_router.websocket("/ws/market")
 async def websocket_market(websocket: WebSocket):
     await manager.connect(websocket)
@@ -277,54 +389,80 @@ async def websocket_market(websocket: WebSocket):
 async def lifespan(app: FastAPI):
     from app.database import engine, Base
     from app.models import AgentRunRecord, AgentMetricRecord, TeamChatMessageRecord, DailyReport, Trader  # noqa: F401
+    from app.models import GridState, GridLevel  # noqa: F401 — ensure grid tables are created
 
+    # ── Step 1: create all tables ────────────────────────────────────────────
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # Add SL/TP columns to positions table if missing (safe migration)
-        await conn.execute(text(
-            "ALTER TABLE positions ADD COLUMN stop_loss_price FLOAT"
-        )) if not await _column_exists(conn, "positions", "stop_loss_price") else None
-        await conn.execute(text(
-            "ALTER TABLE positions ADD COLUMN take_profit_price FLOAT"
-        )) if not await _column_exists(conn, "positions", "take_profit_price") else None
-        # Add trailing stop columns to positions table if missing
-        await conn.execute(text(
-            "ALTER TABLE positions ADD COLUMN highest_price FLOAT"
-        )) if not await _column_exists(conn, "positions", "highest_price") else None
-        await conn.execute(text(
-            "ALTER TABLE positions ADD COLUMN trailing_stop_pct FLOAT"
-        )) if not await _column_exists(conn, "positions", "trailing_stop_pct") else None
 
-        # Add is_paper column to trades and positions (defaults all existing to paper=true)
-        if not await _column_exists(conn, "trades", "is_paper"):
-            await conn.execute(text(
-                "ALTER TABLE trades ADD COLUMN is_paper BOOLEAN DEFAULT TRUE"
-            ))
-            await conn.execute(text("UPDATE trades SET is_paper = TRUE WHERE is_paper IS NULL"))
-        if not await _column_exists(conn, "positions", "is_paper"):
-            await conn.execute(text(
-                "ALTER TABLE positions ADD COLUMN is_paper BOOLEAN DEFAULT TRUE"
-            ))
-            await conn.execute(text("UPDATE positions SET is_paper = TRUE WHERE is_paper IS NULL"))
-
-        # Add unique constraint for per-agent position isolation (safe: ignore if exists)
+    # ── Step 2: incremental column migrations — each in its own transaction ──
+    # PostgreSQL aborts the ENTIRE transaction on any failed statement, so we
+    # must use separate transactions for each DDL that might already exist.
+    _migrations = [
+        ("positions", "stop_loss_price",   "ALTER TABLE positions ADD COLUMN stop_loss_price FLOAT"),
+        ("positions", "take_profit_price", "ALTER TABLE positions ADD COLUMN take_profit_price FLOAT"),
+        ("positions", "highest_price",     "ALTER TABLE positions ADD COLUMN highest_price FLOAT"),
+        ("positions", "trailing_stop_pct", "ALTER TABLE positions ADD COLUMN trailing_stop_pct FLOAT"),
+        ("positions", "is_paper",          "ALTER TABLE positions ADD COLUMN is_paper BOOLEAN DEFAULT TRUE"),
+        ("positions", "scale_out_levels",  "ALTER TABLE positions ADD COLUMN scale_out_levels TEXT"),
+        ("trades",    "is_paper",          "ALTER TABLE trades ADD COLUMN is_paper BOOLEAN DEFAULT TRUE"),
+        ("agents",    "trader_id",         "ALTER TABLE agents ADD COLUMN trader_id VARCHAR(36)"),
+        ("trades",    "trader_id",         "ALTER TABLE trades ADD COLUMN trader_id VARCHAR(36)"),
+        ("agent_metric_records", "actual_trades",  "ALTER TABLE agent_metric_records ADD COLUMN actual_trades INTEGER DEFAULT 0"),
+        ("agent_metric_records", "winning_trades", "ALTER TABLE agent_metric_records ADD COLUMN winning_trades INTEGER DEFAULT 0"),
+        ("positions", "grid_id",       "ALTER TABLE positions ADD COLUMN grid_id VARCHAR(36)"),
+        ("positions", "grid_level_id", "ALTER TABLE positions ADD COLUMN grid_level_id VARCHAR(36)"),
+        ("positions", "phemex_order_id", "ALTER TABLE positions ADD COLUMN phemex_order_id VARCHAR(100)"),
+        ("agent_metric_records", "is_paper", "ALTER TABLE agent_metric_records ADD COLUMN is_paper BOOLEAN DEFAULT TRUE"),
+    ]
+    for table, column, ddl in _migrations:
         try:
+            async with engine.begin() as conn:
+                exists = await _column_exists(conn, table, column)
+                if not exists:
+                    await conn.execute(text(ddl))
+                    if column == "is_paper":
+                        await conn.execute(text(
+                            f"UPDATE {table} SET is_paper = TRUE WHERE is_paper IS NULL"
+                        ))
+        except Exception as e:
+            logger.warning(f"Migration '{ddl[:60]}' failed (may already exist): {e}")
+
+    # ── Step 3: unique indexes — own transactions, safe to fail ──────────────
+    try:
+        async with engine.begin() as conn:
             await conn.execute(text(
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_position_user_agent_symbol "
                 "ON positions (user_id, agent_id, symbol)"
             ))
-        except Exception:
-            pass  # Index already exists or DB doesn't support IF NOT EXISTS
+    except Exception:
+        pass  # already exists
 
-        # Add trader_id columns to agents and trades (Multi-Trader Architecture)
-        if not await _column_exists(conn, "agents", "trader_id"):
+    try:
+        async with engine.begin() as conn:
+            # Drop old single-column unique constraint, add composite (agent_id, is_paper)
             await conn.execute(text(
-                "ALTER TABLE agents ADD COLUMN trader_id VARCHAR(36)"
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_metric_agent_mode "
+                "ON agent_metric_records (agent_id, is_paper)"
             ))
-        if not await _column_exists(conn, "trades", "trader_id"):
-            await conn.execute(text(
-                "ALTER TABLE trades ADD COLUMN trader_id VARCHAR(36)"
-            ))
+    except Exception:
+        pass  # already exists
+
+    # ── Step 4: seed strategy_overrides with enabled=True for all known types ─
+    try:
+        import app.strategies as strategy_registry
+        from app.database import get_async_session
+        async with get_async_session() as db:
+            from app.models import StrategyOverride
+            from sqlalchemy.dialects.postgresql import insert as pg_insert
+            for stype in strategy_registry.all_types():
+                stmt = pg_insert(StrategyOverride).values(
+                    strategy_type=stype, enabled=True
+                ).on_conflict_do_nothing(index_elements=["strategy_type"])
+                await db.execute(stmt)
+            await db.commit()
+    except Exception as e:
+        logger.warning(f"strategy_overrides seed failed (non-fatal): {e}")
 
     from app.services.llm import llm_service
     try:
@@ -343,13 +481,52 @@ async def lifespan(app: FastAPI):
     from app.services.team_chat import team_chat
     team_chat.set_broadcast(lambda msg: manager.broadcast(msg))
 
+    # Seed default whale watchlist in the background so it never blocks server startup.
+    # The leaderboard fetch (~33K rows) can take a few seconds; we don't want to hold
+    # up request handling while waiting for it.
+    from app.services.whale_intelligence import whale_intelligence as _whale_svc
+    async def _seed_whale_watchlist():
+        from app.database import get_async_session as _get_session
+        try:
+            async with _get_session() as _db:
+                await _whale_svc.seed_default_watchlist(_db)
+        except Exception as e:
+            logger.warning(f"Whale watchlist seeding failed: {e}")
+    asyncio.create_task(_seed_whale_watchlist())
+
     broadcast_task = asyncio.create_task(_market_broadcast_loop())
+    whale_task = asyncio.create_task(_whale_broadcast_loop())
+
+    # Telegram inbound polling — starts only if polling_enabled=True in config.
+    # Zero overhead when disabled; a single idle long-poll connection when enabled.
+    from app.services.telegram_service import telegram_service as _tg_svc
+    telegram_poll_task = asyncio.create_task(_tg_svc.start_polling())
+
+    # Auto-start the trading scheduler so it survives backend restarts without
+    # requiring a manual click in the UI.
+    async def _auto_start_scheduler():
+        from app.services.agent_scheduler import agent_scheduler as _sched
+        try:
+            await _sched.start()
+        except Exception as _e:
+            logger.warning(f"Auto-start scheduler failed: {_e}")
+    asyncio.create_task(_auto_start_scheduler())
 
     yield
 
     broadcast_task.cancel()
+    whale_task.cancel()
+    telegram_poll_task.cancel()
     try:
         await broadcast_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await whale_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await telegram_poll_task
     except asyncio.CancelledError:
         pass
 

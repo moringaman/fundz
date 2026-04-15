@@ -41,6 +41,148 @@ class PriceLevels:
     fibonacci_retracements: Dict[str, float]
     fibonacci_extensions: Dict[str, float]
 
+    # ── Structural-level helpers ──────────────────────────────────────────────
+    def all_levels_above(self, price: float) -> List[float]:
+        """Return all structural levels above *price*, sorted ascending."""
+        levels: List[float] = []
+        levels.extend(r for r in self.resistance if r > price)
+        levels.extend(v for v in self.fibonacci_retracements.values() if v > price)
+        levels.extend(v for v in self.fibonacci_extensions.values() if v > price)
+        for k, v in self.pivot_points.items():
+            if v > price and k.startswith("r"):
+                levels.append(v)
+        return sorted(set(round(l, 8) for l in levels))
+
+    def all_levels_below(self, price: float) -> List[float]:
+        """Return all structural levels below *price*, sorted descending."""
+        levels: List[float] = []
+        levels.extend(s for s in self.support if s < price)
+        levels.extend(v for v in self.fibonacci_retracements.values() if v < price)
+        levels.extend(v for v in self.fibonacci_extensions.values() if v < price)
+        for k, v in self.pivot_points.items():
+            if v < price and k.startswith("s"):
+                levels.append(v)
+        return sorted(set(round(l, 8) for l in levels), reverse=True)
+
+
+def snap_tp_to_structure(
+    candidate_tp: float,
+    price_levels: PriceLevels,
+    current_price: float,
+    is_short: bool,
+    max_adjust_pct: float = 0.25,
+) -> float:
+    """Snap a candidate TP to the nearest structural level.
+
+    For LONGS  → find the nearest resistance/fib BELOW the candidate TP so
+                 TP sits just before a ceiling where sellers congregate.
+    For SHORTS → find the nearest support/fib ABOVE the candidate TP so
+                 TP sits just above a floor where buyers congregate.
+
+    If no structural level is close enough (within *max_adjust_pct* of the
+    original candidate), the candidate is returned unchanged.
+
+    A small 0.15 % margin is subtracted (longs) / added (shorts) so TP
+    triggers just before the level, not right at it.
+    """
+    MARGIN = 0.0015  # 0.15 % shy of the structural level
+
+    if is_short:
+        # TP is BELOW entry for shorts — find support levels above TP
+        # (i.e. between TP and entry) that could stall the decline.
+        levels = price_levels.all_levels_below(current_price)
+        # Levels below price, sorted descending — pick the first one that
+        # is near (but at or above) the candidate, or the first one below.
+        best = None
+        for lvl in levels:
+            if lvl < candidate_tp:
+                continue  # level is farther than candidate — skip
+            if lvl <= current_price:
+                best = lvl
+                break
+        if best is None:
+            # No level between candidate and price — pick closest below entry
+            for lvl in levels:
+                if lvl >= candidate_tp:
+                    best = lvl
+                    break
+        if best and abs(best - candidate_tp) / max(candidate_tp, 1e-10) <= max_adjust_pct:
+            return round(best * (1 + MARGIN), 8)  # just above support
+    else:
+        # TP is ABOVE entry for longs — find resistance levels below TP
+        # that could cap the advance.
+        levels = price_levels.all_levels_above(current_price)
+        best = None
+        for lvl in levels:
+            if lvl > candidate_tp:
+                continue  # level is farther than candidate — skip
+            best = lvl  # last one still below or at candidate
+        if best is None:
+            # No level between entry and candidate — pick closest above entry
+            for lvl in levels:
+                if lvl <= candidate_tp:
+                    best = lvl
+        if best and abs(best - candidate_tp) / max(candidate_tp, 1e-10) <= max_adjust_pct:
+            return round(best * (1 - MARGIN), 8)  # just below resistance
+
+    return candidate_tp
+
+
+def snap_sl_to_structure(
+    candidate_sl: float,
+    price_levels: PriceLevels,
+    current_price: float,
+    is_short: bool,
+    max_widen_pct: float = 0.15,
+) -> float:
+    """Snap a candidate SL past the nearest structural level.
+
+    For LONGS  → SL should sit just BELOW the nearest support beneath
+                 entry, so normal support bounces don't trigger the stop.
+    For SHORTS → SL should sit just ABOVE the nearest resistance above
+                 entry, so normal resistance probes don't trigger the stop.
+
+    Only widens the SL (never tightens it) — if the structural level
+    is farther out than *max_widen_pct* from the candidate, keep the
+    original. A 0.20 % buffer is added past the level.
+    """
+    BUFFER = 0.0020  # 0.20 % past the structural level
+
+    if is_short:
+        # SL is ABOVE entry for shorts — find resistance above entry
+        levels = price_levels.all_levels_above(current_price)
+        best = None
+        for lvl in levels:
+            # Pick the first resistance above current_price
+            if lvl >= candidate_sl:
+                best = lvl
+                break
+        if best is None and levels:
+            best = levels[0]  # closest above
+        if best:
+            ideal = round(best * (1 + BUFFER), 8)  # just above
+            # Only widen (raise) the SL, and only within max_widen_pct
+            if ideal > candidate_sl and (ideal - candidate_sl) / max(candidate_sl, 1e-10) <= max_widen_pct:
+                return ideal
+    else:
+        # SL is BELOW entry for longs — find support below entry
+        levels = price_levels.all_levels_below(current_price)
+        best = None
+        for lvl in levels:
+            # Pick the first support below current_price
+            if lvl <= candidate_sl:
+                best = lvl
+                break
+        if best is None and levels:
+            best = levels[0]  # closest below
+        if best:
+            ideal = round(best * (1 - BUFFER), 8)  # just below
+            # Only widen (lower) the SL, and only within max_widen_pct
+            if ideal < candidate_sl and (candidate_sl - ideal) / max(candidate_sl, 1e-10) <= max_widen_pct:
+                return ideal
+
+    return candidate_sl
+
 
 @dataclass
 class PatternSignal:
@@ -117,7 +259,7 @@ class TechnicalAnalyst:
             current_price = data_primary['close'].iloc[-1]
 
             price_levels = self._calculate_price_levels(data_primary)
-            patterns = self._identify_patterns(data_primary, current_price)
+            patterns = self._identify_patterns(data_primary, current_price, price_levels)
             multi_tf = self._analyze_multitimeframe(data_primary, data_mid, data_high, current_price, symbol, tf_primary, tf_mid, tf_high)
 
             signal, confidence = self._generate_overall_signal(
@@ -127,6 +269,17 @@ class TechnicalAnalyst:
             observations = self._generate_observations(
                 price_levels, patterns, multi_tf, current_price
             )
+
+            # Additive: append Hyperliquid whale observations (graceful degradation)
+            try:
+                from app.services.whale_intelligence import whale_intelligence
+                whale_report = await whale_intelligence.fetch_whale_report()
+                if whale_report is not None:
+                    coin = whale_intelligence.symbol_to_coin(symbol)
+                    bias = whale_report.coin_biases.get(coin)
+                    observations.extend(whale_intelligence.build_ta_observations(symbol, bias))
+            except Exception:
+                pass  # TA continues without whale data
 
             return TechnicalAnalystReport(
                 timestamp=datetime.utcnow(),
@@ -234,7 +387,7 @@ class TechnicalAnalyst:
             "s3": s3
         }
 
-    def _identify_patterns(self, df: pd.DataFrame, current_price: float) -> List[PatternSignal]:
+    def _identify_patterns(self, df: pd.DataFrame, current_price: float, price_levels: Optional[PriceLevels] = None) -> List[PatternSignal]:
         patterns = []
         
         closes = df['close']
@@ -251,60 +404,93 @@ class TechnicalAnalyst:
         bb_middle = bb['middle'].iloc[-1]
         bb_lower = bb['lower'].iloc[-1]
 
+        # Pre-compute nearest structural targets for MACD patterns
+        # so TP1/TP2 sit at real chart levels, not arbitrary % offsets.
+        _levels_above: List[float] = price_levels.all_levels_above(current_price) if price_levels else []
+        _levels_below: List[float] = price_levels.all_levels_below(current_price) if price_levels else []
+
         if rsi < 35 and current_price <= bb_lower:
-            rr = 3.0
+            # Oversold bounce — bullish
+            # SL: just below nearest support (or BB lower × 0.98 fallback)
+            _sl_candidates = [s for s in _levels_below if s < bb_lower]
+            _sl = _sl_candidates[0] * 0.998 if _sl_candidates else bb_lower * 0.98
+            # TP1: nearest resistance above price (or BB middle fallback)
+            _tp1 = _levels_above[0] * 0.9985 if _levels_above else bb_middle
+            # TP2: second resistance or BB upper
+            _tp2 = _levels_above[1] * 0.9985 if len(_levels_above) > 1 else bb_upper
+            _risk = abs(current_price - _sl)
+            rr = abs(_tp1 - current_price) / _risk if _risk > 0 else 3.0
             patterns.append(PatternSignal(
                 pattern_type="oversold_bounce",
                 direction="bullish",
                 confidence=0.75,
                 entry_price=current_price,
-                stop_loss=bb_lower * 0.98,
-                take_profit_1=bb_middle,
-                take_profit_2=bb_upper,
-                risk_reward=rr,
-                reasoning=f"RSI oversold ({rsi:.1f}) + price at lower BB. Classic reversal setup."
+                stop_loss=_sl,
+                take_profit_1=_tp1,
+                take_profit_2=_tp2,
+                risk_reward=round(rr, 2),
+                reasoning=f"RSI oversold ({rsi:.1f}) + price at lower BB. TP targets at structural levels."
             ))
 
         if rsi > 65 and current_price >= bb_upper:
-            rr = 3.0
+            # Overbought reversal — bearish
+            # SL: just above nearest resistance (or BB upper × 1.02 fallback)
+            _sl_candidates = [r for r in _levels_above if r > bb_upper]
+            _sl = _sl_candidates[0] * 1.002 if _sl_candidates else bb_upper * 1.02
+            # TP1: nearest support below price (or BB middle fallback)
+            _tp1 = _levels_below[0] * 1.0015 if _levels_below else bb_middle
+            # TP2: second support or BB lower
+            _tp2 = _levels_below[1] * 1.0015 if len(_levels_below) > 1 else bb_lower
+            _risk = abs(_sl - current_price)
+            rr = abs(current_price - _tp1) / _risk if _risk > 0 else 3.0
             patterns.append(PatternSignal(
                 pattern_type="overbought_reversal",
                 direction="bearish",
                 confidence=0.75,
                 entry_price=current_price,
-                stop_loss=bb_upper * 1.02,
-                take_profit_1=bb_middle,
-                take_profit_2=bb_lower,
-                risk_reward=rr,
-                reasoning=f"RSI overbought ({rsi:.1f}) + price at upper BB. Expect rejection."
+                stop_loss=_sl,
+                take_profit_1=_tp1,
+                take_profit_2=_tp2,
+                risk_reward=round(rr, 2),
+                reasoning=f"RSI overbought ({rsi:.1f}) + price at upper BB. TP targets at structural levels."
             ))
 
         if macd > macd_signal and macd > 0:
-            rr = 2.0
+            # MACD bullish — use nearest resistance for TP, nearest support for SL
+            _sl = _levels_below[0] * 0.998 if _levels_below else current_price * 0.97
+            _tp1 = _levels_above[0] * 0.9985 if _levels_above else current_price * 1.05
+            _tp2 = _levels_above[1] * 0.9985 if len(_levels_above) > 1 else current_price * 1.08
+            _risk = abs(current_price - _sl)
+            rr = abs(_tp1 - current_price) / _risk if _risk > 0 else 2.0
             patterns.append(PatternSignal(
                 pattern_type="macd_bullish_cross",
                 direction="bullish",
                 confidence=0.6,
                 entry_price=current_price,
-                stop_loss=current_price * 0.97,
-                take_profit_1=current_price * 1.05,
-                take_profit_2=current_price * 1.08,
-                risk_reward=rr,
-                reasoning="MACD bullish crossover above zero line."
+                stop_loss=_sl,
+                take_profit_1=_tp1,
+                take_profit_2=_tp2,
+                risk_reward=round(rr, 2),
+                reasoning="MACD bullish crossover above zero line. Targets at structural levels."
             ))
 
         if macd < macd_signal and macd < 0:
-            rr = 2.0
+            # MACD bearish — use nearest support for TP, nearest resistance for SL
+            _sl = _levels_above[0] * 1.002 if _levels_above else current_price * 1.03
+            _tp1 = _levels_below[0] * 1.0015 if _levels_below else current_price * 0.95
+            _tp2 = _levels_below[1] * 1.0015 if len(_levels_below) > 1 else current_price * 0.92
+            _risk = abs(_sl - current_price)
+            rr = abs(current_price - _tp1) / _risk if _risk > 0 else 2.0
             patterns.append(PatternSignal(
                 pattern_type="macd_bearish_cross",
                 direction="bearish",
                 confidence=0.6,
                 entry_price=current_price,
-                stop_loss=current_price * 1.03,
-                take_profit_1=current_price * 0.95,
-                take_profit_2=current_price * 0.92,
-                risk_reward=rr,
-                reasoning="MACD bearish crossover below zero line."
+                stop_loss=_sl,
+                take_profit_1=_tp1,
+                take_profit_2=_tp2,
+                risk_reward=round(rr, 2),
+                reasoning="MACD bearish crossover below zero line. Targets at structural levels."
             ))
 
         return patterns

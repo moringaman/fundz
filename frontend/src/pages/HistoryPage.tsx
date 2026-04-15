@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import {
   useTradeHistory,
   usePaperOrders,
@@ -10,21 +10,29 @@ import {
   useUpdatePositionSlTp,
   useClosePosition,
   useTraders,
+  useTradingMode,
 } from '../hooks/useQueries';
 import { timeAgo } from '../utils/timeAgo';
 import { formatPrice, formatPnl, formatPnlPct } from '../utils/formatPrice';
 import { usePagination, Paginator } from '../components/common/Paginator';
+import { SkeletonStats, SkeletonTable } from '../components/common/Skeleton';
 
 export function HistoryPage() {
+  const { isPaper } = useTradingMode();
   const [tab, setTab] = useState<'paper' | 'live'>('paper');
   const [view, setView] = useState<'closed' | 'orders'>('closed');
+
+  // Auto-switch tab when global trading mode changes
+  useEffect(() => {
+    setTab(isPaper ? 'paper' : 'live');
+  }, [isPaper]);
 
   const { data: trades = [] } = useTradeHistory();
   const { data: pnl } = usePnl();
   const { data: paperTrades = [] } = usePaperOrders();
   const { data: paperPnl } = usePaperPnl();
   const { data: paperPositions = [] } = usePaperPositions();
-  const { data: closedTrades = [] } = useClosedTrades();
+  const { data: closedTrades = [], isPending: closedLoading } = useClosedTrades();
   const { data: agentsData = [] } = useAgents();
   const { data: tradersData = [] } = useTraders();
 
@@ -95,7 +103,7 @@ export function HistoryPage() {
   const winRate = closed.length ? (wins.length / closed.length * 100) : 0;
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6" style={{ margin: '1.75rem'}}>
       <h1 className="page-title" style={{ marginTop: '2rem'}}>Trade History</h1>
 
       <div className="tab-row">
@@ -106,6 +114,14 @@ export function HistoryPage() {
           Live Trades
         </button>
       </div>
+
+      {closedLoading ? (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+          <SkeletonStats count={5} />
+          <SkeletonTable rows={8} cols={8} />
+        </div>
+      ) : (
+      <>
 
       {activePnl && (
         <div className="stats-grid">
@@ -164,16 +180,41 @@ export function HistoryPage() {
               <span>Stop Loss</span><span>Take Profit</span>
               <span>Unrealized P&L</span><span>P&L %</span><span>Trader</span><span>Strategy</span><span></span>
             </div>
-            {positions.map((pos: any) => (
-              <div key={pos.id || pos.symbol} className="trades-row" style={{ gridTemplateColumns: '1fr 0.5fr 0.7fr 0.9fr 0.9fr 1fr 1fr 0.9fr 0.7fr 0.7fr 0.7fr 0.6fr' }}>
-                <span style={{ fontWeight: 600 }}>{pos.symbol}</span>
+            {positions.map((pos: any) => {
+              const danger = pos.sl_danger ?? 'safe';
+              const isCritical = danger === 'critical';
+              const isWarning = danger === 'warning';
+              const rowBg = isCritical
+                ? 'rgba(231,76,60,0.10)'
+                : isWarning
+                ? 'rgba(243,156,18,0.08)'
+                : undefined;
+              const rowBorder = isCritical
+                ? '1px solid rgba(231,76,60,0.45)'
+                : isWarning
+                ? '1px solid rgba(243,156,18,0.3)'
+                : undefined;
+              return (
+              <div key={pos.id || pos.symbol} className="trades-row" style={{ gridTemplateColumns: '1fr 0.5fr 0.7fr 0.9fr 0.9fr 1fr 1fr 0.9fr 0.7fr 0.7fr 0.7fr 0.6fr', background: rowBg, borderRadius: rowBorder ? 6 : undefined, outline: rowBorder }}>
+                <span style={{ fontWeight: 600, display: 'flex', alignItems: 'center', gap: '.3rem' }}>
+                  {isCritical && (
+                    <span title="Stop-out imminent — within 1% of stop loss" style={{
+                      fontSize: '.75rem', animation: 'pulse 1s infinite',
+                    }}>🚨</span>
+                  )}
+                  {isWarning && !isCritical && (
+                    <span title="Approaching stop loss — within 2.5%" style={{ fontSize: '.75rem' }}>⚠️</span>
+                  )}
+                  {pos.symbol}
+                </span>
                 <span className={pos.side === 'buy' ? 'positive' : 'negative'}>{pos.side?.toUpperCase()}</span>
                 <span>{pos.quantity?.toFixed(6)}</span>
                 <span>${formatPrice(pos.entry_price)}</span>
                 <span>${formatPrice(pos.current_price)}</span>
 
                 {/* ── Stop Loss (editable) ── */}
-                <span style={{ display: 'flex', alignItems: 'center', gap: '.25rem' }}>
+                <span style={{ display: 'flex', flexDirection: 'column', gap: '.1rem' }}>
+                  <span style={{ display: 'flex', alignItems: 'center', gap: '.25rem' }}>
                   {editingPos === pos.id ? (
                     <input
                       type="number" step="0.01" value={editSL}
@@ -191,9 +232,34 @@ export function HistoryPage() {
                     <span
                       onClick={() => startEdit(pos)}
                       title="Click to edit SL/TP"
-                      style={{ color: 'var(--red)', fontSize: '.75rem', fontFamily: 'var(--mono)', cursor: 'pointer', borderBottom: '1px dashed var(--red)', paddingBottom: 1 }}
+                      style={{
+                        color: isCritical ? '#ff4d4d' : isWarning ? '#f39c12' : 'var(--red)',
+                        fontSize: '.75rem', fontFamily: 'var(--mono)', cursor: 'pointer',
+                        borderBottom: `1px dashed ${isCritical ? '#ff4d4d' : isWarning ? '#f39c12' : 'var(--red)'}`,
+                        paddingBottom: 1, fontWeight: isCritical ? 700 : undefined,
+                      }}
                     >
                       {pos.stop_loss_price ? `$${formatPrice(pos.stop_loss_price)}` : '— set'}
+                    </span>
+                  )}
+                  </span>
+                  {pos.distance_to_sl_pct != null && editingPos !== pos.id && (
+                    <span style={{
+                      fontSize: '.62rem',
+                      color: isCritical ? '#ff4d4d' : isWarning ? '#f39c12' : 'var(--text-muted)',
+                      fontFamily: 'var(--mono)',
+                    }}>
+                      {pos.distance_to_sl_pct >= 0
+                        ? `${pos.distance_to_sl_pct.toFixed(2)}% away`
+                        : `PAST SL`}
+                    </span>
+                  )}
+                  {pos.sl_below_entry && pos.pnl_at_sl != null && editingPos !== pos.id && (
+                    <span
+                      title="Stop loss is below entry — this position will close at a loss if stopped out"
+                      style={{ fontSize: '.62rem', color: '#ff4d4d', fontFamily: 'var(--mono)' }}
+                    >
+                      loss if hit: ${Math.abs(pos.pnl_at_sl).toFixed(2)}
                     </span>
                   )}
                 </span>
@@ -286,7 +352,8 @@ export function HistoryPage() {
                   </button>
                 </span>
               </div>
-            ))}
+              );
+            })}
           </div>
           )}
         </div>
@@ -457,6 +524,8 @@ export function HistoryPage() {
             </>
           )}
         </div>
+      )}
+      </>
       )}
     </div>
   );

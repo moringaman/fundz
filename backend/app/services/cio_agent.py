@@ -97,7 +97,8 @@ class CIOAgent:
         agent_metrics: List[Dict] = None,
         current_positions: Optional[Dict] = None,
         fund_performance: Optional[Dict] = None,
-        period: str = "daily"
+        period: str = "daily",
+        trade_insights: Optional[Dict] = None,
     ) -> FundHealthReport:
         """
         Generate comprehensive fund health report
@@ -125,7 +126,8 @@ class CIOAgent:
             # Generate strategic recommendations using LLM
             strategic_recs = await self._generate_strategic_recommendations(
                 fund_perf, leaderboard, strategy_perf, risk_metrics,
-                analyst_report, portfolio_decision, agent_metrics
+                analyst_report, portfolio_decision, agent_metrics,
+                trade_insights=trade_insights
             )
 
             # Build executive summary
@@ -274,7 +276,8 @@ class CIOAgent:
         risk_metrics: Dict,
         analyst_report: Optional[Dict],
         portfolio_decision: Optional[Dict],
-        agent_metrics: List[Dict]
+        agent_metrics: List[Dict],
+        trade_insights: Optional[Dict] = None,
     ) -> List[StrategicRecommendation]:
         """Generate LLM-based strategic recommendations"""
         recommendations = []
@@ -283,7 +286,8 @@ class CIOAgent:
             # Build context for LLM
             context = self._build_strategic_context(
                 fund_perf, leaderboard, strategy_perf, risk_metrics,
-                analyst_report, portfolio_decision, agent_metrics
+                analyst_report, portfolio_decision, agent_metrics,
+                trade_insights=trade_insights
             )
 
             prompt = f"""You are the Chief Investment Officer of a crypto trading fund.
@@ -308,11 +312,20 @@ MARKET CONTEXT:
 {context}
 
 Provide 2-3 strategic recommendations in JSON format.
+
+IMPORTANT RULES:
+- Only recommend disable_agent if the agent has ≥15 runs AND win rate < 30% AND P&L is negative.
+- Recommend enable_agent if a disabled agent has ✓ regime fit (shown above) AND backtest results were positive.
+- Momentum, breakout, and trend-following strategies are GOOD in trending_down markets — consider re-enabling them.
+- Mean-reversion and grid strategies are GOOD in ranging markets — re-enable when regime shifts.
+- Never disable an agent that was just re-enabled (give it at least 15 runs first).
+- Use TRADE LEARNING data (shown above) when it indicates a strategy is systematically failing or excelling.
+
 IMPORTANT: Respond with ONLY the JSON array, no markdown fences, no preamble text.
 [
   {{
     "recommendation": "enable_agent|disable_agent|increase_allocation|reduce_risk|add_new_strategy|diversify|pause_strategy",
-    "target": "agent_id or portfolio",
+    "target": "agent_name or strategy_type or portfolio",
     "confidence": 0.0-1.0,
     "rationale": "brief explanation",
     "expected_impact": "qualitative description of impact"
@@ -358,14 +371,17 @@ IMPORTANT: Respond with ONLY the JSON array, no markdown fences, no preamble tex
         risk_metrics: Dict,
         analyst_report: Optional[Dict],
         portfolio_decision: Optional[Dict],
-        agent_metrics: List[Dict]
+        agent_metrics: List[Dict],
+        trade_insights: Optional[Dict] = None,
     ) -> str:
         """Build context string for LLM"""
         context_lines = []
 
+        current_regime = "unknown"
         if analyst_report:
+            current_regime = analyst_report.get('regime', 'unknown')
             context_lines.append(f"Analyst Market Sentiment: {analyst_report.get('sentiment', 'neutral')}")
-            context_lines.append(f"Market Regime: {analyst_report.get('regime', 'unknown')}")
+            context_lines.append(f"Market Regime: {current_regime}")
 
         if portfolio_decision:
             context_lines.append(f"Portfolio Manager Recommendation: {portfolio_decision.get('recommendation', 'hold')}")
@@ -379,6 +395,75 @@ IMPORTANT: Respond with ONLY the JSON array, no markdown fences, no preamble tex
         if strategy_perf:
             best_strategy = max(strategy_perf.items(), key=lambda x: x[1])
             context_lines.append(f"Best strategy: {best_strategy[0]} ({best_strategy[1]:.1f}% of returns)")
+
+        # Disabled agents that may be suitable for current regime
+        disabled = [m for m in agent_metrics if not m.get("is_enabled", True)]
+        if disabled:
+            try:
+                import app.strategies as strategy_registry
+                regime_suitable = []
+                for m in disabled:
+                    stype = m.get("strategy_type", "")
+                    profile = strategy_registry.get(stype) or {}
+                    avoid = profile.get("avoid_conditions", [])
+                    good_for = profile.get("market_conditions", [])
+                    regime_ok = current_regime not in avoid
+                    regime_match = not good_for or current_regime in good_for
+                    runs = m.get("total_runs", 0)
+                    win_rate = m.get("win_rate", 0.0)
+                    regime_suitable.append(
+                        f"  {m.get('name', stype)} ({stype}): "
+                        f"{runs} runs, {win_rate:.0%} WR — "
+                        f"regime fit: {'✓' if (regime_ok and regime_match) else '✗'} "
+                        f"({'good for ' + current_regime if regime_ok and regime_match else 'avoid in ' + current_regime})"
+                    )
+                context_lines.append(f"\nDISABLED AGENTS ({len(disabled)} total — consider re-enabling if regime fits):")
+                context_lines.extend(regime_suitable)
+            except Exception:
+                context_lines.append(f"\nDisabled agents: {len(disabled)} (regime fitness unavailable)")
+
+        # ── Trade learning: strategy-level retrospective insights ──────────────
+        if trade_insights:
+            strategy_insights = trade_insights.get("strategy_insights", {})
+            agent_insights = trade_insights.get("agent_insights", {})
+            trade_count = trade_insights.get("trade_count", 0)
+            summary = trade_insights.get("summary", "")
+
+            if strategy_insights or agent_insights:
+                context_lines.append(f"\nTRADE LEARNING ({trade_count} trades analysed in last 48h):")
+                if summary:
+                    context_lines.append(f"  Summary: {summary}")
+
+                # Strategy-level patterns
+                if strategy_insights:
+                    context_lines.append("  Strategy performance across all agents:")
+                    for stype, si in strategy_insights.items():
+                        wr = si.get("win_rate", 0)
+                        total = si.get("total_trades", 0)
+                        n_agents = si.get("agent_count", 1)
+                        weaknesses = si.get("weaknesses", [])
+                        strengths = si.get("strengths", [])
+                        adj = si.get("confidence_adj", 0.0)
+                        adj_str = f" [confidence {'+' if adj >= 0 else ''}{adj:.0%}]" if adj != 0 else ""
+                        line = f"    {stype}: {wr:.0%} WR over {total} trades ({n_agents} agents){adj_str}"
+                        if weaknesses:
+                            line += f" — ⚠ {weaknesses[0]}"
+                        elif strengths:
+                            line += f" — ✓ {strengths[0]}"
+                        context_lines.append(line)
+
+                # Agent-level highlights (top issues only)
+                struggling_agents = [
+                    (aid, ins) for aid, ins in agent_insights.items()
+                    if ins.get("win_rate", 1.0) < 0.35 and ins.get("total_trades", 0) >= 3
+                ]
+                if struggling_agents:
+                    context_lines.append("  Underperforming agents (WR < 35%, ≥3 trades):")
+                    for aid, ins in struggling_agents[:5]:
+                        name = ins.get("agent_name", aid[:12])
+                        wr = ins.get("win_rate", 0)
+                        weakness = ins.get("weaknesses", ["no pattern identified"])[0]
+                        context_lines.append(f"    {name}: {wr:.0%} WR — {weakness}")
 
         return "\n".join(context_lines) if context_lines else "Standard market conditions"
 

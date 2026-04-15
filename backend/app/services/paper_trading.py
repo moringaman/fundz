@@ -435,6 +435,11 @@ class PaperTradingService:
             result = await db.execute(query)
             return result.scalars().all()
 
+    async def get_position(self, position_id: str) -> Optional[PaperPosition]:
+        """Fetch a single position by ID from DB (always fresh, bypasses in-memory cache)."""
+        async with get_async_session() as db:
+            return await db.get(PaperPosition, position_id)
+
     async def get_positions_live(self, symbol: Optional[str] = None) -> list:
         """Return open positions with live market prices and unrealized P&L."""
         positions = await self.get_positions(symbol)
@@ -447,12 +452,66 @@ class PaperTradingService:
             entry = pos.entry_price or 0.0
             pos_side = pos.side.value if hasattr(pos.side, 'value') else str(pos.side)
             is_short = pos_side.lower() == 'sell'
+            qty = pos.quantity or 0
+            # Round-trip fee estimate so unrealized P&L matches closed-trade net P&L
+            _fr = self.fee_rate_for(pos.symbol)
+            _est_fees = (entry * qty * _fr) + (current_price * qty * _fr)
             if is_short:
-                unrealized = (entry - current_price) * (pos.quantity or 0)
-                unrealized_pct = ((entry - current_price) / entry * 100) if entry > 0 else 0.0
+                unrealized = (entry - current_price) * qty - _est_fees
+                unrealized_pct = (unrealized / (entry * qty) * 100) if entry * qty > 0 else 0.0
             else:
-                unrealized = (current_price - entry) * (pos.quantity or 0)
-                unrealized_pct = ((current_price - entry) / entry * 100) if entry > 0 else 0.0
+                unrealized = (current_price - entry) * qty - _est_fees
+                unrealized_pct = (unrealized / (entry * qty) * 100) if entry * qty > 0 else 0.0
+            sl_price = getattr(pos, 'stop_loss_price', None)
+            tp_price = getattr(pos, 'take_profit_price', None)
+
+            # Distance from current price to SL — positive = still safe, negative = already past SL
+            distance_to_sl_pct: Optional[float] = None
+            if sl_price and current_price:
+                if is_short:
+                    distance_to_sl_pct = round((sl_price - current_price) / current_price * 100, 2)
+                else:
+                    distance_to_sl_pct = round((current_price - sl_price) / current_price * 100, 2)
+
+            # Distance from current price to TP
+            distance_to_tp_pct: Optional[float] = None
+            if tp_price and current_price:
+                if is_short:
+                    distance_to_tp_pct = round((current_price - tp_price) / current_price * 100, 2)
+                else:
+                    distance_to_tp_pct = round((tp_price - current_price) / current_price * 100, 2)
+
+            # Is the SL below entry (long) or above entry (short)?
+            # If true the position would close at a loss if the stop fires.
+            sl_below_entry: bool = False
+            pnl_at_sl: Optional[float] = None
+            if sl_price and entry:
+                if is_short:
+                    sl_below_entry = sl_price > entry   # short SL above entry = loss
+                else:
+                    sl_below_entry = sl_price < entry   # long SL below entry = loss
+                qty = pos.quantity or 0
+                if is_short:
+                    pnl_at_sl = round((entry - sl_price) * qty, 2)
+                else:
+                    pnl_at_sl = round((sl_price - entry) * qty, 2)
+
+            # Danger tiers:
+            #   critical  — within 1% of SL (immediate stop-out risk)
+            #   warning   — within 2.5% of SL (approaching danger)
+            #   safe      — more than 2.5% away (or no SL set)
+            if distance_to_sl_pct is not None and distance_to_sl_pct >= 0:
+                if distance_to_sl_pct <= 1.0:
+                    sl_danger = "critical"
+                elif distance_to_sl_pct <= 2.5:
+                    sl_danger = "warning"
+                else:
+                    sl_danger = "safe"
+            elif distance_to_sl_pct is not None and distance_to_sl_pct < 0:
+                sl_danger = "critical"  # Already past SL
+            else:
+                sl_danger = "safe"
+
             live_positions.append({
                 "id": pos.id,
                 "symbol": pos.symbol,
@@ -462,8 +521,13 @@ class PaperTradingService:
                 "current_price": current_price,
                 "unrealized_pnl": round(unrealized, 4),
                 "unrealized_pnl_pct": round(unrealized_pct, 2),
-                "stop_loss_price": getattr(pos, 'stop_loss_price', None),
-                "take_profit_price": getattr(pos, 'take_profit_price', None),
+                "stop_loss_price": sl_price,
+                "take_profit_price": tp_price,
+                "distance_to_sl_pct": distance_to_sl_pct,
+                "distance_to_tp_pct": distance_to_tp_pct,
+                "sl_below_entry": sl_below_entry,
+                "pnl_at_sl": pnl_at_sl,
+                "sl_danger": sl_danger,
                 "highest_price": getattr(pos, 'highest_price', None),
                 "trailing_stop_pct": getattr(pos, 'trailing_stop_pct', None),
                 "updated_at": pos.updated_at.isoformat() if pos.updated_at else None,
@@ -579,6 +643,110 @@ class PaperTradingService:
             "exit_price": current_price,
             "pnl": round(pnl, 4),
             "order": order,
+        }
+
+    async def partial_close(
+        self,
+        position_id: str,
+        close_pct: float,
+        price: float,
+        agent_id: Optional[str] = None,
+        label: str = "scale-out",
+    ) -> Optional[dict]:
+        """
+        Close a fraction of an open position at the given price.
+
+        close_pct: 0.0–1.0 (e.g. 0.33 = close 33% of remaining quantity)
+
+        Returns a summary dict with realized_pnl, quantity_closed, and
+        remaining_quantity, or None if the position was not found.
+
+        The position record is updated in-place (quantity reduced, realized_pnl
+        accumulated).  A Trade record is written for the audit trail.
+        """
+        close_pct = max(0.0, min(close_pct, 1.0))
+        if close_pct == 0.0:
+            return None
+
+        fee_rate = self.fee_rate_for
+        async with get_async_session() as db:
+            pos = await db.get(PaperPosition, position_id)
+            if pos is None:
+                return None
+
+            qty_to_close = pos.quantity * close_pct
+            if qty_to_close < 1e-12:
+                return None
+
+            entry = pos.entry_price or price
+            side_str = pos.side.value if hasattr(pos.side, "value") else str(pos.side)
+            is_long = side_str.upper() == "BUY"
+
+            # Raw P&L on the slice
+            if is_long:
+                raw_pnl = qty_to_close * (price - entry)
+            else:
+                raw_pnl = qty_to_close * (entry - price)
+
+            # Fee on the closing notional
+            fr = self.fee_rate_for(pos.symbol)
+            close_fee = qty_to_close * price * fr
+            # Proportional entry fee for this slice (paid at open, allocated per unit)
+            entry_fee = qty_to_close * entry * fr
+            net_pnl = raw_pnl - close_fee - entry_fee
+
+            # Reduce position quantity and accumulate realized P&L
+            pos.quantity -= qty_to_close
+            pos.realized_pnl = (pos.realized_pnl or 0.0) + net_pnl
+
+            # Credit USDT balance with the proceeds from closing this slice
+            usdt_balance = await db.scalar(
+                select(PaperBalance).where(
+                    PaperBalance.user_id == pos.user_id,
+                    PaperBalance.asset == "USDT",
+                )
+            )
+            if usdt_balance is not None:
+                usdt_balance.available += qty_to_close * price - close_fee
+
+            # Write an audit trade record
+            close_side = OrderSide.SELL if is_long else OrderSide.BUY
+            import uuid as _uuid
+            trade = PaperOrder(
+                id=str(_uuid.uuid4()),
+                user_id=pos.user_id,
+                agent_id=agent_id or pos.agent_id,
+                symbol=pos.symbol,
+                side=close_side,
+                quantity=qty_to_close,
+                price=price,
+                total=qty_to_close * price,
+                fee=close_fee,
+                status=OrderStatus.FILLED,
+                is_paper=True,
+                phemex_order_id=f"{label}-{str(_uuid.uuid4())[:8]}",
+            )
+            db.add(trade)
+
+            # If position is fully closed, remove it
+            if pos.quantity < 1e-12:
+                await db.delete(pos)
+                remaining = 0.0
+            else:
+                remaining = pos.quantity
+
+            await db.commit()
+
+        return {
+            "label": label,
+            "quantity_closed": qty_to_close,
+            "remaining_quantity": remaining,
+            "price": price,
+            "raw_pnl": raw_pnl,
+            "net_pnl": net_pnl,
+            "close_fee": close_fee,
+            "entry_fee": entry_fee,
+            "total_fee": close_fee + entry_fee,
         }
 
     # ------------------------------------------------------------------
@@ -717,9 +885,36 @@ class PaperTradingService:
                         short_qty = min(o.quantity, cum_sold - cum_bought)
                         short_remaining.append({"order": o, "remaining": short_qty})
 
+        # ── Consolidate FIFO slices that share the same exit order ────────
+        # When multiple entry orders are closed by a single exit (e.g. 3
+        # scale-in entries closed by 1 buy), the FIFO matcher creates one
+        # row per entry. Merge them into a single round-trip row so the
+        # user sees one trade with the correct total P&L.
+        merged: list[dict] = []
+        merge_map: dict[str, int] = {}   # (agent_id, side, exit_time) → index
+        for t in closed:
+            key = f"{t['agent_id']}|{t['side']}|{t['exit_time']}"
+            if key in merge_map:
+                idx = merge_map[key]
+                m = merged[idx]
+                old_qty = m["quantity"]
+                new_qty = old_qty + t["quantity"]
+                # weighted-average entry price
+                m["entry_price"] = (m["entry_price"] * old_qty + t["entry_price"] * t["quantity"]) / new_qty
+                m["quantity"] = round(new_qty, 8)
+                m["gross_pnl"] = round(m["gross_pnl"] + t["gross_pnl"], 6)
+                m["fee"] = round(m["fee"] + t["fee"], 6)
+                m["net_pnl"] = round(m["net_pnl"] + t["net_pnl"], 6)
+                entry_notional = m["quantity"] * m["entry_price"]
+                m["pnl_pct"] = round((m["net_pnl"] / entry_notional * 100) if entry_notional else 0, 4)
+                m["result"] = "win" if m["net_pnl"] > 0 else ("loss" if m["net_pnl"] < 0 else "breakeven")
+            else:
+                merge_map[key] = len(merged)
+                merged.append(dict(t))    # shallow copy
+
         # Sort by exit time descending (most recent first) and limit
-        closed.sort(key=lambda t: t["exit_time"] or "", reverse=True)
-        return closed[:limit]
+        merged.sort(key=lambda t: t["exit_time"] or "", reverse=True)
+        return merged[:limit]
 
     async def get_agent_performance_from_db(self) -> dict[str, dict]:
         """Return per-agent net P&L, win rate, and trade count from closed DB trades.

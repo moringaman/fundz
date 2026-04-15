@@ -40,6 +40,16 @@ class MarketRegime:
 
 
 @dataclass
+class StrategyRecommendation:
+    """Marina's regime-derived strategy proposal for the strategy review service."""
+    strategy_type: str          # momentum, mean_reversion, breakout, grid, scalping
+    recommended_symbols: List[str]
+    timeframe: str
+    rationale: str
+    priority: float             # 0.0–1.0; used to rank proposals
+
+
+@dataclass
 class ResearchReport:
     """Analyst's complete market research report"""
     timestamp: datetime
@@ -51,6 +61,11 @@ class ResearchReport:
     top_risk: str  # Primary risk identified
     analyst_recommendation: str  # Overall action for portfolio
     reasoning: str
+    strategy_recommendations: List['StrategyRecommendation'] = None  # regime-derived proposals
+
+    def __post_init__(self):
+        if self.strategy_recommendations is None:
+            self.strategy_recommendations = []
 
 
 class ResearchAnalystAgent:
@@ -136,6 +151,10 @@ class ResearchAnalystAgent:
 
             reasoning = self._build_reasoning(market_regime, opportunities, sector_leadership)
 
+            strategy_recommendations = self._derive_strategy_recommendations(
+                market_regime, opportunities, sector_leadership, market_data
+            )
+
             report = ResearchReport(
                 timestamp=timestamp,
                 market_regime=market_regime,
@@ -145,7 +164,8 @@ class ResearchAnalystAgent:
                 top_opportunity=top_opportunity,
                 top_risk=top_risk,
                 analyst_recommendation=analyst_recommendation,
-                reasoning=reasoning
+                reasoning=reasoning,
+                strategy_recommendations=strategy_recommendations,
             )
 
             return report
@@ -392,6 +412,97 @@ Return JSON: {{"regime": "...", "regime_confidence": 0.0-1.0, "sentiment": "..."
                         f"({opp.confidence:.1%} confidence) → {opp.recommended_action.upper()}")
 
         return "\n".join(lines)
+
+    def _derive_strategy_recommendations(
+        self,
+        regime: MarketRegime,
+        opportunities: List[MarketOpportunity],
+        leadership: Dict[str, str],
+        market_data: Dict[str, Dict],
+    ) -> List[StrategyRecommendation]:
+        """Derive strategy type recommendations directly from the market regime.
+
+        This converts Marina's regime assessment into concrete strategy proposals
+        that the strategy review service and traders can act on — closing the loop
+        between research and execution.
+        """
+        recs: List[StrategyRecommendation] = []
+        r = regime.regime
+        vol = regime.volatility_regime
+        sentiment = regime.sentiment
+
+        # Leader symbols are preferred for directional strategies
+        leaders = [s for s, lbl in leadership.items() if lbl == "leader"]
+        all_syms = list(market_data.keys())
+        best_syms = leaders[:3] if leaders else all_syms[:3]
+
+        # 1. Trending market → momentum and breakout strategies shine
+        if r in ("trending_up", "trending_down"):
+            direction = "bullish" if r == "trending_up" else "bearish"
+            recs.append(StrategyRecommendation(
+                strategy_type="momentum",
+                recommended_symbols=best_syms,
+                timeframe="15m" if vol in ("high", "extreme") else "1h",
+                rationale=f"Market is {r} ({regime.regime_confidence:.0%} confidence, {direction} bias). "
+                          f"Momentum strategies perform best in clear trends. "
+                          f"Leaders: {', '.join(leaders[:2]) if leaders else 'BTC/ETH'}.",
+                priority=min(0.9, regime.regime_confidence + 0.1),
+            ))
+            recs.append(StrategyRecommendation(
+                strategy_type="breakout",
+                recommended_symbols=best_syms,
+                timeframe="1h",
+                rationale=f"{r.replace('_', ' ').title()} regime creates breakout opportunities "
+                          f"at key resistance/support levels.",
+                priority=min(0.8, regime.regime_confidence),
+            ))
+
+        # 2. Ranging market → mean reversion and grid strategies
+        if r in ("ranging",):
+            recs.append(StrategyRecommendation(
+                strategy_type="mean_reversion",
+                recommended_symbols=best_syms,
+                timeframe="1h",
+                rationale=f"Ranging market ({regime.regime_confidence:.0%} confidence) is ideal for "
+                          f"mean reversion — price oscillates around equilibrium. "
+                          f"Avoid momentum strategies until a breakout confirms.",
+                priority=min(0.9, regime.regime_confidence + 0.1),
+            ))
+            if vol in ("low", "medium"):
+                recs.append(StrategyRecommendation(
+                    strategy_type="grid",
+                    recommended_symbols=best_syms[:2],
+                    timeframe="15m",
+                    rationale=f"Low-medium volatility ranging market suits grid trading — "
+                              f"systematic buy/sell at fixed intervals within the BB range.",
+                    priority=min(0.75, regime.regime_confidence),
+                ))
+
+        # 3. Volatility expansion → scalping and tight mean reversion
+        if r == "volatility_expansion" or vol in ("high", "extreme"):
+            recs.append(StrategyRecommendation(
+                strategy_type="scalping",
+                recommended_symbols=best_syms[:2],
+                timeframe="5m",
+                rationale=f"Volatility expansion ({vol}) creates frequent short-term swings. "
+                          f"Scalping with tight stops captures these without overnight risk.",
+                priority=0.65 if vol == "high" else 0.55,
+            ))
+
+        # 4. Trending up with bullish sentiment → trend following for larger moves
+        if r == "trending_up" and sentiment in ("bullish", "very_bullish"):
+            recs.append(StrategyRecommendation(
+                strategy_type="trend_following",
+                recommended_symbols=best_syms,
+                timeframe="4h",
+                rationale=f"Strong {sentiment} sentiment in uptrend. "
+                          f"Trend following on 4h captures the macro move beyond intraday noise.",
+                priority=0.70,
+            ))
+
+        # Sort by priority descending
+        recs.sort(key=lambda x: x.priority, reverse=True)
+        return recs[:4]  # cap at 4 proposals per cycle
 
     def _default_regime(self) -> MarketRegime:
         """Return safe default regime assessment"""

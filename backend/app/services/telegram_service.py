@@ -5,12 +5,27 @@ via the Bot API (POST https://api.telegram.org/bot<token>/sendMessage).
 All alerts are gated by per-event toggles stored in the DB via the settings
 module.  Calling code simply awaits the relevant method; if the alert type is
 disabled or credentials are missing the call is a no-op.
+
+Inbound polling:
+  When polling_enabled=True the service runs a long-poll loop (getUpdates with
+  timeout=30) as an asyncio task.  Commands are restricted to the configured
+  chat_id so random Telegram users cannot interact with the bot.
+
+  Supported commands:
+    /help          — list all commands
+    /status        — portfolio summary (balance + open position count + daily P&L)
+    /positions     — list all open positions with entry, current price, P&L, SL/TP
+    /close <id>    — close a position by its short ID (first 8 chars of UUID)
+    /sl <id> <px>  — update stop-loss price on a position
+    /tp <id> <px>  — update take-profit price on a position
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Optional
 
 import httpx
@@ -25,6 +40,7 @@ class TelegramConfig:
     bot_token: str = ""
     chat_id: str = ""
     enabled: bool = False
+    polling_enabled: bool = False   # Inbound command polling
     # Per-event toggles
     trade_executed: bool = True
     trade_rejected: bool = True
@@ -44,6 +60,10 @@ class TelegramService:
 
     def __init__(self) -> None:
         self._config = TelegramConfig()
+        # API error cooldown state — prevents alert spam
+        self._api_error_last_sent: Optional[datetime] = None
+        self._api_error_acknowledged: bool = False
+        self._API_ERROR_COOLDOWN = timedelta(hours=6)
 
     # ── Config management ──────────────────────────────────────────────────
 
@@ -245,15 +265,53 @@ class TelegramService:
         )
         await self.send(text)
 
-    async def alert_api_error(self, context: str, error: str) -> None:
+    async def alert_api_error(self, context: str, error: str, status_code: Optional[int] = None) -> None:
+        """Send a Telegram alert for Phemex API errors (500, 401, etc.).
+
+        Respects a 6-hour cooldown: once an alert is sent, no further alerts
+        fire until either 6 hours elapse OR the user sends /ack via the bot.
+        """
         if not self._config.api_error:
             return
+
+        now = datetime.now()
+
+        # Check cooldown — don't spam if already alerted recently
+        if self._api_error_last_sent and not self._api_error_acknowledged:
+            elapsed = now - self._api_error_last_sent
+            if elapsed < self._API_ERROR_COOLDOWN:
+                logger.debug(
+                    f"API error alert suppressed — cooldown active "
+                    f"({elapsed.total_seconds() / 3600:.1f}h / 6h, /ack not received)"
+                )
+                return
+
+        # Reset acknowledged flag on new send
+        self._api_error_acknowledged = False
+        self._api_error_last_sent = now
+
+        code_str = f" `{status_code}`" if status_code else ""
         text = (
-            f"🔌 *API Error*\n\n"
+            f"🚨 *Phemex API Error{code_str}*\n\n"
             f"Context: {context}\n"
-            f"Error: `{error[:300]}`"
+            f"Error: `{error[:300]}`\n\n"
+            f"_This alert will repeat in 6 hours unless acknowledged._\n"
+            f"Reply /ack to acknowledge."
         )
         await self.send(text)
+
+    def acknowledge_api_error(self) -> str:
+        """Acknowledge the API error alert, resetting the cooldown.
+
+        Returns a confirmation message.
+        """
+        if self._api_error_last_sent is None:
+            return "No active API error alerts to acknowledge."
+        self._api_error_acknowledged = True
+        return (
+            f"✅ API error alert acknowledged.\n"
+            f"You won't be alerted again until a *new* API error occurs."
+        )
 
     async def alert_daily_report(
         self,
@@ -288,6 +346,255 @@ class TelegramService:
             return
         text = f"⚖️ *Portfolio Rebalanced*\n\n{summary}"
         await self.send(text)
+
+    # ── Inbound polling ───────────────────────────────────────────────────
+
+    async def start_polling(self) -> None:
+        """Start the long-poll loop as a background coroutine.
+
+        Call once from the app lifespan after settings have been loaded.
+        Safe to call even when polling_enabled=False — it will exit immediately.
+        The loop restarts itself on error; it only stops when cancelled.
+        """
+        if not (self._config.polling_enabled and self.is_enabled()):
+            logger.debug("Telegram polling disabled or not configured — skipping")
+            return
+        logger.info("Telegram polling started")
+        offset = 0
+        while True:
+            try:
+                offset = await self._poll_once(offset)
+            except asyncio.CancelledError:
+                logger.info("Telegram polling cancelled")
+                return
+            except Exception as exc:
+                logger.warning(f"Telegram poll error: {exc} — retrying in 10s")
+                await asyncio.sleep(10)
+
+    async def _poll_once(self, offset: int) -> int:
+        """Call getUpdates with long-poll timeout=30, process any messages, return new offset."""
+        url = f"{TELEGRAM_API}/bot{self._config.bot_token}/getUpdates"
+        params = {"timeout": 30, "offset": offset, "allowed_updates": ["message"]}
+        async with httpx.AsyncClient(timeout=35.0) as client:
+            resp = await client.get(url, params=params)
+        if resp.status_code != 200:
+            logger.warning(f"Telegram getUpdates failed: {resp.status_code}")
+            await asyncio.sleep(5)
+            return offset
+        data = resp.json()
+        for update in data.get("result", []):
+            offset = max(offset, update["update_id"] + 1)
+            await self._handle_update(update)
+        return offset
+
+    async def _handle_update(self, update: dict) -> None:
+        """Route an incoming Telegram update to the right command handler."""
+        msg = update.get("message", {})
+        if not msg:
+            return
+
+        # ── Auth gate — only respond to the configured chat_id ────────────
+        sender_chat = str(msg.get("chat", {}).get("id", ""))
+        if sender_chat != str(self._config.chat_id):
+            logger.warning(
+                f"Telegram: ignoring message from unauthorized chat_id={sender_chat} "
+                f"(expected {self._config.chat_id})"
+            )
+            return
+
+        text = msg.get("text", "").strip()
+        if not text.startswith("/"):
+            return  # ignore non-commands
+
+        parts = text.split()
+        cmd   = parts[0].lower().split("@")[0]   # strip @botname suffix if present
+        args  = parts[1:]
+
+        handlers = {
+            "/help":      self._cmd_help,
+            "/status":    self._cmd_status,
+            "/positions": self._cmd_positions,
+            "/close":     self._cmd_close,
+            "/sl":        self._cmd_sl,
+            "/tp":        self._cmd_tp,
+            "/ack":       self._cmd_ack,
+        }
+        handler = handlers.get(cmd)
+        if handler:
+            try:
+                await handler(args)
+            except Exception as exc:
+                logger.error(f"Telegram command {cmd} error: {exc}", exc_info=True)
+                await self.send(f"⚠️ Command failed: `{exc}`")
+        else:
+            await self.send(f"Unknown command `{cmd}`. Use /help for the list.")
+
+    # ── Command handlers ──────────────────────────────────────────────────
+
+    async def _cmd_help(self, _args: list[str]) -> None:
+        text = (
+            "🤖 *Phemex AI Trader — Bot Commands*\n\n"
+            "/status — portfolio summary\n"
+            "/positions — list all open positions\n"
+            "/close `<id>` — close position by short ID\n"
+            "/sl `<id> <price>` — update stop-loss\n"
+            "/tp `<id> <price>` — update take-profit\n"
+            "/ack — acknowledge API error alert\n"
+            "/help — this message"
+        )
+        await self.send(text)
+
+    async def _cmd_status(self, _args: list[str]) -> None:
+        try:
+            from app.services.paper_trading import paper_trading
+            positions = await paper_trading.get_positions_live()
+            balances  = await paper_trading.get_all_balances()
+            usdt = next(
+                (float(b.available) for b in balances if b.asset == "USDT"),
+                0.0,
+            )
+
+            total_unrealised  = sum(p.get("unrealized_pnl", 0.0) or 0.0 for p in positions)
+            positions_value   = sum(
+                (p.get("quantity") or 0) * (p.get("current_price") or 0)
+                for p in positions
+            )
+            total_equity      = usdt + positions_value
+            exposure_pct      = (positions_value / total_equity * 100) if total_equity > 0 else 0.0
+
+            unr_sign = "+" if total_unrealised >= 0 else ""
+            lines = [
+                "📊 *Portfolio Status*\n",
+                f"Available USDT:   `${usdt:,.2f}`",
+                f"Positions Value:  `${positions_value:,.2f}`",
+                f"Total Equity:     `${total_equity:,.2f}`",
+                f"Exposure:         `{exposure_pct:.1f}%`",
+                f"Open positions:   `{len(positions)}`",
+                f"Unrealised P&L:   `{unr_sign}${total_unrealised:,.2f}`",
+            ]
+            await self.send("\n".join(lines))
+        except Exception as exc:
+            await self.send(f"⚠️ Could not fetch status: `{exc}`")
+
+    async def _cmd_positions(self, _args: list[str]) -> None:
+        try:
+            from app.services.paper_trading import paper_trading
+            positions = await paper_trading.get_positions_live()
+            if not positions:
+                await self.send("📭 No open positions.")
+                return
+
+            lines = ["📋 *Open Positions*\n"]
+            for p in positions:
+                pid   = str(p.get("id", ""))[:8]
+                sym   = p.get("symbol", "?")
+                side  = p.get("side", "?").upper()
+                entry = p.get("entry_price", 0.0)
+                curr  = p.get("current_price", 0.0)
+                pnl   = p.get("unrealized_pnl", 0.0) or 0.0
+                sl    = p.get("stop_loss_price")
+                tp    = p.get("take_profit_price")
+                pnl_e = "🟢" if pnl >= 0 else "🔴"
+                sl_s  = f"`${sl:,.4f}`" if sl else "—"
+                tp_s  = f"`${tp:,.4f}`" if tp else "—"
+                lines.append(
+                    f"{pnl_e} `{pid}` *{sym}* {side}\n"
+                    f"  Entry `${entry:,.4f}` → Now `${curr:,.4f}`\n"
+                    f"  P&L `{'+'if pnl>=0 else ''}${pnl:,.2f}` | SL {sl_s} TP {tp_s}"
+                )
+            await self.send("\n\n".join(lines))
+        except Exception as exc:
+            await self.send(f"⚠️ Could not fetch positions: `{exc}`")
+
+    async def _cmd_close(self, args: list[str]) -> None:
+        if not args:
+            await self.send("Usage: /close `<position-id>`\nGet the ID from /positions")
+            return
+        short_id = args[0].strip()
+        try:
+            from app.services.paper_trading import paper_trading
+            positions = await paper_trading.get_positions()
+            match = next(
+                (p for p in positions if str(p.id).startswith(short_id) or str(p.id) == short_id),
+                None,
+            )
+            if not match:
+                await self.send(f"❌ No position found matching ID `{short_id}`")
+                return
+            result = await paper_trading.close_position(str(match.id))
+            if result:
+                pnl = result.get("pnl", 0.0)
+                e   = "🟢" if pnl >= 0 else "🔴"
+                await self.send(
+                    f"{e} *Position Closed*\n\n"
+                    f"`{short_id}` {match.symbol} {match.side.upper()}\n"
+                    f"P&L: `{'+'if pnl>=0 else ''}${pnl:,.2f}`"
+                )
+            else:
+                await self.send(f"⚠️ Close returned no result for `{short_id}`")
+        except Exception as exc:
+            await self.send(f"⚠️ Close failed: `{exc}`")
+
+    async def _cmd_sl(self, args: list[str]) -> None:
+        if len(args) < 2:
+            await self.send("Usage: /sl `<position-id> <price>`")
+            return
+        short_id, price_str = args[0], args[1]
+        try:
+            price = float(price_str)
+        except ValueError:
+            await self.send(f"❌ Invalid price: `{price_str}`")
+            return
+        try:
+            from app.services.paper_trading import paper_trading
+            positions = await paper_trading.get_positions()
+            match = next(
+                (p for p in positions if str(p.id).startswith(short_id) or str(p.id) == short_id),
+                None,
+            )
+            if not match:
+                await self.send(f"❌ No position found matching ID `{short_id}`")
+                return
+            await paper_trading.update_position_sl_tp(str(match.id), stop_loss_price=price)
+            await self.send(
+                f"✅ Stop-loss updated\n\n"
+                f"`{short_id}` {match.symbol} → SL `${price:,.4f}`"
+            )
+        except Exception as exc:
+            await self.send(f"⚠️ SL update failed: `{exc}`")
+
+    async def _cmd_tp(self, args: list[str]) -> None:
+        if len(args) < 2:
+            await self.send("Usage: /tp `<position-id> <price>`")
+            return
+        short_id, price_str = args[0], args[1]
+        try:
+            price = float(price_str)
+        except ValueError:
+            await self.send(f"❌ Invalid price: `{price_str}`")
+            return
+        try:
+            from app.services.paper_trading import paper_trading
+            positions = await paper_trading.get_positions()
+            match = next(
+                (p for p in positions if str(p.id).startswith(short_id) or str(p.id) == short_id),
+                None,
+            )
+            if not match:
+                await self.send(f"❌ No position found matching ID `{short_id}`")
+                return
+            await paper_trading.update_position_sl_tp(str(match.id), take_profit_price=price)
+            await self.send(
+                f"✅ Take-profit updated\n\n"
+                f"`{short_id}` {match.symbol} → TP `${price:,.4f}`"
+            )
+        except Exception as exc:
+            await self.send(f"⚠️ TP update failed: `{exc}`")
+
+    async def _cmd_ack(self, _args: list[str]) -> None:
+        """Acknowledge active API error alert, silencing further repeats."""
+        reply = self.acknowledge_api_error()
+        await self.send(reply)
 
 
 # Singleton

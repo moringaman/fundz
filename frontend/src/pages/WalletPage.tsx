@@ -1,7 +1,8 @@
 import { useBalance } from '../hooks/useQueries';
+import { SkeletonCard } from '../components/common/Skeleton';
 
 export function WalletPage() {
-  const { data: balancesRaw } = useBalance();
+  const { data: balancesRaw, isPending: balanceLoading } = useBalance();
   const balances: any[] = Array.isArray(balancesRaw?.data)
     ? balancesRaw.data
     : Array.isArray(balancesRaw)
@@ -11,6 +12,13 @@ export function WalletPage() {
   return (
     <div className="space-y-6">
       <h1 className="page-title">Wallet</h1>
+      {balanceLoading ? (
+        <div className="wallet-grid">
+          {Array.from({ length: 4 }, (_, i) => (
+            <SkeletonCard key={i} lines={2} height={100} />
+          ))}
+        </div>
+      ) : (
       <div className="wallet-grid">
         {balances.length === 0 ? (
           <p className="text-gray-400">No balances found. Configure API key to sync.</p>
@@ -24,6 +32,7 @@ export function WalletPage() {
           ))
         )}
       </div>
+      )}
     </div>
   );
 }

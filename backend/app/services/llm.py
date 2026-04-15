@@ -51,7 +51,7 @@ class LLMRegistry:
             'name': 'James Sterling',
             'title': 'Portfolio Manager',
             'model': 'meta-llama/llama-3.1-8b-instruct',
-            'temperature': 0.5,
+            'temperature': 0.2,
             'max_tokens': 1200,
             'avatar': 'https://api.dicebear.com/7.x/avataaars/svg?seed=James%20Sterling&gender=male',
             'bio': 'Experienced manager responsible for capital allocation and rebalancing across all agents.'
@@ -87,7 +87,7 @@ class LLMRegistry:
             'name': 'Jordan Blake',
             'title': 'Quantitative Trader',
             'model': 'mistralai/mixtral-8x7b-instruct',
-            'temperature': 0.5,
+            'temperature': 0.15,
             'max_tokens': 800,
             'avatar': 'https://api.dicebear.com/7.x/avataaars/svg?seed=Jordan%20Blake&gender=male',
             'bio': 'Quantitative trader executing algorithmic strategies and generating entry/exit signals across all pairs.'
@@ -353,6 +353,15 @@ CORE RULES (these define your edge — follow them without exception):
 7. Fee round-trip = 0.12% — your edge must exceed this
 8. A missed trade costs nothing; a losing trade costs real money
 
+SCALE-OUT POLICY (this fund uses staged profit-taking, not single-target exits):
+- When you enter a position, the system automatically scales out in up to 3 tranches.
+- Tranche 1 (~33% of TP range): 25% of position closes → SL moves to breakeven.
+- Tranche 2 (~60% of TP range): another 35% closes → remaining ~40% rides to full TP or trailing stop.
+- This means your ENTRY CRITERIA should be higher quality — you will capture meaningful profit
+  on winners even if they don't reach full TP, so be selective and let trades breathe.
+- Set TP targets at NATURAL RESISTANCE/SUPPORT, not just percentage offsets.
+- SL should be below/above a key level — partial closes mean the risk on the runner is free.
+
 CONFIDENCE CALIBRATION:
 - 0.8–1.0 → Strong trend + 3+ aligned indicators + clear levels + team agrees → BUY or SELL
 - 0.6–0.8 → Clear trend + 2 aligned indicators → BUY or SELL (cautious size)
@@ -507,6 +516,28 @@ Return JSON: {{"trend": "strong_bullish|bullish|neutral|bearish|strong_bearish",
                         + "\n".join(f"  {r}" for r in retro_rules)
                     )
 
+            # Whale intelligence — Hyperliquid on-chain smart-money positioning
+            whale = team_context.get("whale")
+            if whale and (whale.get("long_notional", 0) + whale.get("short_notional", 0)) >= 10_000:
+                def _wfmt(v: float) -> str:
+                    if v >= 1_000_000:
+                        return f"${v / 1_000_000:.1f}M"
+                    if v >= 1_000:
+                        return f"${v / 1_000:.0f}K"
+                    return f"${v:.0f}"
+                _wdirection = "NET LONG" if whale.get("net_notional", 0) > 0 else "NET SHORT"
+                _wbias = whale.get("bias", "neutral").upper()
+                parts.append(
+                    f"HYPERLIQUID WHALE POSITIONING (on-chain smart-money):\n"
+                    f"- {whale.get('coin', '?')} bias: {_wbias} | {_wdirection} | "
+                    f"{_wfmt(whale.get('long_notional', 0))} long vs "
+                    f"{_wfmt(whale.get('short_notional', 0))} short\n"
+                    f"- {whale.get('whale_count', 0)} tracked wallet(s) | "
+                    f"avg {whale.get('avg_leverage', 1):.0f}x leverage\n"
+                    f"- Smart-money alignment: if their bias AGREES with your signal, "
+                    f"increase confidence; if it OPPOSES, reduce confidence or hold"
+                )
+
             if parts:
                 team_section = "\n\nTEAM INTELLIGENCE (factor these into your decision):\n" + "\n\n".join(parts) + """
 
@@ -547,6 +578,7 @@ VOLATILITY & SUPPORT/RESISTANCE:
 - ATR (Volatility): {atr:.2f}
 - Current position vs BB: {"Near resistance (upper band)" if price_data.get('current', 0) > bb_middle else "Near support (lower band)" if price_data.get('current', 0) < bb_middle else "Mid-range"}
 {team_section}
+SCALE-OUT REMINDER: This fund scales out of positions in tranches (25% at 33% of TP, 35% at 60% of TP, remainder at full TP). Factor this into your conviction — a trade only needs to reach 33% of its TP range to be profitable. Prefer setups with clear intermediate resistance/support levels where partial profit-taking makes sense.
 NOTE: "sell" means SHORT when no long position exists — you can profit from downtrends.
 Analyse the data above and return your trading decision as JSON."""
 
@@ -587,6 +619,7 @@ OPTIMIZATION OPPORTUNITIES:
 - If profit_factor <1.5: Increase winners or reduce losers (tighter stops?)
 - If win_rate >60% but low PnL: Increase position size or extend profit targets
 - If losses exceed wins: Review signal confluence, add filters
+- NOTE: This fund uses scale-out exits (partial closes at 33% and 60% of TP range). Win rate reflects FULL TP hits only — a "loss" may still have returned profit via scale-out. Focus on profit_factor and expectancy over raw win_rate.
 
 CONFIDENCE FACTORS:
 - Adequate sample size: {total_trades >= 20}

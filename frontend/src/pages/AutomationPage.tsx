@@ -1,17 +1,24 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import {
   useAutomationStatus,
   useAutomationMetrics,
   useAgents,
+  useTradingMode,
+  useSetTradingMode,
 } from '../hooks/useQueries';
 import { automationApi } from '../lib/api';
+import { SkeletonStats, SkeletonCard } from '../components/common/Skeleton';
 
 export function AutomationPage() {
   const { data: statusData, refetch: refetchStatus } = useAutomationStatus();
-  const { data: metricsData = [] } = useAutomationMetrics();
+  const { data: metricsData = [], isPending: metricsLoading } = useAutomationMetrics();
   const { data: agentsData = [] } = useAgents();
   const [runningAgent, setRunningAgent] = useState<string | null>(null);
-  const [usePaperMode, setUsePaperMode] = useState(true);
+
+  // Mode is server-persisted — read from settings, write via mutation
+  const { isPaper } = useTradingMode();
+  const setTradingMode = useSetTradingMode();
+  const [modeUpdating, setModeUpdating] = useState(false);
 
   const status = statusData ?? null;
   const metrics: any[] = Array.isArray(metricsData) ? metricsData : [];
@@ -53,7 +60,7 @@ export function AutomationPage() {
         max_position_size: agent.max_position_size,
         stop_loss_pct: agent.stop_loss_pct || 2.0,
         take_profit_pct: agent.take_profit_pct || 4.0,
-      }, usePaperMode);
+      }, isPaper);
     } catch (error) {
       console.error('Failed to run agent:', error);
     } finally {
@@ -62,28 +69,44 @@ export function AutomationPage() {
   };
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6" style={{ margin: '1.75rem' }}>
       <h1 className="page-title">Strategy Automation</h1>
 
       <div className="card">
         <div className="card-header-row">
           <div>
             <h2 className="card-title">Trading Mode</h2>
-            <p className="text-gray-400 text-sm">{usePaperMode ? 'Paper Trading - No real trades executed' : 'Real Trading - Actual trades will be executed'}</p>
+            <p className="text-gray-400 text-sm">
+              {isPaper ? 'Paper Trading — No real trades executed' : '🔴 Live Trading — Real trades will be executed on the exchange'}
+            </p>
           </div>
-          <label className="toggle-switch">
-            <input type="checkbox" checked={usePaperMode} onChange={() => setUsePaperMode(!usePaperMode)} />
-            <span className="toggle-slider" />
-          </label>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+            {modeUpdating && <span style={{ fontSize: '12px', color: '#888' }}>Saving…</span>}
+            <label className="toggle-switch">
+              <input
+                type="checkbox"
+                checked={!isPaper}
+                disabled={modeUpdating}
+                onChange={async () => {
+                  setModeUpdating(true);
+                  try { await setTradingMode.mutateAsync(!isPaper); } finally { setModeUpdating(false); }
+                }}
+              />
+              <span className="toggle-slider" />
+            </label>
+          </div>
         </div>
-        {!usePaperMode && (
+        {!isPaper && (
           <div className="warning-banner">
-            ⚠️ Real Trading Enabled - Actual trades will be executed on the exchange
+            ⚠️ Live Trading Enabled — Actual trades will be executed on the exchange
           </div>
         )}
       </div>
 
       <div className="stats-grid">
+        {metricsLoading ? (
+          <div style={{ gridColumn: '1 / -1' }}><SkeletonStats count={4} /></div>
+        ) : (<>
         <div className="stat-card">
           <p className="stat-label">Scheduler</p>
           <p className={`stat-value ${status?.scheduler_running ? 'positive' : ''}`}>
@@ -102,6 +125,7 @@ export function AutomationPage() {
           <p className="stat-label">Market</p>
           <p className="stat-value">{market?.trend || 'N/A'}</p>
         </div>
+        </>)}
       </div>
 
       <div className="card">
@@ -122,8 +146,8 @@ export function AutomationPage() {
         <div className="setup-grid">
           <div className="setup-item">
             <span className="setup-label">Trading Mode</span>
-            <span className={`setup-value ${usePaperMode ? 'paper' : 'real'}`}>
-              {usePaperMode ? 'Paper Trading' : 'Real Trading'}
+            <span className={`setup-value ${isPaper ? 'paper' : 'real'}`}>
+              {isPaper ? 'Paper Trading' : '🔴 Live Trading'}
             </span>
           </div>
           <div className="setup-item">

@@ -190,6 +190,11 @@ class Position(Base):
     highest_price = Column(Float, nullable=True)
     trailing_stop_pct = Column(Float, nullable=True)
     is_paper = Column(Boolean, default=True)
+    phemex_order_id = Column(String(100), nullable=True)  # live order tracking {"pct_of_tp": 0.33, "close_pct": 0.33, "triggered": false}
+    scale_out_levels = Column(Text, nullable=True)
+    # Grid trading: link this position to a specific grid level
+    grid_id = Column(String(36), nullable=True)
+    grid_level_id = Column(String(36), nullable=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     __table_args__ = (
@@ -257,10 +262,13 @@ class AgentMetricRecord(Base):
     __tablename__ = "agent_metric_records"
 
     id = Column(String(36), primary_key=True, default=generate_uuid)
-    agent_id = Column(String(36), ForeignKey("agents.id", ondelete="CASCADE"), nullable=False, unique=True)
+    agent_id = Column(String(36), ForeignKey("agents.id", ondelete="CASCADE"), nullable=False)
+    is_paper = Column(Boolean, default=True)
     total_runs = Column(Integer, default=0)
     successful_runs = Column(Integer, default=0)
     failed_runs = Column(Integer, default=0)
+    actual_trades = Column(Integer, default=0)   # closed positions only (pnl set)
+    winning_trades = Column(Integer, default=0)  # closed positions with pnl > 0
     total_pnl = Column(Float, default=0.0)
     buy_signals = Column(Integer, default=0)
     sell_signals = Column(Integer, default=0)
@@ -269,6 +277,10 @@ class AgentMetricRecord(Base):
     avg_pnl = Column(Float, default=0.0)
     last_run = Column(DateTime(timezone=True), nullable=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("agent_id", "is_paper", name="uq_agent_metric_agent_mode"),
+    )
 
 
 class AnalystReport(Base):
@@ -529,12 +541,52 @@ class StrategyAction(Base):
     )
 
 
+class WhaleAddress(Base):
+    """Watchlist of Hyperliquid whale addresses to track."""
+    __tablename__ = "whale_addresses"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    address = Column(String(100), unique=True, nullable=False)
+    label = Column(String(100), nullable=True)
+    notes = Column(Text, nullable=True)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    snapshots = relationship("WhaleSnapshot", back_populates="whale", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        Index("idx_whale_address_active", "is_active"),
+    )
+
+
+class WhaleSnapshot(Base):
+    """Point-in-time snapshot of a whale's positions on Hyperliquid."""
+    __tablename__ = "whale_snapshots"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    whale_id = Column(String(36), ForeignKey("whale_addresses.id", ondelete="CASCADE"), nullable=False)
+    captured_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    positions = Column(JSON, default=list)
+    account_value = Column(Float, nullable=True)
+    total_notional = Column(Float, default=0.0)
+    symbols_active = Column(JSON, default=list)
+
+    whale = relationship("WhaleAddress", back_populates="snapshots")
+
+    __table_args__ = (
+        Index("idx_whale_snapshot_whale_captured", "whale_id", "captured_at"),
+        Index("idx_whale_snapshot_captured_at", "captured_at"),
+    )
+
+
 from app.models import User, ApiKey, TradingPair, Trader, Agent, AgentPair, AgentSignal, Trade, Position, Balance, Kline
 from app.models import SignalType, OrderSide, OrderStatus
 from app.models import AgentRunRecord, AgentMetricRecord
 from app.models import AnalystReport, PortfolioDecision, RiskAssessmentRecord, ExecutionPlan, CIOReport, AgentDecision
 from app.models import TeamChatMessageRecord, DailyReport
 from app.models import BacktestRecord, StrategyAction
+from app.models import WhaleAddress, WhaleSnapshot
 
 
 class AppSetting(Base):
@@ -543,4 +595,98 @@ class AppSetting(Base):
 
     key = Column(String(100), primary_key=True)
     value = Column(JSON, nullable=False, default=dict)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+# ── Grid Trading Models ─────────────────────────────────────────────────────
+
+class GridStatus(enum.Enum):
+    active = "active"
+    paused = "paused"
+    cancelled = "cancelled"
+    completed = "completed"
+
+
+class GridLevelStatus(enum.Enum):
+    pending = "pending"        # not yet placed
+    open = "open"              # order placed, awaiting fill
+    filled = "filled"          # position is open at this level
+    counter_placed = "counter_placed"  # counter-order placed after fill
+    closed = "closed"          # level fully closed with P&L realised
+
+
+class GridState(Base):
+    """One active grid per (agent, symbol). Tracks the overall grid lifecycle."""
+    __tablename__ = "grid_states"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    agent_id = Column(String(36), ForeignKey("agents.id", ondelete="SET NULL"), nullable=True)
+    symbol = Column(String(20), nullable=False)
+    status = Column(Enum(GridStatus), default=GridStatus.active, nullable=False)
+
+    # Grid geometry
+    grid_low = Column(Float, nullable=False)       # bottom of range
+    grid_high = Column(Float, nullable=False)      # top of range
+    grid_levels = Column(Integer, nullable=False)  # number of levels
+    grid_spacing_pct = Column(Float, nullable=False)  # % between levels
+    current_price_at_creation = Column(Float, nullable=False)
+    regime_atr = Column(Float, nullable=True)       # ATR at creation (drift baseline)
+
+    # Financial tracking
+    total_invested = Column(Float, default=0.0)    # capital currently deployed
+    realized_pnl = Column(Float, default=0.0)      # closed-level profits
+    cancel_reason = Column(Text, nullable=True)    # populated when cancelled
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        Index("idx_grid_states_agent_symbol", "agent_id", "symbol"),
+    )
+
+
+class GridLevel(Base):
+    """One row per price level within a grid."""
+    __tablename__ = "grid_levels"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    grid_id = Column(String(36), ForeignKey("grid_states.id", ondelete="CASCADE"), nullable=False)
+    level_index = Column(Integer, nullable=False)    # 0 = lowest level
+    price = Column(Float, nullable=False)            # target price for this level
+    side = Column(Enum(OrderSide), nullable=False)   # buy at low levels, sell at high
+    status = Column(Enum(GridLevelStatus), default=GridLevelStatus.pending, nullable=False)
+    quantity = Column(Float, nullable=False)
+
+    # Populated on fill
+    position_id = Column(String(36), nullable=True)  # links to positions.id
+    entry_price = Column(Float, nullable=True)
+    exit_price = Column(Float, nullable=True)
+    pnl = Column(Float, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        Index("idx_grid_levels_grid_id", "grid_id"),
+    )
+
+
+
+class StrategyOverride(Base):
+    """
+    Runtime overrides for strategy definitions sourced from registry.yaml.
+    Only stores values that differ from YAML  the registry loaderdefaults 
+    merges these on top of the base YAML definition at request time.
+    """
+    __tablename__ = "strategy_overrides"
+
+    strategy_type = Column(String(64), primary_key=True)   # matches registry.yaml key
+    enabled = Column(Boolean, default=True, nullable=False)
+    display_order = Column(Integer, nullable=True)          # UI sort order override
+    default_stop_loss_pct = Column(Float, nullable=True)    # None = use YAML default
+    default_take_profit_pct = Column(Float, nullable=True)
+    default_trailing_stop_pct = Column(Float, nullable=True)
+    default_timeframe = Column(String(16), nullable=True)
+    notes = Column(Text, nullable=True)                     # admin notes / reason for override
+
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

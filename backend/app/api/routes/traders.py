@@ -231,59 +231,98 @@ async def toggle_trader(trader_id: str):
         trader.is_enabled = not trader.is_enabled
         await db.commit()
 
+    # Sync to in-memory scheduler so allocation logic sees the change immediately
+    try:
+        from app.services.agent_scheduler import agent_scheduler
+        for t in agent_scheduler._traders:
+            if t.get("id") == trader_id:
+                t["is_enabled"] = trader.is_enabled
+                break
+    except Exception as _sync_err:
+        logger.warning(f"Could not sync trader toggle to scheduler: {_sync_err}")
+
     return {"trader_id": trader_id, "is_enabled": trader.is_enabled}
 
 
 @router.get("/{trader_id}/performance", response_model=TraderPerformanceResponse)
 async def get_trader_performance(trader_id: str):
-    """Get aggregated performance for a trader."""
+    """Get aggregated performance for a trader, filtered by current trading mode."""
     from sqlalchemy import select
     from app.models import Trader, Agent, AgentMetricRecord
+    from app.services.paper_trading import paper_trading
+    from app.services.trading_service import _is_paper_mode
+
+    is_paper = _is_paper_mode()
 
     async with get_async_session() as db:
         trader = await db.get(Trader, trader_id)
         if not trader:
             raise HTTPException(status_code=404, detail="Trader not found")
 
-        # Fetch agents for this trader
         agents_result = await db.execute(
             select(Agent).where(Agent.trader_id == trader_id)
         )
         agents = agents_result.scalars().all()
         agent_ids = [a.id for a in agents]
 
-        # Fetch metrics
+        # Fetch metrics for the CURRENT mode only
         metrics_result = await db.execute(
-            select(AgentMetricRecord).where(AgentMetricRecord.agent_id.in_(agent_ids))
+            select(AgentMetricRecord).where(
+                AgentMetricRecord.agent_id.in_(agent_ids),
+                AgentMetricRecord.is_paper == is_paper,
+            )
         ) if agent_ids else None
         metrics = metrics_result.scalars().all() if metrics_result else []
 
-        total_pnl = sum(m.total_pnl or 0 for m in metrics)
-        total_trades = sum(m.total_runs or 0 for m in metrics)
-        winning = sum(int((m.total_runs or 0) * (m.win_rate or 0)) for m in metrics)
-        win_rate = winning / total_trades if total_trades > 0 else 0.0
+    # Use closed-trade DB records as authoritative source for trade counts and win rate
+    # Paper → PaperOrder table via paper_trading.get_agent_performance_from_db()
+    # Live  → AgentMetricRecord with is_paper=False (most up-to-date from scheduler)
+    if is_paper:
+        db_perf = await paper_trading.get_agent_performance_from_db()
+    else:
+        # For live, AgentMetricRecord is the authoritative source (updated by monitor loop)
+        db_perf = {
+            m.agent_id: {
+                "net_pnl": m.total_pnl or 0.0,
+                "win_rate": m.win_rate,
+                "total_trades": m.actual_trades or 0,
+            }
+            for m in metrics
+        }
 
-        agent_summaries = []
-        for a in agents:
-            m = next((m for m in metrics if m.agent_id == a.id), None)
-            agent_summaries.append({
-                "id": a.id,
-                "name": a.name,
-                "strategy_type": a.strategy_type,
-                "is_enabled": a.is_enabled,
-                "pnl": m.total_pnl if m else 0,
-                "win_rate": m.win_rate if m else 0,
-                "runs": m.total_runs if m else 0,
-            })
+    total_pnl = sum(m.total_pnl or 0 for m in metrics)
+    total_trades = 0
+    winning = 0
+    for a in agents:
+        ap = db_perf.get(a.id)
+        if ap:
+            total_trades += ap["total_trades"]
+            winning += int(ap["total_trades"] * (ap["win_rate"] or 0))
 
-        return TraderPerformanceResponse(
-            trader_id=trader.id,
-            trader_name=trader.name,
-            total_pnl=total_pnl,
-            win_rate=win_rate,
-            total_trades=total_trades,
-            winning_trades=winning,
-            agent_count=len(agents),
-            allocation_pct=trader.allocation_pct,
-            agents=agent_summaries,
-        )
+    win_rate = winning / total_trades if total_trades > 0 else 0.0
+
+    agent_summaries = []
+    for a in agents:
+        m = next((m for m in metrics if m.agent_id == a.id), None)
+        ap = db_perf.get(a.id, {})
+        agent_summaries.append({
+            "id": a.id,
+            "name": a.name,
+            "strategy_type": a.strategy_type,
+            "is_enabled": a.is_enabled,
+            "pnl": m.total_pnl if m else ap.get("net_pnl", 0),
+            "win_rate": ap.get("win_rate") or (m.win_rate if m else 0) or 0,
+            "runs": ap.get("total_trades") or (m.actual_trades if m else 0) or 0,
+        })
+
+    return TraderPerformanceResponse(
+        trader_id=trader.id,
+        trader_name=trader.name,
+        total_pnl=total_pnl,
+        win_rate=win_rate,
+        total_trades=total_trades,
+        winning_trades=winning,
+        agent_count=len(agents),
+        allocation_pct=trader.allocation_pct,
+        agents=agent_summaries,
+    )

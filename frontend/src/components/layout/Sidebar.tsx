@@ -1,4 +1,4 @@
-import { Activity, Bot, Wallet, Settings, X, TrendingUp, History, Zap, Users, MessageCircle, BarChart2 } from 'lucide-react';
+import { Activity, Bot, Wallet, Settings, X, TrendingUp, History, Zap, Users, MessageCircle, BarChart2, GitBranch } from 'lucide-react';
 import { useAppSelector, useAppDispatch } from '../../store/hooks';
 import { setSidebarOpen } from '../../store/slices/uiSlice';
 import { useAutomationStatus, useAgents, usePaperOrders, useTradeHistory, useFundTeamStatus } from '../../hooks/useQueries';
@@ -86,7 +86,7 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
           {/* Agents */}
           <button type="button" onClick={() => navigate('agents')} className={`nav-item ${activePage === 'agents' ? 'active' : ''}`}>
             <Bot size={16} />
-            <span>Strategies</span>
+            <span>Agents</span>
             {enabledAgentCount > 0
               ? <NavBadge variant="green">{enabledAgentCount} ON</NavBadge>
               : <NavBadge>0 ON</NavBadge>
@@ -139,6 +139,16 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
           <button type="button" onClick={() => navigate('wallet')} className={`nav-item ${activePage === 'wallet' ? 'active' : ''}`}>
             <Wallet size={16} />
             <span>Wallet</span>
+          </button>
+
+          <button type="button" onClick={() => navigate('whales')} className={`nav-item ${activePage === 'whales' ? 'active' : ''}`}>
+            <Activity size={16} />
+            <span>Whales</span>
+          </button>
+
+          <button type="button" onClick={() => navigate('workflows')} className={`nav-item ${activePage === 'workflows' ? 'active' : ''}`}>
+            <GitBranch size={16} />
+            <span>Workflows</span>
           </button>
 
           {/* Settings */}

@@ -18,7 +18,9 @@ import {
 import { WsIndicator } from '../components/common/WsIndicator';
 import { MiniChart } from '../components/common/MiniChart';
 import { PerformanceCharts } from '../components/PerformanceCharts';
+import { WhaleIntelligencePanel } from '../components/WhaleIntelligencePanel';
 import { timeAgo } from '../utils/timeAgo';
+import { Skeleton, SkeletonCard, SkeletonChart, SkeletonRows, SkeletonStats } from '../components/common/Skeleton';
 
 const FALLBACK_SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'ADAUSDT'];
 
@@ -35,8 +37,8 @@ export function DashboardPage() {
 
   const { data: paperStatus, refetch: refetchStatus } = usePaperStatus();
   const { data: paperPnl, refetch: refetchPnl } = usePaperPnl();
-  const { data: portfolio } = usePaperPortfolio();
-  const { data: agentsData = [] } = useAgents();
+  const { data: portfolio, isPending: portfolioLoading } = usePaperPortfolio();
+  const { data: agentsData = [], isPending: agentsLoading } = useAgents();
   const { data: metricsData = [] } = useAutomationMetrics();
   const { data: runsData = [] } = useAutomationRuns(undefined, 12);
   const { data: teamStatus } = useFundTeamStatus();
@@ -64,6 +66,50 @@ export function DashboardPage() {
 
   // ── Portfolio totals (from canonical backend endpoint) ──
   const portfolioTotal = portfolio?.total_capital ?? 0;
+
+  // ── Loading skeleton ──
+  if (portfolioLoading && agentsLoading) {
+    return (
+      <div style={{ padding: '1rem 1.1rem', display: 'flex', flexDirection: 'column', gap: '.75rem', height: '100%', overflow: 'auto' }}>
+        {/* Ticker bar skeleton */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', padding: '.75rem 1rem', background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: 8 }}>
+          <Skeleton width={80} height={16} />
+          <Skeleton width={100} height={22} />
+          <Skeleton width={60} height={14} />
+          <div style={{ flex: 1 }} />
+          <Skeleton width={60} height={12} />
+          <Skeleton width={60} height={12} />
+          <Skeleton width={60} height={12} />
+        </div>
+        {/* Symbol strip skeleton */}
+        <div style={{ display: 'flex', gap: '.5rem' }}>
+          {Array.from({ length: 5 }, (_, i) => (
+            <Skeleton key={i} width={110} height={40} rounded />
+          ))}
+        </div>
+        {/* 3-column grid skeleton */}
+        <div className="dash-grid">
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '.75rem' }}>
+            <SkeletonCard lines={4} height={180} />
+            <SkeletonChart height={140} />
+            <SkeletonCard lines={5} />
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '.75rem' }}>
+            <SkeletonCard lines={6} height={260} />
+            <SkeletonChart height={180} />
+            <SkeletonCard lines={3} />
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '.75rem' }}>
+            <SkeletonCard lines={4} height={200} />
+            <SkeletonCard lines={3} />
+            <SkeletonCard lines={4} />
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+
   const usdtTotal = portfolio?.usdt_total ?? 0;
   const holdingsValue = portfolio?.positions_value ?? 0;
   const exposurePct = portfolio?.exposure_pct ?? 0;
@@ -269,6 +315,9 @@ export function DashboardPage() {
               )}
             </div>
           </div>
+
+          {/* Whale Intelligence — mini strip */}
+          <WhaleIntelligencePanel compact mini />
 
         </div>
 

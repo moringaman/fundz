@@ -56,6 +56,88 @@ class LlmConfig(BaseModel):
     has_azure_key: bool = False
 
 
+class TradingGates(BaseModel):
+    """Configurable thresholds for all trading gates and filters."""
+    # Entry confidence
+    min_entry_confidence: float = Field(default=0.50, ge=0.1, le=1.0,
+        description="Minimum signal confidence to enter a trade (0.0–1.0)")
+    ta_veto_confidence: float = Field(default=0.75, ge=0.1, le=1.0,
+        description="TA analyst must exceed this confidence to veto a signal")
+    # MTF confluence
+    mtf_confluence_block_score: float = Field(default=0.40, ge=0.0, le=1.0,
+        description="Block trade when MTF alignment=mixed AND score below this")
+    mtf_strong_alignment_score: float = Field(default=0.55, ge=0.0, le=1.0,
+        description="Score above which aligned MTF boosts confidence")
+    mtf_aligned_boost: float = Field(default=0.10, ge=0.0, le=0.5,
+        description="Confidence multiplier bonus when MTF strongly aligned (+fraction)")
+    mtf_opposed_penalty: float = Field(default=0.25, ge=0.0, le=0.9,
+        description="Confidence multiplier penalty when MTF strongly opposes (fraction removed)")
+    mtf_mixed_penalty: float = Field(default=0.20, ge=0.0, le=0.9,
+        description="Confidence multiplier penalty when MTF alignment is mixed (fraction removed)")
+    # HTF adjustments
+    htf_aligned_boost: float = Field(default=0.15, ge=0.0, le=0.5,
+        description="Confidence bonus when higher-TF trend aligns with signal (+fraction)")
+    htf_opposed_penalty: float = Field(default=0.50, ge=0.0, le=0.9,
+        description="Confidence penalty when higher-TF trend opposes signal (fraction removed)")
+    # Whale sentiment
+    whale_entry_gate_enabled: bool = Field(default=True,
+        description="When enabled, 70%+ opposing whale notional hard-blocks new entries. Disable to ignore whale positioning for trade entry decisions.")
+    whale_caution_threshold: float = Field(default=0.75, ge=0.5, le=1.0,
+        description="Fraction of whale notional SHORT to trigger CAUTION elevation")
+    whale_info_threshold: float = Field(default=0.65, ge=0.5, le=1.0,
+        description="Fraction of whale notional SHORT to add informational warning")
+    whale_bull_threshold: float = Field(default=0.30, ge=0.0, le=0.5,
+        description="Fraction SHORT below which broad bullish positioning is noted")
+    # Agent lifecycle
+    min_runs_before_disable: int = Field(default=15, ge=5, le=100,
+        description="Minimum trade runs required before CIO or traders can disable an agent")
+    # Circuit breaker
+    circuit_breaker_max_trades: int = Field(default=30, ge=5, le=200,
+        description="Maximum trades per day before halting all trading")
+    # Correlation limits
+    max_same_asset_positions: int = Field(default=2, ge=1, le=10,
+        description="Maximum concurrent positions on the same symbol")
+    max_directional_concentration_pct: float = Field(default=40.0, ge=10.0, le=100.0,
+        description="Maximum % of capital in all-long or all-short positions")
+    # Position sizing
+    confidence_size_reference: float = Field(default=0.65, ge=0.3, le=1.0,
+        description="Confidence level at which full position size is used (sizing reference)")
+    confidence_size_floor: float = Field(default=0.50, ge=0.1, le=1.0,
+        description="Minimum position size multiplier regardless of low confidence")
+    # TA confidence boost/penalty
+    ta_boost_multiplier: float = Field(default=0.20, ge=0.0, le=0.5,
+        description="Confidence boost when TA agrees with signal (fraction added)")
+    ta_penalty_multiplier: float = Field(default=0.40, ge=0.0, le=0.9,
+        description="Confidence penalty when TA opposes signal (fraction removed)")
+    ta_min_confidence: float = Field(default=0.60, ge=0.1, le=1.0,
+        description="Minimum TA confidence required to apply boost or penalty")
+    # ── US Market Open Management ─────────────────────────────────────────────
+    # The 09:00 ET (13:00–13:30 UTC) open is the highest-volatility window of the
+    # day. Institutional order flow, delta-hedging, and stop-hunting routinely
+    # reverse the Asian/European trend. Three layers of protection:
+    #   1. BLACKOUT (default 12:45–13:30 UTC): hard-block all new entries
+    #   2. PRE-OPEN SWEEP (default 12:30 UTC): move profitable SLs to breakeven
+    #   3. CONFIRMATION WINDOW (default 13:30–14:15 UTC): require elevated
+    #      confidence before entering — direction must be proved, not guessed
+    us_open_blackout_enabled: bool = Field(default=True,
+        description="Block all new position entries during the US open chaos window")
+    us_open_blackout_start_utc: int = Field(default=1245, ge=0, le=2359,
+        description="Blackout start time in UTC HHMM format (default 12:45)")
+    us_open_blackout_end_utc: int = Field(default=1330, ge=0, le=2359,
+        description="Blackout end time in UTC HHMM format (default 13:30)")
+    us_open_preopen_sl_tighten: bool = Field(default=True,
+        description="Move profitable position SLs to breakeven before the US open")
+    us_open_preopen_tighten_utc: int = Field(default=1230, ge=0, le=2359,
+        description="Pre-open SL tighten sweep time in UTC HHMM format (default 12:30)")
+    us_open_confirmation_end_utc: int = Field(default=1415, ge=0, le=2359,
+        description="End of elevated-confidence confirmation window in UTC HHMM (default 14:15)")
+    us_open_confirmation_confidence: float = Field(default=0.80, ge=0.5, le=1.0,
+        description="Minimum confidence required to enter during the US open confirmation window")
+
+
+
+
+
 class GeneralSettings(BaseModel):
     app_name: str = "phemex-ai-trader"
     debug: bool = True
@@ -68,6 +150,11 @@ class SettingsResponse(BaseModel):
     trading: TradingPreferences
     llm: LlmConfig
     general: GeneralSettings
+    gates: TradingGates
+
+
+class TradingGatesUpdateRequest(TradingGates):
+    pass
 
 
 class ApiKeySaveRequest(BaseModel):
@@ -97,6 +184,7 @@ class TelegramSettingsModel(BaseModel):
     bot_token: str = ""
     chat_id: str = ""
     enabled: bool = False
+    polling_enabled: bool = False   # Inbound command polling (getUpdates long-poll)
     trade_executed: bool = True
     trade_rejected: bool = True
     ta_veto: bool = True
@@ -116,6 +204,7 @@ class TelegramSettingsModel(BaseModel):
 
 _runtime_risk_limits: Optional[RiskLimits] = None
 _runtime_trading_prefs: Optional[TradingPreferences] = None
+_runtime_trading_gates: Optional[TradingGates] = None
 _settings_loaded = False
 
 
@@ -161,7 +250,7 @@ async def _save_setting(key: str, value: dict):
 
 async def _load_all_settings():
     """Load risk limits, trading prefs and Telegram config from DB, fall back to defaults."""
-    global _runtime_risk_limits, _runtime_trading_prefs, _settings_loaded
+    global _runtime_risk_limits, _runtime_trading_prefs, _runtime_trading_gates, _settings_loaded
 
     if _settings_loaded:
         return
@@ -185,6 +274,16 @@ async def _load_all_settings():
             _runtime_trading_prefs = TradingPreferences()
     else:
         _runtime_trading_prefs = TradingPreferences()
+
+    gates_data = await _load_setting("trading_gates")
+    if gates_data:
+        try:
+            _runtime_trading_gates = TradingGates(**gates_data)
+            logger.info("Loaded trading gates from DB")
+        except Exception:
+            _runtime_trading_gates = TradingGates()
+    else:
+        _runtime_trading_gates = TradingGates()
 
     # Load and apply Telegram settings
     telegram_data = await _load_setting("telegram")
@@ -216,6 +315,13 @@ def get_trading_prefs() -> TradingPreferences:
     if _runtime_trading_prefs is None:
         return TradingPreferences()
     return _runtime_trading_prefs
+
+
+def get_trading_gates() -> TradingGates:
+    """Access current trading gate thresholds from other modules (sync)."""
+    if _runtime_trading_gates is None:
+        return TradingGates()
+    return _runtime_trading_gates
 
 
 def _mask_key(key: Optional[str]) -> Optional[str]:
@@ -254,6 +360,7 @@ async def get_settings():
             debug=app_settings.debug,
             rate_limit_per_minute=app_settings.rate_limit_per_minute,
         ),
+        gates=_runtime_trading_gates,
     )
 
 
@@ -290,6 +397,22 @@ async def update_trading_prefs(req: TradingPreferencesUpdateRequest):
     _runtime_trading_prefs = TradingPreferences(**req.model_dump())
     await _save_setting("trading_prefs", req.model_dump())
     return _runtime_trading_prefs
+
+
+@router.get("/gates", response_model=TradingGates)
+async def get_gates():
+    """Return current trading gate thresholds."""
+    await _load_all_settings()
+    return _runtime_trading_gates
+
+
+@router.put("/gates", response_model=TradingGates)
+async def update_trading_gates(req: TradingGatesUpdateRequest):
+    """Update trading gate thresholds (persisted to DB, applied immediately)."""
+    global _runtime_trading_gates
+    _runtime_trading_gates = TradingGates(**req.model_dump())
+    await _save_setting("trading_gates", req.model_dump())
+    return _runtime_trading_gates
 
 
 @router.put("/llm")
@@ -356,6 +479,7 @@ async def get_telegram_settings():
         "bot_token": f"...{cfg.bot_token[-6:]}" if len(cfg.bot_token) > 6 else ("***" if cfg.bot_token else ""),
         "chat_id": cfg.chat_id,
         "enabled": cfg.enabled,
+        "polling_enabled": cfg.polling_enabled,
         "trade_executed": cfg.trade_executed,
         "trade_rejected": cfg.trade_rejected,
         "ta_veto": cfg.ta_veto,

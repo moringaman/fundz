@@ -14,14 +14,20 @@ import { soundService } from '../lib/soundService';
 
 export function useEventSounds() {
   useEffect(() => {
+    // Register auto-unlock so sounds activate on the first click anywhere in
+    // the app — the user never needs to visit Settings to re-enable after refresh.
+    soundService.autoUnlockOnInteraction();
+
     const onTradeExecuted = () => {
       soundService.play('trade-open');
     };
 
     const onTeamChat = (msg: unknown) => {
-      const m = msg as { message_type?: string; content?: string };
-      if (m.message_type !== 'trade') return;
-      const content = (m.content ?? '').toUpperCase();
+      const payload = msg as { message_type?: string; content?: string; data?: { message_type?: string; content?: string } };
+      const messageType = payload.data?.message_type ?? payload.message_type;
+      if (messageType !== 'trade') return;
+
+      const content = (payload.data?.content ?? payload.content ?? '').toUpperCase();
       if (content.includes('TAKE-PROFIT')) {
         soundService.play('profit-take');
       } else if (content.includes('STOP-LOSS') || content.includes('TRAILING-STOP')) {

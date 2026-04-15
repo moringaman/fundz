@@ -15,7 +15,9 @@ import {
 } from '../hooks/useQueries';
 import { DailyReportPanel } from '../components/DailyReportPanel';
 import { TeamChatPanel } from '../components/TeamChatPanel';
+// import { WhaleIntelligencePanel } from '../components/WhaleIntelligencePanel';
 import { usePagination, Paginator } from '../components/common/Paginator';
+import { Skeleton, SkeletonCard, SkeletonChart, SkeletonRows } from '../components/common/Skeleton';
 
 export function FundTeamPage() {
   const { data: marketAnalysis, isLoading: marketLoading } = useFundMarketAnalysis();
@@ -108,6 +110,9 @@ export function FundTeamPage() {
           </span>
         </div>
       </div>
+      {/* <div style={{ marginBottom: '2rem' }}>
+        <WhaleIntelligencePanel />
+      </div> */}
       <div style={{  marginBottom: '2rem' }}>
       <TeamChatPanel />
       </div>
@@ -216,7 +221,7 @@ export function FundTeamPage() {
           </div>
 
           {marketLoading ? (
-            <div style={{ display: 'flex', justifyContent: 'center', padding: '2rem', color: 'var(--text-dim)' }}>Analyzing markets...</div>
+            <div style={{ padding: '1rem' }}><SkeletonRows rows={4} gap={12} lineHeight={14} /></div>
           ) : marketAnalysis ? (
             <div>
               {/* Analyst Summary */}
@@ -305,7 +310,7 @@ export function FundTeamPage() {
           </div>
 
           {technicalLoading ? (
-            <div style={{ display: 'flex', justifyContent: 'center', padding: '1.5rem', color: 'var(--text-dim)' }}>Analyzing charts...</div>
+            <div style={{ padding: '1rem' }}><SkeletonChart height={120} /></div>
           ) : taReports.length > 0 ? (
             <div>
               {/* Symbol Tabs */}
@@ -499,7 +504,7 @@ export function FundTeamPage() {
           </div>
 
           {riskLoading ? (
-            <div style={{ display: 'flex', justifyContent: 'center', padding: '1.5rem', color: 'var(--text-dim)' }}>Assessing risk...</div>
+            <div style={{ padding: '1rem' }}><SkeletonRows rows={3} gap={10} lineHeight={16} /></div>
           ) : riskData ? (
             <div>
               {/* Risk Level Gauge */}

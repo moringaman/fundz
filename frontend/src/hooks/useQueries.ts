@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient, QueryClient, useMutation } from '@tanstack/react-query';
-import { tradingApi, agentApi, paperApi, automationApi, settingsApi, fundApi, traderApi } from '../lib/api';
+import { tradingApi, agentApi, paperApi, automationApi, settingsApi, fundApi, traderApi, whaleApi } from '../lib/api';
 import { wsClient } from '../lib/websocket';
 import { useEffect } from 'react';
 
@@ -65,6 +65,40 @@ export function useAgents() {
     queryFn: () => agentApi.getAgents().then((r) => r.data),
     refetchInterval: 60_000,
     staleTime: 30_000,
+  });
+}
+
+// ─── Strategy registry ────────────────────────────────────────────────────────
+export function useStrategies() {
+  return useQuery({
+    queryKey: ['strategies'],
+    queryFn: () => agentApi.getStrategies().then((r) => r.data),
+    staleTime: 60_000,
+  });
+}
+
+export function useUpdateStrategy() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, data }: { id: string; data: Record<string, unknown> }) =>
+      fetch(`/api/strategies/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      }).then((r) => { if (!r.ok) throw new Error('Update failed'); return r.json(); }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['strategies'] }),
+  });
+}
+
+export function useResetStrategy() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) =>
+      fetch(`/api/strategies/${id}/reset`, { method: 'POST' }).then((r) => {
+        if (!r.ok) throw new Error('Reset failed');
+        return r.json();
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['strategies'] }),
   });
 }
 
@@ -361,6 +395,34 @@ export function useSettings() {
   });
 }
 
+/** Returns { isPaper, isLive } based on the persisted server setting. */
+export function useTradingMode() {
+  const { data } = useSettings();
+  const isPaper = data?.trading?.paper_trading_default ?? true;
+  return { isPaper, isLive: !isPaper };
+}
+
+/** Persists the paper/live mode toggle to the backend. Invalidates settings cache. */
+export function useSetTradingMode() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (isPaper: boolean) => {
+      // Fetch current prefs first so we don't lose other fields
+      const current = await settingsApi.getSettings().then((r) => r.data?.trading ?? {});
+      return settingsApi.updateTradingPrefs({
+        default_symbol: current.default_symbol ?? 'BTCUSDT',
+        default_timeframe: current.default_timeframe ?? '1h',
+        paper_trading_default: isPaper,
+        auto_confirm_orders: current.auto_confirm_orders ?? false,
+        default_order_type: current.default_order_type ?? 'limit',
+      });
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['settings'] });
+    },
+  });
+}
+
 export function useTradingPairs() {
   return useQuery({
     queryKey: ['tradingPairs'],
@@ -471,5 +533,58 @@ export function useTraderPerformance(traderId?: string) {
     enabled: !!traderId,
     staleTime: 60_000,
     refetchInterval: 60_000,
+  });
+}
+
+// ─── Whale Intelligence ───────────────────────────────────────────────────────
+export function useWhaleWatchlist() {
+  return useQuery({
+    queryKey: ['whaleWatchlist'],
+    queryFn: () => whaleApi.getWatchlist().then((r) => r.data),
+    staleTime: 30_000,
+    refetchInterval: 60_000,
+  });
+}
+
+export function useWhaleIntelligence() {
+  return useQuery({
+    queryKey: ['whaleIntelligence'],
+    queryFn: () => whaleApi.getIntelligence().then((r) => r.data),
+    staleTime: 55_000,
+    refetchInterval: 60_000,
+    retry: 1,
+  });
+}
+
+export function useAddWhaleAddress() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { address: string; label?: string; notes?: string }) =>
+      whaleApi.addAddress(body).then((r) => r.data),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['whaleWatchlist'] }),
+  });
+}
+
+export function useDeleteWhaleAddress() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => whaleApi.deleteAddress(id).then((r) => r.data),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['whaleWatchlist'] }),
+  });
+}
+
+export function useToggleWhaleAddress() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => whaleApi.toggleAddress(id).then((r) => r.data),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['whaleWatchlist'] }),
+  });
+}
+
+export function useRefreshWhaleIntelligence() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => whaleApi.refresh().then((r) => r.data),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['whaleIntelligence'] }),
   });
 }

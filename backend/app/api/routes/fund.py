@@ -908,6 +908,9 @@ async def get_trader_leaderboard():
     not the in-memory agent metrics buffer which is pruned and mixes bootstrap
     backtest data with live trade results.
     """
+    from sqlalchemy import select as sa_select
+    from app.models import Agent as DBAgent
+    from app.database import get_async_session
     from app.services.trader_service import trader_service
     from app.services.paper_trading import paper_trading
 
@@ -915,15 +918,25 @@ async def get_trader_leaderboard():
     allocations = agent_scheduler.get_trader_allocations()
     total_capital = agent_scheduler._total_capital or 0.0
 
-    # Pull per-agent performance from DB (authoritative, net-of-fees)
+    # Pull per-agent performance from DB (authoritative, net-of-fees, all agents)
     db_perf = await paper_trading.get_agent_performance_from_db()
+
+    # Load ALL DB agents for each trader (not just enabled ones in memory)
+    async with get_async_session() as db:
+        all_agents_result = await db.execute(sa_select(DBAgent))
+        all_db_agents = all_agents_result.scalars().all()
+
+    # Build trader_id → list of agent dicts
+    trader_agents_map: dict = {}
+    for a in all_db_agents:
+        tid = a.trader_id
+        if tid not in trader_agents_map:
+            trader_agents_map[tid] = []
+        trader_agents_map[tid].append({"id": a.id, "name": a.name, "is_enabled": a.is_enabled})
 
     leaderboard = []
     for t in traders:
-        t_agents = [
-            cfg for cfg in agent_scheduler._enabled_agents.values()
-            if cfg.get("trader_id") == t["id"]
-        ]
+        t_agents = trader_agents_map.get(t["id"], [])
 
         # Aggregate DB-sourced metrics across all agents for this trader
         total_pnl = 0.0
@@ -949,7 +962,7 @@ async def get_trader_leaderboard():
                         "agent_id": a["id"],
                         "total_pnl": m.total_pnl,
                         "win_rate": m.win_rate,
-                        "total_runs": m.total_runs,
+                        "total_runs": m.actual_trades,  # use actual trades, not runs
                     })
             perf = trader_service.get_trader_performance(t, t_agents, agent_metrics_list)
             total_pnl = perf.total_pnl

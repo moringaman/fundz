@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { TrendingUp, Activity, Target, BarChart3, Cpu } from 'lucide-react';
 import { useTraderLeaderboard, useTraders, useAgents, useAutomationMetrics } from '../hooks/useQueries';
+import { SkeletonCard } from '../components/common/Skeleton';
 
 const RISK_COLORS: Record<string, string> = {
   low: 'var(--green)',
@@ -49,7 +50,7 @@ function WinBar({ rate }: { rate: number }) {
 }
 
 export function TradersPage() {
-  const { data: leaderboard = [] } = useTraderLeaderboard();
+  const { data: leaderboard = [], isPending: tradersLoading } = useTraderLeaderboard();
   const { data: tradersData = [] } = useTraders();
   const { data: agentsData = [] } = useAgents();
   const { data: metricsData = [] } = useAutomationMetrics();
@@ -111,6 +112,15 @@ export function TradersPage() {
           {traders.length} active
         </span>
       </div>
+
+      {tradersLoading ? (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '1rem' }}>
+          {Array.from({ length: 3 }, (_, i) => (
+            <SkeletonCard key={i} lines={5} height={220} />
+          ))}
+        </div>
+      ) : (
+      <>
 
       {/* ── Leaderboard cards ── */}
       <div style={{ display: 'grid', gridTemplateColumns: `repeat(${traders.length || 3}, 1fr)`, gap: '1rem' }}>
@@ -426,6 +436,8 @@ export function TradersPage() {
         <div className="card" style={{ textAlign: 'center', padding: '3rem', color: 'var(--text-dim)', fontSize: '.85rem' }}>
           Start the scheduler to load and initialise the trading team.
         </div>
+      )}
+      </>
       )}
     </div>
   );

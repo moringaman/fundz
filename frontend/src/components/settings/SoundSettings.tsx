@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { Volume2, VolumeX, Play } from 'lucide-react';
 import { soundService, type SoundKey } from '../../lib/soundService';
 
@@ -11,6 +11,17 @@ const EVENT_LABELS: { key: SoundKey; label: string; description: string }[] = [
 export function SoundSettings() {
   const [prefs, setPrefs] = useState(() => soundService.getPrefs());
   const [unlocked, setUnlocked] = useState(() => soundService.isUnlocked());
+  const [testingAll, setTestingAll] = useState(false);
+
+  // Stay in sync with soundService — auto-unlock fires externally (e.g. from
+  // useEventSounds on first page click) so we subscribe rather than only reading
+  // state at mount time.
+  useEffect(() => {
+    const unsub = soundService.onUnlock(() => setUnlocked(true));
+    // Also re-read prefs on mount in case they changed while this component was unmounted
+    setPrefs(soundService.getPrefs());
+    return unsub;
+  }, []);
 
   const save = useCallback((update: Parameters<typeof soundService.setPrefs>[0]) => {
     soundService.setPrefs(update);
@@ -30,6 +41,24 @@ export function SoundSettings() {
     soundService.play(key);
   };
 
+  const handleTestAll = async () => {
+    if (testingAll) return;
+    setTestingAll(true);
+    try {
+      if (!soundService.isUnlocked()) {
+        await soundService.unlock();
+        setUnlocked(soundService.isUnlocked());
+      }
+
+      const sequence: SoundKey[] = ['trade-open', 'profit-take', 'stop-loss'];
+      sequence.forEach((key, idx) => {
+        window.setTimeout(() => soundService.play(key), idx * 650);
+      });
+    } finally {
+      window.setTimeout(() => setTestingAll(false), 2100);
+    }
+  };
+
   return (
     <div className="settings-card space-y-4">
       {/* Header */}
@@ -41,7 +70,7 @@ export function SoundSettings() {
         Subtle audio cues for key trading events. Sounds play in-browser when events arrive via WebSocket.
       </p>
 
-      {/* Autoplay unlock banner */}
+      {/* Autoplay unlock banner — only shown until first interaction unlocks audio */}
       {!unlocked && (
         <div style={{
           display: 'flex', alignItems: 'center', justifyContent: 'space-between',
@@ -54,12 +83,12 @@ export function SoundSettings() {
           <div>
             <div style={{ fontSize: '.75rem', fontWeight: 600, color: 'var(--accent)' }}>Sounds not yet active</div>
             <div style={{ fontSize: '.68rem', color: 'var(--text-secondary)' }}>
-              Browser policy requires a click before audio can play.
+              Will activate automatically on your next click — or tap below to enable now.
             </div>
           </div>
           <button type="button" className="settings-btn settings-btn-primary" onClick={handleUnlock}
             style={{ whiteSpace: 'nowrap', fontSize: '.72rem' }}>
-            Enable Sounds
+            Enable Now
           </button>
         </div>
       )}
@@ -96,6 +125,28 @@ export function SoundSettings() {
             {Math.round(prefs.volume * 100)}%
           </span>
         </div>
+      </div>
+
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '.75rem' }}>
+        <div style={{ fontSize: '.67rem', color: 'var(--text-secondary)' }}>
+          Run a quick three-tone test to verify browser audio output.
+        </div>
+        <button
+          type="button"
+          onClick={handleTestAll}
+          className="settings-btn"
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: '.4rem',
+            whiteSpace: 'nowrap',
+            opacity: testingAll ? 0.8 : 1,
+          }}
+          disabled={testingAll}
+        >
+          <Play size={13} />
+          {testingAll ? 'Testing...' : 'Test All Sounds'}
+        </button>
       </div>
 
       <hr style={{ border: 'none', borderTop: '1px solid var(--border)', margin: '.5rem 0' }} />

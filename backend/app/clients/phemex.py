@@ -52,27 +52,84 @@ class PhemexClient:
             "x-phemex-request-signature": signature,
         }
 
-    async def _request(self, method: str, path: str, params: Optional[Dict[str, Any]] = None, body: str = "", base_url: str = None) -> Dict[str, Any]:
+    async def _request(self, method: str, path: str, params: Optional[Dict[str, Any]] = None, body: str = "", base_url: str = None, _retries: int = 3) -> Dict[str, Any]:
         params = params or {}
-        headers = self._generate_signature(method, path, params, body)
-        headers["Content-Type"] = "application/json"
-        
         url_base = base_url or self.base_url
         url = f"{url_base}{path}"
 
-        if method in ("POST", "PUT"):
-            response = await self.client.request(
-                method, url, headers=headers,
-                content=body if body else None,
-            )
-        else:
-            response = await self.client.request(
-                method, url, params=params if method == "GET" else None,
-                headers=headers,
-            )
+        last_exc: Optional[Exception] = None
+        for attempt in range(_retries):
+            # Re-sign on every attempt — expiry is time-based
+            headers = self._generate_signature(method, path, params, body)
+            headers["Content-Type"] = "application/json"
 
-        response.raise_for_status()
-        return response.json()
+            try:
+                if method in ("POST", "PUT"):
+                    response = await self.client.request(
+                        method, url, headers=headers,
+                        content=body if body else None,
+                    )
+                else:
+                    response = await self.client.request(
+                        method, url, params=params if method == "GET" else None,
+                        headers=headers,
+                    )
+
+                response.raise_for_status()
+                return response.json()
+            except httpx.HTTPStatusError as exc:
+                last_exc = exc
+                if exc.response.status_code < 500:
+                    # 4xx errors are not retryable — alert on 401 before raising
+                    if exc.response.status_code == 401:
+                        try:
+                            from app.services.telegram_service import telegram_service
+                            import asyncio as _aio
+                            _aio.create_task(
+                                telegram_service.alert_api_error(
+                                    context=f"{method} {path}",
+                                    error=str(exc)[:300],
+                                    status_code=401,
+                                )
+                            )
+                        except Exception:
+                            pass
+                    raise
+                logger.warning(
+                    f"Phemex {exc.response.status_code} on {method} {path} "
+                    f"(attempt {attempt + 1}/{_retries})"
+                )
+                if attempt < _retries - 1:
+                    import asyncio
+                    await asyncio.sleep(1.5 ** attempt)  # 1s, 1.5s, 2.25s
+            except (httpx.ConnectError, httpx.ReadTimeout) as exc:
+                last_exc = exc
+                logger.warning(
+                    f"Phemex connection issue on {method} {path}: {exc} "
+                    f"(attempt {attempt + 1}/{_retries})"
+                )
+                if attempt < _retries - 1:
+                    import asyncio
+                    await asyncio.sleep(1.5 ** attempt)
+
+        # ── Fire Telegram alert for critical API errors (500, 401) ────────
+        if isinstance(last_exc, httpx.HTTPStatusError):
+            _code = last_exc.response.status_code
+            if _code in (500, 401):
+                try:
+                    from app.services.telegram_service import telegram_service
+                    import asyncio
+                    asyncio.create_task(
+                        telegram_service.alert_api_error(
+                            context=f"{method} {path}",
+                            error=str(last_exc)[:300],
+                            status_code=_code,
+                        )
+                    )
+                except Exception:
+                    pass  # Alert is best-effort — never block the raise
+
+        raise last_exc  # type: ignore[misc]
 
     @staticmethod
     def _to_ep(price: float) -> int:

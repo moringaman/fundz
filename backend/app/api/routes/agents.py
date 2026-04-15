@@ -9,6 +9,7 @@ from sqlalchemy.orm import selectinload
 from app.database import get_db
 from app.models import Agent as DBAgent, AgentSignal as DBAgentSignal, SignalType
 from app.services.backtest import BacktestConfig, backtest_engine
+import app.strategies as strategy_registry
 
 router = APIRouter(prefix="/agents", tags=["agents"])
 
@@ -17,27 +18,20 @@ class AgentConfig(BaseModel):
     name: str
     strategy_type: str
     trading_pairs: List[str]
+    trader_id: Optional[str] = None
     allocation_percentage: float = 10.0
     max_position_size: float = 0.1
     risk_limit: float = 2.0
-    stop_loss_pct: float = 2.0
-    take_profit_pct: float = 4.0
+    stop_loss_pct: float = 3.5
+    take_profit_pct: float = 7.0
     trailing_stop_pct: Optional[float] = None
     run_interval_seconds: int = 3600
     indicators_config: dict = {}
     timeframe: str = "1h"
 
 
-# Permitted timeframes per strategy — used for validation and UI hints
-STRATEGY_TIMEFRAMES: dict = {
-    "scalping":        {"default": "5m",  "allowed": ["1m", "5m", "15m"]},
-    "momentum":        {"default": "15m", "allowed": ["15m", "30m", "1h"]},
-    "mean_reversion":  {"default": "1h",  "allowed": ["15m", "30m", "1h", "4h"]},
-    "breakout":        {"default": "1h",  "allowed": ["30m", "1h", "4h"]},
-    "trend_following": {"default": "4h",  "allowed": ["1h", "4h", "1d"]},
-    "grid":            {"default": "15m", "allowed": ["5m", "15m", "30m", "1h"]},
-    "ai":              {"default": "1h",  "allowed": ["5m", "15m", "30m", "1h", "4h", "1d"]},
-}
+# Permitted timeframes per strategy — loaded from registry
+STRATEGY_TIMEFRAMES: dict = strategy_registry.strategy_timeframes()
 
 ALL_TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"]
 
@@ -55,8 +49,8 @@ class Agent(BaseModel):
     allocation_percentage: float = 10.0
     max_position_size: float = 0.1
     risk_limit: float = 2.0
-    stop_loss_pct: float = 2.0
-    take_profit_pct: float = 4.0
+    stop_loss_pct: float = 3.5
+    take_profit_pct: float = 7.0
     trailing_stop_pct: Optional[float] = None
     run_interval_seconds: int = 3600
     indicators_config: dict = {}
@@ -85,8 +79,8 @@ def agent_to_response(db_agent: DBAgent) -> Agent:
         allocation_percentage=db_agent.allocation_percentage,
         max_position_size=db_agent.max_position_size,
         risk_limit=db_agent.risk_limit,
-        stop_loss_pct=db_agent.config.get("stop_loss_pct", 2.0),
-        take_profit_pct=db_agent.config.get("take_profit_pct", 4.0),
+        stop_loss_pct=db_agent.config.get("stop_loss_pct", 3.5),
+        take_profit_pct=db_agent.config.get("take_profit_pct", 7.0),
         trailing_stop_pct=db_agent.config.get("trailing_stop_pct"),
         run_interval_seconds=db_agent.run_interval_seconds,
         indicators_config=db_agent.config.get("indicators_config", {}),
@@ -102,6 +96,28 @@ async def get_strategy_timeframes():
     return STRATEGY_TIMEFRAMES
 
 
+@router.get("/strategies")
+async def get_strategies(db: AsyncSession = Depends(get_db)):
+    """Returns full strategy definitions (YAML + DB overrides) for UI consumption."""
+    from app.models import StrategyOverride
+    from sqlalchemy import select as sa_select
+    result = await db.execute(sa_select(StrategyOverride))
+    rows = result.scalars().all()
+    overrides = {
+        r.strategy_type: {
+            "enabled": r.enabled,
+            "display_order": r.display_order,
+            "default_stop_loss_pct": r.default_stop_loss_pct,
+            "default_take_profit_pct": r.default_take_profit_pct,
+            "default_trailing_stop_pct": r.default_trailing_stop_pct,
+            "default_timeframe": r.default_timeframe,
+            "notes": r.notes,
+        }
+        for r in rows
+    }
+    return strategy_registry.for_ui(overrides)
+
+
 @router.get("", response_model=List[Agent])
 async def get_agents(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(DBAgent))
@@ -112,10 +128,38 @@ async def get_agents(db: AsyncSession = Depends(get_db)):
 @router.post("", response_model=Agent)
 async def create_agent(config: AgentConfig, db: AsyncSession = Depends(get_db)):
     import uuid
+
+    # Validate strategy type is in registry
+    if config.strategy_type not in strategy_registry.all_types():
+        raise HTTPException(status_code=400, detail=f"Unknown strategy type '{config.strategy_type}'")
+
+    # Check that the strategy is enabled in the registry
+    from app.models import StrategyOverride
+    override = (await db.execute(
+        select(StrategyOverride).where(StrategyOverride.strategy_type == config.strategy_type)
+    )).scalar_one_or_none()
+    if override and not override.enabled:
+        raise HTTPException(status_code=400, detail=f"Strategy '{config.strategy_type}' is currently disabled in the strategy registry")
+
+    # Enforce 4-agent cap per trader
+    if config.trader_id:
+        trader_agents = (await db.execute(
+            select(DBAgent).where(
+                DBAgent.trader_id == config.trader_id,
+                DBAgent.is_enabled == True,
+            )
+        )).scalars().all()
+        if len(trader_agents) >= 4:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Trader already has {len(trader_agents)} active agents (maximum 4 per trader)"
+            )
+
     agent_id = str(uuid.uuid4())
     agent = DBAgent(
         id=agent_id,
-        user_id="default-user",  # TODO: Add proper user auth
+        user_id="default-user",
+        trader_id=config.trader_id,
         name=config.name,
         strategy_type=config.strategy_type,
         config={

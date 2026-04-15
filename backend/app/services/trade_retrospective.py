@@ -146,7 +146,10 @@ class TradeRetrospectiveService:
             agents_by_id = {a["id"]: a for a in agents_list}
             agent_insights = self._compute_agent_insights(analyses, agents_by_id)
 
-            # Generate parameter adjustment recommendations
+            # Aggregate cross-agent strategy insights
+            strategy_insights = self._compute_strategy_insights(analyses, agents_by_id)
+
+            # Generate parameter adjustment recommendations (including SL widening)
             adjustments = self._recommend_adjustments(analyses, agents_by_id)
 
             # Build summary
@@ -155,6 +158,7 @@ class TradeRetrospectiveService:
             result = {
                 "trade_analyses": [self._analysis_to_dict(a) for a in analyses],
                 "agent_insights": agent_insights,
+                "strategy_insights": strategy_insights,
                 "parameter_adjustments": adjustments,
                 "summary": summary,
                 "analyzed_at": datetime.utcnow().isoformat(),
@@ -414,6 +418,107 @@ class TradeRetrospectiveService:
 
         return insights
 
+    def _compute_strategy_insights(
+        self,
+        analyses: List[TradeAnalysis],
+        agents_by_id: Dict[str, Dict],
+    ) -> Dict[str, Dict[str, Any]]:
+        """Aggregate trade analyses across ALL agents of the same strategy type.
+
+        This produces cross-agent learning: if every momentum agent is losing
+        on counter-trend entries, the insight applies to momentum as a whole.
+        """
+        # Map agent_id → strategy_type
+        agent_strategy: Dict[str, str] = {}
+        for agent_id, agent in agents_by_id.items():
+            stype = (agent.get("config") or {}).get("strategy_type") or agent.get("strategy_type", "")
+            if stype:
+                agent_strategy[agent_id] = stype
+
+        # Group by strategy
+        strategy_trades: Dict[str, List[TradeAnalysis]] = {}
+        for a in analyses:
+            if not a.agent_id:
+                continue
+            stype = agent_strategy.get(a.agent_id)
+            if stype:
+                strategy_trades.setdefault(stype, []).append(a)
+
+        insights: Dict[str, Dict[str, Any]] = {}
+        for stype, trades in strategy_trades.items():
+            if len(trades) < 2:
+                continue  # need at least 2 trades for any meaningful signal
+
+            wins = [t for t in trades if t.result == "win"]
+            losses = [t for t in trades if t.result == "loss"]
+            total = len(trades)
+            win_rate = len(wins) / total
+            avg_win_pct = sum(t.pnl_pct for t in wins) / len(wins) if wins else 0.0
+            avg_loss_pct = sum(t.pnl_pct for t in losses) / len(losses) if losses else 0.0
+
+            # Pattern frequency across all agents in this strategy
+            patterns: Dict[str, Dict] = {}
+            for t in trades:
+                if t.pattern_label:
+                    for p in t.pattern_label.split(", "):
+                        patterns.setdefault(p, {"total": 0, "wins": 0})
+                        patterns[p]["total"] += 1
+                        if t.result == "win":
+                            patterns[p]["wins"] += 1
+
+            pattern_win_rates = {
+                p: s["wins"] / s["total"]
+                for p, s in patterns.items()
+                if s["total"] >= 2
+            }
+            best_pattern = max(pattern_win_rates, key=pattern_win_rates.get) if pattern_win_rates else None
+            worst_pattern = min(pattern_win_rates, key=pattern_win_rates.get) if pattern_win_rates else None
+
+            # Confidence multiplier: strategy-level WR drives a multiplier applied
+            # to all agents of this type during signal generation.
+            # Excellent (>65%) → +10% boost; Poor (<35%) → -20% penalty; neutral otherwise
+            if win_rate > 0.65:
+                confidence_adj = 0.10
+                confidence_adj_reason = f"{stype} strategy firing well across all agents ({win_rate:.0%} WR) — boosting confidence"
+            elif win_rate < 0.35:
+                confidence_adj = -0.20
+                confidence_adj_reason = f"{stype} strategy underperforming across all agents ({win_rate:.0%} WR) — reducing confidence"
+            else:
+                confidence_adj = 0.0
+                confidence_adj_reason = ""
+
+            weaknesses = []
+            strengths = []
+
+            if worst_pattern and pattern_win_rates.get(worst_pattern, 1.0) < 0.30:
+                weaknesses.append(f"{worst_pattern} setups fail strategy-wide ({pattern_win_rates[worst_pattern]:.0%} WR)")
+            if best_pattern and pattern_win_rates.get(best_pattern, 0.0) > 0.70:
+                strengths.append(f"{best_pattern} setups work strategy-wide ({pattern_win_rates[best_pattern]:.0%} WR)")
+            if avg_loss_pct < -3.0:
+                weaknesses.append(f"Average loss is large ({avg_loss_pct:.1f}%) — SL may be too wide across strategy")
+            if win_rate < 0.35:
+                weaknesses.append(f"Win rate below 35% across all {stype} agents — consider pausing strategy or reviewing regime fit")
+
+            # Agents contributing to this strategy
+            agent_ids = list({a.agent_id for a in trades if a.agent_id})
+
+            insights[stype] = {
+                "strategy_type": stype,
+                "total_trades": total,
+                "agent_count": len(agent_ids),
+                "win_rate": round(win_rate, 3),
+                "avg_win_pct": round(avg_win_pct, 2),
+                "avg_loss_pct": round(avg_loss_pct, 2),
+                "best_pattern": best_pattern,
+                "worst_pattern": worst_pattern,
+                "strengths": strengths,
+                "weaknesses": weaknesses,
+                "confidence_adj": confidence_adj,
+                "confidence_adj_reason": confidence_adj_reason,
+            }
+
+        return insights
+
     def _recommend_adjustments(
         self,
         analyses: List[TradeAnalysis],
@@ -429,7 +534,7 @@ class TradeRetrospectiveService:
                 agent_trades.setdefault(a.agent_id, []).append(a)
 
         for agent_id, trades in agent_trades.items():
-            if len(trades) < 3:
+            if len(trades) < 2:
                 continue  # need minimum sample size
 
             losses = [t for t in trades if t.result == "loss"]
@@ -461,7 +566,7 @@ class TradeRetrospectiveService:
                 win_maes = [t.max_adverse for t in wins if t.max_adverse is not None]
                 avg_win_mae = sum(win_maes) / len(win_maes) if win_maes else 1.0
 
-                # If losing trades go much further against us than winning trades
+                # If losing trades go much further against us than winning trades — tighten SL
                 if avg_mae > avg_win_mae * 2 and avg_mae > 2.0:
                     recommended_sl = round(avg_win_mae * 1.5, 1)  # 1.5x the typical winner's drawdown
                     if 0.5 <= recommended_sl <= 8.0:
@@ -471,6 +576,38 @@ class TradeRetrospectiveService:
                             "stop_loss_pct": recommended_sl,
                             "reason": f"Stop-losses too wide (avg {avg_mae:.1f}% adverse) — tighter SL at {recommended_sl:.1f}% based on winning trade drawdowns",
                         })
+
+            # ── NEW: detect stops being hit by noise (SL too tight) ──────────
+            # Signal: many losses have very small MAE (< 1%) but good MFE later
+            # — the trade was stopped out on a minor dip before recovering.
+            # Recommend a wider SL to give the trade room to breathe.
+            if wins and losses:
+                # Small-MAE losses: stopped out within 1% of entry
+                small_mae_losses = [t for t in losses if t.max_adverse is not None and t.max_adverse < 1.0]
+                if len(small_mae_losses) >= 2 and len(small_mae_losses) / max(len(losses), 1) >= 0.5:
+                    # At least half of losses are small-MAE — likely noise stops
+                    avg_small_mae = sum(t.max_adverse for t in small_mae_losses) / len(small_mae_losses)
+                    # Only recommend wider SL if wins have higher MAE (they survive the dip)
+                    if win_maes:
+                        avg_win_mae_for_wide = sum(win_maes) / len(win_maes)
+                        if avg_win_mae_for_wide > avg_small_mae * 1.5:
+                            recommended_sl = round(avg_win_mae_for_wide * 1.2, 1)
+                            current_sl = (agents_by_id.get(agent_id) or {}).get("config", {})
+                            if isinstance(current_sl, dict):
+                                current_sl = current_sl.get("stop_loss_pct", 999)
+                            else:
+                                current_sl = 999
+                            if 0.5 <= recommended_sl <= 10.0 and recommended_sl > float(current_sl) * 0.9:
+                                adjustments.append({
+                                    "agent_id": agent_id,
+                                    "agent_name": agent_name,
+                                    "stop_loss_pct": recommended_sl,
+                                    "reason": (
+                                        f"{len(small_mae_losses)} losses stopped out within 1% of entry "
+                                        f"(avg MAE {avg_small_mae:.2f}%) while wins survive avg {avg_win_mae_for_wide:.2f}% dip "
+                                        f"— widening SL to {recommended_sl:.1f}% to reduce noise stops"
+                                    ),
+                                })
 
             # Check for exit efficiency issues (leaving money on the table)
             win_effs = [t.exit_efficiency for t in wins if t.exit_efficiency is not None]

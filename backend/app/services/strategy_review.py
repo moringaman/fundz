@@ -65,6 +65,7 @@ class StrategyReviewService:
         agents: List[Dict],
         agent_metrics: List[Dict],
         market_condition: MarketCondition,
+        analyst_report=None,  # Optional[ResearchReport] — Marina's latest regime analysis
     ) -> StrategyReviewResult:
         """
         Joint FM + TA strategy review. Called from agent_scheduler._run_team_analysis().
@@ -73,7 +74,7 @@ class StrategyReviewService:
         1. TA: Get confluence scores for all symbols agents trade
         2. TA: Evaluate strategy fit for each agent against current conditions
         3. FM: Score each agent on performance + TA fit
-        4. Joint: Propose actions (create/disable/enable/adjust)
+        4. Joint: Propose actions (create/disable/enable/adjust), boosted by Marina's regime recs
         5. Return structured result for team chat + execution
         """
         timestamp = datetime.utcnow()
@@ -145,9 +146,9 @@ class StrategyReviewService:
             }
             agent_evaluations.append(evaluation)
 
-        # 4. Propose actions
+        # 4. Propose actions — pass Marina's recommendations for regime-boosted scoring
         proposed_actions = await self._propose_actions(
-            agent_evaluations, confluence_scores, market_condition
+            agent_evaluations, confluence_scores, market_condition, analyst_report
         )
 
         # 5. Build summary
@@ -166,10 +167,19 @@ class StrategyReviewService:
         evaluations: List[Dict],
         confluence_scores: Dict,
         market_condition: MarketCondition,
+        analyst_report=None,  # Optional[ResearchReport]
     ) -> List[StrategyActionProposal]:
         proposals: List[StrategyActionProposal] = []
         creates = 0
         disables = 0
+
+        # Build a quick lookup: strategy_type → priority from Marina's recommendations
+        marina_priority: Dict[str, float] = {}
+        marina_symbols: Dict[str, List[str]] = {}
+        if analyst_report and getattr(analyst_report, 'strategy_recommendations', None):
+            for rec in analyst_report.strategy_recommendations:
+                marina_priority[rec.strategy_type] = rec.priority
+                marina_symbols[rec.strategy_type] = rec.recommended_symbols
 
         # Sort by combined score to process worst first
         sorted_evals = sorted(evaluations, key=lambda e: e['combined_score'])
@@ -240,7 +250,8 @@ class StrategyReviewService:
         # CREATE: Check if there's an opportunity for an underserved strategy
         if creates < self.MAX_CREATES_PER_CYCLE:
             proposal = await self._evaluate_new_agent_opportunity(
-                evaluations, confluence_scores, market_condition
+                evaluations, confluence_scores, market_condition,
+                marina_priority=marina_priority, marina_symbols=marina_symbols,
             )
             if proposal:
                 proposals.append(proposal)
@@ -252,14 +263,41 @@ class StrategyReviewService:
         evaluations: List[Dict],
         confluence_scores: Dict,
         market_condition: MarketCondition,
+        marina_priority: Dict[str, float] = None,
+        marina_symbols: Dict[str, List[str]] = None,
     ) -> Optional[StrategyActionProposal]:
         """Check if market conditions warrant creating a new agent."""
+        import app.strategies as strategy_registry
         existing_strategies = {ev['strategy_type'] for ev in evaluations}
-        all_strategies = ['momentum', 'mean_reversion', 'breakout']
+        # Load enabled candidates from DB-merged registry; grid requires Marina's explicit recommendation
+        try:
+            from app.database import get_async_session
+            from app.models import StrategyOverride
+            from sqlalchemy import select as sa_select
+            async with get_async_session() as _db:
+                _result = await _db.execute(sa_select(StrategyOverride))
+                _enabled = {r.strategy_type for r in _result.scalars().all() if r.enabled}
+        except Exception:
+            _enabled = set(strategy_registry.all_types())  # fallback: treat all as enabled
+        all_strategies = [
+            s for s in strategy_registry.ai_proposable()
+            if s != 'ai' and s in _enabled
+        ]
+        if not marina_priority.get('grid', 0):
+            all_strategies = [s for s in all_strategies if s != 'grid']
         missing = [s for s in all_strategies if s not in existing_strategies]
 
         if not missing:
             return None
+
+        marina_priority = marina_priority or {}
+        marina_symbols = marina_symbols or {}
+
+        # Sort missing strategies by Marina's priority (higher → try first)
+        def _marina_rank(s):
+            return marina_priority.get(s, 0.0)
+
+        missing.sort(key=_marina_rank, reverse=True)
 
         # Pick the best missing strategy for current conditions
         best_strategy = None
@@ -271,10 +309,15 @@ class StrategyReviewService:
             # Quick backtest to validate on the best confluence symbol
             try:
                 symbol = 'BTCUSDT'
-                for sym, data in confluence_scores.items():
-                    if data.get('score', 0) > best_confluence:
-                        best_confluence = data['score']
-                        symbol = sym
+                # Marina's recommended symbols take precedence over pure confluence ranking
+                if strategy in marina_symbols and marina_symbols[strategy]:
+                    symbol = marina_symbols[strategy][0]
+                    best_confluence = marina_priority.get(strategy, self.CREATE_THRESHOLD_SCORE)
+                else:
+                    for sym, data in confluence_scores.items():
+                        if data.get('score', 0) > best_confluence:
+                            best_confluence = data['score']
+                            symbol = sym
 
                 if best_confluence < self.CREATE_THRESHOLD_SCORE:
                     continue
@@ -302,7 +345,11 @@ class StrategyReviewService:
                 "breakout": "Breakout Hunter",
                 "scalping": "Scalp Sniper",
                 "trend_following": "Trend Follower",
+                "grid": "Grid Trader",
             }
+            marina_note = ""
+            if best_strategy in marina_priority:
+                marina_note = f" Marina research priority: {marina_priority[best_strategy]:.0%}."
             return StrategyActionProposal(
                 action="create_agent",
                 target_agent_id=None,
@@ -321,7 +368,7 @@ class StrategyReviewService:
                     f"${(best_bt_result.net_pnl or 0):.2f} net PnL, "
                     f"Sharpe {(best_bt_result.sharpe_ratio or 0):.2f} "
                     f"over {best_bt_result.total_trades} trades. "
-                    f"Market confluence: {(best_confluence or 0):.2f}."
+                    f"Market confluence: {(best_confluence or 0):.2f}.{marina_note}"
                 ),
                 initiated_by="joint",
                 confluence_score=best_confluence,

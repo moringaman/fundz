@@ -46,15 +46,15 @@ class BacktestConfig:
     take_profit_pct: float = 0.05
     strategy: str = "momentum"
     # Fee modeling — defaults to spot USDT rates (most agents trade USDT pairs)
-    # Phemex spot taker: 0.10% | Phemex contract taker: 0.06%
-    maker_fee_pct: float = 0.10   # 0.10% spot maker/taker (conservative)
-    taker_fee_pct: float = 0.10   # 0.10% spot taker fee
+    # Phemex perpetual contract taker: 0.06% | spot taker: 0.10%
+    maker_fee_pct: float = 0.06   # Phemex perpetual contract maker fee
+    taker_fee_pct: float = 0.06   # Phemex perpetual contract taker fee
     slippage_pct: float = 0.02    # 0.02% estimated slippage
     # Trailing stop
     use_trailing_stop: bool = False
     trailing_stop_pct: float = 0.03  # 3% trailing stop
     # Data window — 1000 candles: ~42 days on 1h, ~10 days on 15m, ~167 days on 4h
-    candle_limit: int = 1000      # configurable, supports >500 via pagination
+    candle_limit: int = 2000      # configurable; fetched in paginated 1000-candle batches
 
 
 class BacktestEngine:
@@ -89,12 +89,20 @@ class BacktestEngine:
         drawdown_curve: List[float] = []
         peak_balance = balance
 
+        # Scale-out schedule for backtest — mirrors live _SCALE_PROFILES "default"
+        # [(pct_of_tp_range, close_pct), ...]
+        _SCALE_LEVELS = [(0.33, 0.25), (0.60, 0.35)]
+
         for i in range(50, len(df)):
             current_time = df.iloc[i]['time']
             current_price = float(df.iloc[i]['close'])
 
             signal = self.indicator_service.generate_signal(df.iloc[:i + 1], {'strategy': config.strategy})
             signal_action = signal.signal.value if signal.signal else 'hold'
+
+            # Mirror the live agent confidence gate — only trade signals with meaningful edge
+            if signal.confidence < 0.6:
+                signal_action = 'hold'
 
             # --- ENTRY ---
             if position is None and signal_action in ['buy', 'sell']:
@@ -114,6 +122,7 @@ class BacktestEngine:
                     'entry_price': fill_price,
                     'quantity': quantity,
                     'entry_time': current_time,
+                    'scale_triggered': [False] * len(_SCALE_LEVELS),  # track per-level
                 }
                 entry_price = fill_price
                 trailing_high = fill_price
@@ -143,6 +152,43 @@ class BacktestEngine:
                 else:
                     pnl_pct = (entry_price - current_price) / entry_price
 
+                tp_pct = config.take_profit_pct  # e.g. 0.06 for 6%
+
+                # ── Scale-out partial closes ──────────────────────────────────
+                if pnl_pct > 0:
+                    _progress = pnl_pct / tp_pct if tp_pct > 0 else 0
+                    for _li, (_threshold, _close_pct) in enumerate(_SCALE_LEVELS):
+                        if position['scale_triggered'][_li]:
+                            continue
+                        if _progress >= _threshold:
+                            _close_qty = position['quantity'] * _close_pct
+                            if position['side'] == 'buy':
+                                _fill = current_price - current_price * config.slippage_pct / 100
+                                _slice_pnl = _close_qty * (_fill - entry_price)
+                            else:
+                                _fill = current_price + current_price * config.slippage_pct / 100
+                                _slice_pnl = _close_qty * (entry_price - _fill)
+                            _slice_fee = _close_qty * _fill * config.taker_fee_pct / 100
+                            _entry_fee_slice = _close_qty * entry_price * config.taker_fee_pct / 100
+                            total_fees += _slice_fee  # entry_fee_slice already in total_fees from entry
+                            _net_slice = _slice_pnl - _slice_fee - _entry_fee_slice
+                            balance += _net_slice
+                            position['quantity'] -= _close_qty
+                            position['scale_triggered'][_li] = True
+                            trades.append({
+                                'time': current_time,
+                                'type': 'EXIT',
+                                'side': position['side'],
+                                'price': _fill,
+                                'quantity': _close_qty,
+                                'pnl': _slice_pnl,
+                                'net_pnl': _net_slice,
+                                'fee': _slice_fee + _entry_fee_slice,
+                                'balance': balance,
+                                'pnl_pct': pnl_pct * 100,
+                                'exit_reason': f'scale_out_{_threshold:.0%}',
+                            })
+
                 # Trailing stop check
                 trailing_stop_hit = False
                 if config.use_trailing_stop:
@@ -157,6 +203,7 @@ class BacktestEngine:
                     pnl_pct <= -config.stop_loss_pct
                     or pnl_pct >= config.take_profit_pct
                     or trailing_stop_hit
+                    or position['quantity'] < 1e-12  # fully scaled out
                 )
 
                 if should_exit:
@@ -169,12 +216,13 @@ class BacktestEngine:
                         fill_price = current_price + slippage
                         raw_pnl = position['quantity'] * (entry_price - fill_price)
 
-                    # Exit fee
+                    # Exit fee + proportional entry fee for remaining quantity
                     exit_notional = position['quantity'] * fill_price
                     exit_fee = exit_notional * config.taker_fee_pct / 100
-                    total_fees += exit_fee
+                    entry_fee_remaining = position['quantity'] * entry_price * config.taker_fee_pct / 100
+                    total_fees += exit_fee  # entry_fee_remaining already in total_fees from entry
 
-                    net_pnl = raw_pnl - exit_fee
+                    net_pnl = raw_pnl - exit_fee - entry_fee_remaining
                     balance += net_pnl
 
                     exit_reason = "signal"
@@ -193,7 +241,7 @@ class BacktestEngine:
                         'quantity': position['quantity'],
                         'pnl': raw_pnl,
                         'net_pnl': net_pnl,
-                        'fee': exit_fee,
+                        'fee': exit_fee + entry_fee_remaining,
                         'balance': balance,
                         'pnl_pct': pnl_pct * 100,
                         'exit_reason': exit_reason,
@@ -212,46 +260,82 @@ class BacktestEngine:
         return self._calculate_metrics(trades, equity_curve, drawdown_curve, config.initial_balance, total_fees)
 
     async def _fetch_historical_data(self, config: BacktestConfig) -> List[Dict]:
-        """Fetch kline data, paginating if more than 500 candles requested."""
+        """
+        Fetch kline data for the backtest window.
+
+        Phemex supports up to ~500 rows per call; Binance supports up to 1000.
+        get_klines() automatically falls back to Binance when Phemex returns fewer
+        rows than requested.  For limits > 1000, we paginate via the endTime cursor
+        so callers simply set candle_limit=2000 (or more) without worrying about batching.
+        """
         try:
-            total_limit = config.candle_limit
-            all_klines: List[Dict] = []
-            remaining = total_limit
+            BATCH = 1000  # Binance/Phemex API max per request
+            remaining = config.candle_limit
+            all_klines: list = []
+            end_time_ms: int | None = None  # None = "up to now"
 
             while remaining > 0:
-                batch_size = min(remaining, 500)
-                response = await self.phemex.get_klines(
-                    symbol=config.symbol,
-                    interval=config.interval,
-                    limit=batch_size
+                batch_limit = min(remaining, BATCH)
+
+                if end_time_ms is not None:
+                    # Paginate backwards via Binance endTime cursor
+                    import httpx
+                    async with httpx.AsyncClient() as hc:
+                        resp = await hc.get(
+                            "https://api.binance.com/api/v3/klines",
+                            params={
+                                "symbol": config.symbol,
+                                "interval": config.interval,
+                                "limit": batch_limit,
+                                "endTime": end_time_ms,
+                            },
+                            timeout=15,
+                        )
+                    raw = resp.json()
+                    batch_data = [
+                        [int(k[0] / 1000), "60", k[1], k[2], k[3], k[4], k[5], k[5], config.symbol]
+                        for k in raw
+                    ]
+                else:
+                    response = await self.phemex.get_klines(
+                        symbol=config.symbol,
+                        interval=config.interval,
+                        limit=batch_limit,
+                    )
+                    batch_data = response.get('data', response) if isinstance(response, dict) else response
+
+                if not batch_data:
+                    break
+
+                all_klines.extend(batch_data)
+                remaining -= len(batch_data)
+
+                if len(batch_data) < batch_limit:
+                    break  # exchange returned fewer than requested — no older data
+
+                oldest_ts_sec = min(
+                    (k[0] / 1000 if k[0] > 1e10 else k[0]) for k in batch_data
                 )
+                end_time_ms = int(oldest_ts_sec * 1000) - 1
 
-                data = response.get('data', response) if isinstance(response, dict) else response
-                if not data:
-                    break
+            if not all_klines:
+                return []
 
-                batch = []
-                for k in data:
-                    batch.append({
-                        'time': k[0] / 1000,
-                        'open': float(k[2]),
-                        'high': float(k[3]),
-                        'low': float(k[4]),
-                        'close': float(k[5]),
-                        'volume': float(k[7]),
-                    })
-
-                all_klines.extend(batch)
-                remaining -= len(batch)
-
-                # Phemex returns at most 500 per call; if we got less, no more data
-                if len(batch) < batch_size:
-                    break
-
-            # De-duplicate by time and sort
-            seen = set()
-            unique = []
+            klines = []
             for k in all_klines:
+                klines.append({
+                    'time': k[0] / 1000 if k[0] > 1e10 else k[0],
+                    'open':   float(k[2]),
+                    'high':   float(k[3]),
+                    'low':    float(k[4]),
+                    'close':  float(k[5]),
+                    'volume': float(k[7]),
+                })
+
+            # De-duplicate and sort ascending
+            seen: set = set()
+            unique = []
+            for k in klines:
                 if k['time'] not in seen:
                     seen.add(k['time'])
                     unique.append(k)

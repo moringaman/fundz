@@ -9,6 +9,7 @@ interface Position {
   entry_price: number;
   current_price: number;
   unrealized_pnl: number;
+  is_paper?: boolean;
 }
 
 const PositionsContainer = styled.div`
@@ -95,11 +96,25 @@ export const PositionsTableComponent: React.FC = () => {
   const [positions, setPositions] = useState<Position[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [isPaper, setIsPaper] = useState(true);
+
+  // Load current mode once on mount (and re-check every 60s)
+  useEffect(() => {
+    const checkMode = () =>
+      axios.get('/api/settings').then((r) => {
+        setIsPaper(r.data?.trading?.paper_trading_default ?? true);
+      }).catch(() => {});
+    checkMode();
+    const id = setInterval(checkMode, 60_000);
+    return () => clearInterval(id);
+  }, []);
 
   const fetchPositions = useCallback(async () => {
     try {
       setLoading(true);
-      const response = await axios.get('/api/trading/positions');
+      // Paper mode → /api/paper/positions, Live mode → /api/trading/positions
+      const url = isPaper ? '/api/paper/positions' : '/api/trading/positions';
+      const response = await axios.get(url);
       setPositions(response.data);
       setError(null);
     } catch (err) {
@@ -108,7 +123,7 @@ export const PositionsTableComponent: React.FC = () => {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [isPaper]);
 
   useEffect(() => {
     fetchPositions();
@@ -118,7 +133,12 @@ export const PositionsTableComponent: React.FC = () => {
 
   return (
     <PositionsContainer>
-      <TableTitle>Open Positions</TableTitle>
+      <TableTitle>
+        Open Positions
+        <span style={{ marginLeft: '10px', fontSize: '0.65rem', fontWeight: 700, color: isPaper ? '#888' : '#ff4444', letterSpacing: '0.1em' }}>
+          {isPaper ? 'PAPER' : 'LIVE'}
+        </span>
+      </TableTitle>
       {loading && <StateMessage>Loading positions…</StateMessage>}
       {error && <StateMessage style={{ color: 'var(--red, #ff5370)' }}>{error}</StateMessage>}
       {!loading && !error && positions.length === 0 && (
@@ -130,6 +150,7 @@ export const PositionsTableComponent: React.FC = () => {
             <tr>
               <th>Symbol</th>
               <th>Side</th>
+              <th>Mode</th>
               <th>Quantity</th>
               <th>Entry Price</th>
               <th>Current Price</th>
@@ -138,9 +159,16 @@ export const PositionsTableComponent: React.FC = () => {
           </thead>
           <tbody>
             {positions.map((position) => (
-              <tr key={position.symbol}>
+              <tr key={`${position.symbol}-${position.side}-${position.is_paper}`}>
                 <td>{position.symbol}</td>
                 <td><SideBadge side={position.side}>{position.side}</SideBadge></td>
+                <td>
+                  {position.is_paper === false ? (
+                    <span style={{ fontSize: '0.68rem', fontWeight: 700, color: '#ff4444', letterSpacing: '0.08em' }}>LIVE</span>
+                  ) : (
+                    <span style={{ fontSize: '0.68rem', color: '#888', letterSpacing: '0.05em' }}>PAPER</span>
+                  )}
+                </td>
                 <td>{position.quantity.toFixed(4)}</td>
                 <td>${position.entry_price.toFixed(2)}</td>
                 <td>${position.current_price.toFixed(2)}</td>

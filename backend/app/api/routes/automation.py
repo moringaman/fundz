@@ -41,6 +41,8 @@ class AgentMetricsResponse(BaseModel):
     total_runs: int
     successful_runs: int
     failed_runs: int
+    actual_trades: int      # closed positions only
+    winning_trades: int     # closed positions with pnl > 0
     total_pnl: float
     buy_signals: int
     sell_signals: int
@@ -130,6 +132,8 @@ async def get_all_metrics():
             total_runs=m.total_runs,
             successful_runs=m.successful_runs,
             failed_runs=m.failed_runs,
+            actual_trades=m.actual_trades,
+            winning_trades=m.winning_trades,
             total_pnl=m.total_pnl,
             buy_signals=m.buy_signals,
             sell_signals=m.sell_signals,
@@ -153,6 +157,8 @@ async def get_agent_metrics(agent_id: str):
         total_runs=metrics.total_runs,
         successful_runs=metrics.successful_runs,
         failed_runs=metrics.failed_runs,
+        actual_trades=metrics.actual_trades,
+        winning_trades=metrics.winning_trades,
         total_pnl=metrics.total_pnl,
         buy_signals=metrics.buy_signals,
         sell_signals=metrics.sell_signals,

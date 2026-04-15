@@ -9,6 +9,7 @@ from app.clients.phemex import PhemexClient
 from app.config import settings
 from app.services.indicators import IndicatorService
 from app.services.llm import LLMService
+from app.services.whale_intelligence import whale_intelligence
 
 logger = logging.getLogger(__name__)
 
@@ -303,6 +304,14 @@ class FundManagerAgent:
                     )
                 confluence_section = "\nTECHNICAL CONFLUENCE (from Technical Analyst):\n" + "\n".join(conf_lines) + "\n"
 
+            # Whale intelligence context
+            try:
+                whale_report = await whale_intelligence.fetch_whale_report()
+                whale_section = whale_intelligence.build_llm_context_block(whale_report)
+                whale_section += whale_intelligence.build_exit_pressure_insights(whale_report)
+            except Exception:
+                whale_section = ""
+
             prompt = f"""You are a professional portfolio manager allocating capital across trading agents.
 
 AVAILABLE CAPITAL: ${total_capital:,.0f}
@@ -313,7 +322,8 @@ Volatility: {market_condition.volatility}
 RSI: {(market_condition.rsi or 50):.1f}
 Momentum: {market_condition.momentum}
 Recommendation: {market_condition.recommendation}
-{confluence_section}
+{confluence_section}{whale_section}
+
 AGENT PERFORMANCE DATA:
 {context}
 
@@ -451,6 +461,14 @@ Determine optimal capital allocation. Return JSON:
                     )
                 confluence_section = "\nTECHNICAL CONFLUENCE:\n" + "\n".join(conf_lines) + "\n"
 
+            # Whale intelligence context
+            try:
+                whale_report = await whale_intelligence.fetch_whale_report()
+                trader_whale_section = whale_intelligence.build_llm_context_block(whale_report)
+                trader_whale_section += whale_intelligence.build_exit_pressure_insights(whale_report)
+            except Exception:
+                trader_whale_section = ""
+
             trader_ids = [t["id"] for t in traders if t.get("is_enabled", True)]
             trader_names = {t["id"]: t.get("name", t["id"]) for t in traders}
 
@@ -464,17 +482,22 @@ Volatility: {market_condition.volatility}
 RSI: {(market_condition.rsi or 50):.1f}
 Momentum: {market_condition.momentum}
 Recommendation: {market_condition.recommendation}
-{confluence_section}
+{confluence_section}{trader_whale_section}
+
 TRADER PERFORMANCE DATA:
 {trader_context}
 
 ALLOCATION RULES:
-1. Allocate more capital to traders with better P&L and win rates
-2. Never allocate less than 15% to any enabled trader (all traders need a minimum to operate)
-3. Never allocate more than 50% to any single trader (diversification requirement)
-4. New traders with no trades should receive close to equal allocation until they prove themselves
-5. Factor in market conditions — in volatile markets prefer traders with higher win rates
-6. Allocations must sum to exactly 100%
+1. Allocate capital in strict proportion to risk-adjusted performance (win rate × P&L quality)
+2. A trader with 2× the win rate of another should receive roughly 2× the capital
+3. Minimum allocation: 10% per enabled trader (floor so all traders can operate)
+4. Maximum allocation: 60% to any single trader (diversification cap)
+5. New traders with zero trades receive equal share until they have ≥5 completed trades
+6. In high-volatility markets, shift weight toward traders with highest win rates over P&L
+7. In trending markets, shift weight toward traders with the highest P&L growth
+8. Underperforming traders (win rate < 40% AND negative P&L) should be at the floor (10%)
+9. Allocations must sum to exactly 100%
+10. Do NOT equalise allocations — performance differences MUST result in allocation differences
 
 Return JSON only:
 {{
@@ -488,10 +511,10 @@ Return JSON only:
                 data = json.loads(response.content)
                 alloc_pct: Dict[str, float] = data.get("allocation_pct", {})
 
-                # Enforce min 15%, max 50%, only for enabled traders
+                # Enforce min 10%, max 60%, only for enabled traders
                 for tid in trader_ids:
                     pct = alloc_pct.get(tid, 100.0 / len(trader_ids))
-                    alloc_pct[tid] = max(15.0, min(50.0, pct))
+                    alloc_pct[tid] = max(10.0, min(60.0, pct))
 
                 # Normalise to 100
                 total = sum(alloc_pct.get(tid, 0) for tid in trader_ids)

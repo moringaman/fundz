@@ -1,11 +1,11 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Key, Brain, Save, Eye, EyeOff, Check, RefreshCw, Info, AlertTriangle, TrendingUp, Shield, Mail, Send, Bell, Wallet, Plus, Minus, MessageCircle, Volume2 } from 'lucide-react';
+import { Key, Brain, Save, Eye, EyeOff, Check, RefreshCw, Info, AlertTriangle, TrendingUp, Shield, Mail, Send, Bell, Wallet, Plus, Minus, MessageCircle, Volume2, SlidersHorizontal } from 'lucide-react';
 import { useSettings } from '../hooks/useQueries';
 import { settingsApi, paperApi } from '../lib/api';
 import { notificationService, type NotificationPreferences } from '../lib/notifications';
 import { SoundSettings } from '../components/settings/SoundSettings';
 
-type SettingsTab = 'api' | 'risk' | 'trading' | 'llm' | 'email' | 'notifications' | 'telegram' | 'sounds';
+type SettingsTab = 'api' | 'risk' | 'trading' | 'gates' | 'llm' | 'email' | 'notifications' | 'telegram' | 'sounds';
 
 export function SettingsPage() {
   const { data: settingsData, refetch: refetchSettings } = useSettings();
@@ -55,6 +55,38 @@ export function SettingsPage() {
     openrouter_api_key: '',
   });
 
+  const [gatesForm, setGatesForm] = useState({
+    min_entry_confidence: 0.60,
+    ta_veto_confidence: 0.75,
+    mtf_confluence_block_score: 0.40,
+    mtf_strong_alignment_score: 0.55,
+    mtf_aligned_boost: 0.10,
+    mtf_opposed_penalty: 0.25,
+    mtf_mixed_penalty: 0.20,
+    htf_aligned_boost: 0.15,
+    htf_opposed_penalty: 0.30,
+    whale_caution_threshold: 0.75,
+    whale_info_threshold: 0.65,
+    whale_bull_threshold: 0.30,
+    whale_entry_gate_enabled: true,
+    min_runs_before_disable: 15,
+    circuit_breaker_max_trades: 30,
+    max_same_asset_positions: 2,
+    max_directional_concentration_pct: 40.0,
+    confidence_size_reference: 0.65,
+    confidence_size_floor: 0.50,
+    ta_boost_multiplier: 0.20,
+    ta_penalty_multiplier: 0.40,
+    ta_min_confidence: 0.60,
+    us_open_blackout_enabled: true,
+    us_open_blackout_start_utc: 1245,
+    us_open_blackout_end_utc: 1330,
+    us_open_preopen_sl_tighten: true,
+    us_open_preopen_tighten_utc: 1230,
+    us_open_confirmation_end_utc: 1415,
+    us_open_confirmation_confidence: 0.80,
+  });
+
   // Hydrate forms from server data
   useEffect(() => {
     if (!settingsData) return;
@@ -70,6 +102,7 @@ export function SettingsPage() {
         max_tokens: settingsData.llm.max_tokens,
       }));
     }
+    if (settingsData.gates) setGatesForm(settingsData.gates);
   }, [settingsData]);
 
   // ── Telegram state ──
@@ -77,6 +110,7 @@ export function SettingsPage() {
     bot_token: '',
     chat_id: '',
     enabled: false,
+    polling_enabled: false,
     trade_executed: true,
     trade_rejected: true,
     ta_veto: true,
@@ -268,10 +302,24 @@ export function SettingsPage() {
     }
   };
 
+  const handleSaveGates = async () => {
+    setSaving(true);
+    try {
+      await settingsApi.updateTradingGates(gatesForm);
+      showToast('Trading gates updated', 'success');
+      refetchSettings();
+    } catch (err) {
+      showToast('Failed to update trading gates', 'error');
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const tabs: { id: SettingsTab; label: string; icon: React.ReactNode }[] = [
     { id: 'api', label: 'API Keys', icon: <Key size={14} /> },
     { id: 'risk', label: 'Risk Limits', icon: <Shield size={14} /> },
     { id: 'trading', label: 'Trading', icon: <TrendingUp size={14} /> },
+    { id: 'gates', label: 'Trade Gates', icon: <SlidersHorizontal size={14} /> },
     { id: 'llm', label: 'AI / LLM', icon: <Brain size={14} /> },
     { id: 'email', label: 'Email', icon: <Mail size={14} /> },
     { id: 'notifications', label: 'Notifications', icon: <Bell size={14} /> },
@@ -1027,6 +1075,343 @@ export function SettingsPage() {
         </div>
       )}
 
+      {/* ── Trading Gates Tab ── */}
+      {activeTab === 'gates' && (
+        <div className="settings-card space-y-4">
+          <div style={{ display: 'flex', alignItems: 'center', gap: '.5rem', marginBottom: '.25rem' }}>
+            <SlidersHorizontal size={16} style={{ color: 'var(--accent)' }} />
+            <h2 className="settings-title" style={{ marginBottom: 0 }}>Trading Gate Thresholds</h2>
+          </div>
+          <p style={{ fontSize: '.8rem', color: 'var(--text-secondary)', lineHeight: 1.5, marginBottom: '1rem' }}>
+            All values that govern when trades are allowed, blocked, boosted, or penalised. Changes take effect immediately — no restart required.
+          </p>
+
+          {/* Entry & TA Veto */}
+          <div style={{ borderBottom: '1px solid var(--border)', paddingBottom: '1.25rem', marginBottom: '1.25rem' }}>
+            <p style={{ fontSize: '.75rem', fontWeight: 700, color: 'var(--accent)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: '.75rem' }}>
+              Entry Confidence
+            </p>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+              <div>
+                <label className="settings-label">Min Entry Confidence</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>Signal must exceed this to enter a trade (0–1)</p>
+                <input type="number" step="0.01" min="0.1" max="1.0" className="settings-input"
+                  value={gatesForm.min_entry_confidence}
+                  onChange={e => setGatesForm(p => ({ ...p, min_entry_confidence: parseFloat(e.target.value) }))} />
+              </div>
+              <div>
+                <label className="settings-label">TA Veto Confidence</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>TA analyst blocks entry above this confidence when opposing</p>
+                <input type="number" step="0.01" min="0.1" max="1.0" className="settings-input"
+                  value={gatesForm.ta_veto_confidence}
+                  onChange={e => setGatesForm(p => ({ ...p, ta_veto_confidence: parseFloat(e.target.value) }))} />
+              </div>
+              <div>
+                <label className="settings-label">TA Boost Multiplier</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>Confidence fraction added when TA agrees</p>
+                <input type="number" step="0.01" min="0" max="0.5" className="settings-input"
+                  value={gatesForm.ta_boost_multiplier}
+                  onChange={e => setGatesForm(p => ({ ...p, ta_boost_multiplier: parseFloat(e.target.value) }))} />
+              </div>
+              <div>
+                <label className="settings-label">TA Penalty Multiplier</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>Confidence fraction removed when TA opposes</p>
+                <input type="number" step="0.01" min="0" max="0.9" className="settings-input"
+                  value={gatesForm.ta_penalty_multiplier}
+                  onChange={e => setGatesForm(p => ({ ...p, ta_penalty_multiplier: parseFloat(e.target.value) }))} />
+              </div>
+              <div>
+                <label className="settings-label">TA Min Confidence</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>Minimum TA confidence to apply boost/penalty</p>
+                <input type="number" step="0.01" min="0.1" max="1.0" className="settings-input"
+                  value={gatesForm.ta_min_confidence}
+                  onChange={e => setGatesForm(p => ({ ...p, ta_min_confidence: parseFloat(e.target.value) }))} />
+              </div>
+            </div>
+          </div>
+
+          {/* MTF Confluence */}
+          <div style={{ borderBottom: '1px solid var(--border)', paddingBottom: '1.25rem', marginBottom: '1.25rem' }}>
+            <p style={{ fontSize: '.75rem', fontWeight: 700, color: 'var(--accent)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: '.75rem' }}>
+              Multi-Timeframe (MTF) Confluence
+            </p>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+              <div>
+                <label className="settings-label">MTF Block Score</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>Block trade when alignment=mixed AND score below this</p>
+                <input type="number" step="0.01" min="0" max="1.0" className="settings-input"
+                  value={gatesForm.mtf_confluence_block_score}
+                  onChange={e => setGatesForm(p => ({ ...p, mtf_confluence_block_score: parseFloat(e.target.value) }))} />
+              </div>
+              <div>
+                <label className="settings-label">MTF Strong Alignment Score</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>Score above which aligned MTF applies boost/penalty</p>
+                <input type="number" step="0.01" min="0" max="1.0" className="settings-input"
+                  value={gatesForm.mtf_strong_alignment_score}
+                  onChange={e => setGatesForm(p => ({ ...p, mtf_strong_alignment_score: parseFloat(e.target.value) }))} />
+              </div>
+              <div>
+                <label className="settings-label">MTF Aligned Boost</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>Confidence fraction added when MTF strongly aligns</p>
+                <input type="number" step="0.01" min="0" max="0.5" className="settings-input"
+                  value={gatesForm.mtf_aligned_boost}
+                  onChange={e => setGatesForm(p => ({ ...p, mtf_aligned_boost: parseFloat(e.target.value) }))} />
+              </div>
+              <div>
+                <label className="settings-label">MTF Opposed Penalty</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>Confidence fraction removed when MTF strongly opposes</p>
+                <input type="number" step="0.01" min="0" max="0.9" className="settings-input"
+                  value={gatesForm.mtf_opposed_penalty}
+                  onChange={e => setGatesForm(p => ({ ...p, mtf_opposed_penalty: parseFloat(e.target.value) }))} />
+              </div>
+              <div>
+                <label className="settings-label">MTF Mixed Penalty</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>Confidence fraction removed when MTF alignment is mixed</p>
+                <input type="number" step="0.01" min="0" max="0.9" className="settings-input"
+                  value={gatesForm.mtf_mixed_penalty}
+                  onChange={e => setGatesForm(p => ({ ...p, mtf_mixed_penalty: parseFloat(e.target.value) }))} />
+              </div>
+            </div>
+          </div>
+
+          {/* HTF Adjustments */}
+          <div style={{ borderBottom: '1px solid var(--border)', paddingBottom: '1.25rem', marginBottom: '1.25rem' }}>
+            <p style={{ fontSize: '.75rem', fontWeight: 700, color: 'var(--accent)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: '.75rem' }}>
+              Higher Timeframe (HTF) Adjustments
+            </p>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+              <div>
+                <label className="settings-label">HTF Aligned Boost</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>Confidence boost when HTF trend aligns with signal</p>
+                <input type="number" step="0.01" min="0" max="0.5" className="settings-input"
+                  value={gatesForm.htf_aligned_boost}
+                  onChange={e => setGatesForm(p => ({ ...p, htf_aligned_boost: parseFloat(e.target.value) }))} />
+              </div>
+              <div>
+                <label className="settings-label">HTF Opposed Penalty</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>Confidence penalty when HTF trend opposes signal</p>
+                <input type="number" step="0.01" min="0" max="0.9" className="settings-input"
+                  value={gatesForm.htf_opposed_penalty}
+                  onChange={e => setGatesForm(p => ({ ...p, htf_opposed_penalty: parseFloat(e.target.value) }))} />
+              </div>
+            </div>
+          </div>
+
+          {/* Whale Sentiment */}
+          <div style={{ borderBottom: '1px solid var(--border)', paddingBottom: '1.25rem', marginBottom: '1.25rem' }}>
+            <p style={{ fontSize: '.75rem', fontWeight: 700, color: 'var(--accent)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: '.75rem' }}>
+              Whale Sentiment
+            </p>
+
+            {/* Master toggle */}
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '.6rem .85rem', background: 'var(--bg-elevated)', border: '1px solid var(--border)', borderRadius: '6px', marginBottom: '1rem' }}>
+              <div>
+                <div style={{ fontSize: '.8rem', fontWeight: 600, color: 'var(--text-primary)' }}>Whale Entry Gate</div>
+                <div style={{ fontSize: '.68rem', color: 'var(--text-secondary)' }}>
+                  {gatesForm.whale_entry_gate_enabled
+                    ? '70%+ opposing whale notional will hard-block new entries'
+                    : 'Whale positioning is ignored for trade entry decisions (test mode)'}
+                </div>
+              </div>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '.5rem', cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={gatesForm.whale_entry_gate_enabled}
+                  onChange={e => setGatesForm(p => ({ ...p, whale_entry_gate_enabled: e.target.checked }))}
+                  style={{ accentColor: 'var(--accent)', cursor: 'pointer', width: '1rem', height: '1rem' }}
+                />
+                <span style={{ fontSize: '.75rem', fontWeight: 600, color: gatesForm.whale_entry_gate_enabled ? 'var(--accent)' : 'var(--text-dim)' }}>
+                  {gatesForm.whale_entry_gate_enabled ? 'ON' : 'OFF'}
+                </span>
+              </label>
+            </div>
+
+            <p style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-secondary)', marginBottom: '.5rem' }}>Thresholds</p>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '1rem' }}>
+              <div>
+                <label className="settings-label">Caution Threshold</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>% SHORT that elevates risk to CAUTION</p>
+                <input type="number" step="0.01" min="0.5" max="1.0" className="settings-input"
+                  value={gatesForm.whale_caution_threshold}
+                  onChange={e => setGatesForm(p => ({ ...p, whale_caution_threshold: parseFloat(e.target.value) }))} />
+              </div>
+              <div>
+                <label className="settings-label">Info Threshold</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>% SHORT that adds an informational warning</p>
+                <input type="number" step="0.01" min="0.5" max="1.0" className="settings-input"
+                  value={gatesForm.whale_info_threshold}
+                  onChange={e => setGatesForm(p => ({ ...p, whale_info_threshold: parseFloat(e.target.value) }))} />
+              </div>
+              <div>
+                <label className="settings-label">Bull Threshold</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>% SHORT below which bullish positioning is noted</p>
+                <input type="number" step="0.01" min="0" max="0.5" className="settings-input"
+                  value={gatesForm.whale_bull_threshold}
+                  onChange={e => setGatesForm(p => ({ ...p, whale_bull_threshold: parseFloat(e.target.value) }))} />
+              </div>
+            </div>
+          </div>
+
+          {/* Agent Lifecycle & Circuit Breaker */}
+          <div style={{ borderBottom: '1px solid var(--border)', paddingBottom: '1.25rem', marginBottom: '1.25rem' }}>
+            <p style={{ fontSize: '.75rem', fontWeight: 700, color: 'var(--accent)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: '.75rem' }}>
+              Agent Lifecycle & Circuit Breaker
+            </p>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+              <div>
+                <label className="settings-label">Min Runs Before Disable</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>Minimum trades before CIO/traders can disable an agent</p>
+                <input type="number" step="1" min="5" max="100" className="settings-input"
+                  value={gatesForm.min_runs_before_disable}
+                  onChange={e => setGatesForm(p => ({ ...p, min_runs_before_disable: parseInt(e.target.value) }))} />
+              </div>
+              <div>
+                <label className="settings-label">Max Daily Trades (Circuit Breaker)</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>Halt all trading if this many trades are placed in one day</p>
+                <input type="number" step="1" min="5" max="200" className="settings-input"
+                  value={gatesForm.circuit_breaker_max_trades}
+                  onChange={e => setGatesForm(p => ({ ...p, circuit_breaker_max_trades: parseInt(e.target.value) }))} />
+              </div>
+            </div>
+          </div>
+
+          {/* Position Sizing */}
+          <div style={{ borderBottom: '1px solid var(--border)', paddingBottom: '1.25rem', marginBottom: '1.25rem' }}>
+            <p style={{ fontSize: '.75rem', fontWeight: 700, color: 'var(--accent)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: '.75rem' }}>
+              Position Sizing
+            </p>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+              <div>
+                <label className="settings-label">Confidence Size Reference</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>Confidence level at which full size is allocated</p>
+                <input type="number" step="0.01" min="0.3" max="1.0" className="settings-input"
+                  value={gatesForm.confidence_size_reference}
+                  onChange={e => setGatesForm(p => ({ ...p, confidence_size_reference: parseFloat(e.target.value) }))} />
+              </div>
+              <div>
+                <label className="settings-label">Confidence Size Floor</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>Minimum size multiplier regardless of low confidence</p>
+                <input type="number" step="0.01" min="0.1" max="1.0" className="settings-input"
+                  value={gatesForm.confidence_size_floor}
+                  onChange={e => setGatesForm(p => ({ ...p, confidence_size_floor: parseFloat(e.target.value) }))} />
+              </div>
+              <div>
+                <label className="settings-label">Max Same-Asset Positions</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>Maximum concurrent positions on the same symbol</p>
+                <input type="number" step="1" min="1" max="10" className="settings-input"
+                  value={gatesForm.max_same_asset_positions}
+                  onChange={e => setGatesForm(p => ({ ...p, max_same_asset_positions: parseInt(e.target.value) }))} />
+              </div>
+              <div>
+                <label className="settings-label">Max Directional Concentration %</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>Max % of capital all-long or all-short</p>
+                <input type="number" step="1" min="10" max="100" className="settings-input"
+                  value={gatesForm.max_directional_concentration_pct}
+                  onChange={e => setGatesForm(p => ({ ...p, max_directional_concentration_pct: parseFloat(e.target.value) }))} />
+              </div>
+            </div>
+          </div>
+
+          {/* US Market Open Management */}
+          <div style={{ borderBottom: '1px solid var(--border)', paddingBottom: '1.25rem', marginBottom: '1.25rem' }}>
+            <p style={{ fontSize: '.75rem', fontWeight: 700, color: 'var(--accent)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: '.35rem' }}>
+              US Market Open Management
+            </p>
+            <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', lineHeight: 1.55, marginBottom: '1rem' }}>
+              The 09:00 ET (13:00 UTC) open is the day’s highest-volatility window. US institutions
+              routinely <strong style={{ color: 'var(--text-primary)' }}>fade the Asian/European trend</strong>, triggering stop cascades and
+              sharp reversals. Three layers of protection:
+              <br /><strong style={{ color: 'var(--amber)' }}>1. Pre-open sweep</strong> (default 12:30 UTC)
+              — moves profitable SL to breakeven so we exit at scratch, not a loss.
+              <br /><strong style={{ color: 'var(--red)' }}>2. Blackout</strong> (default 12:45–13:30 UTC)
+              — hard-blocks all new entries during the chaos window.
+              <br /><strong style={{ color: 'var(--green)' }}>3. Confirmation window</strong> (default 13:30–14:15 UTC)
+              — re-entry allowed, but only at elevated confidence. The US session direction
+              has settled — trade with it, not against it.
+            </p>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '.75rem', marginBottom: '1rem' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '.6rem .85rem', background: 'var(--bg-elevated)', border: '1px solid var(--border)', borderRadius: 6 }}>
+                <div>
+                  <div style={{ fontSize: '.8rem', fontWeight: 600, color: 'var(--text-primary)' }}>Blackout Enabled</div>
+                  <div style={{ fontSize: '.68rem', color: 'var(--text-secondary)' }}>Block all new entries from blackout start → end</div>
+                </div>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '.5rem', cursor: 'pointer' }}>
+                  <input type="checkbox" checked={gatesForm.us_open_blackout_enabled}
+                    onChange={e => setGatesForm(p => ({ ...p, us_open_blackout_enabled: e.target.checked }))}
+                    style={{ accentColor: 'var(--accent)', cursor: 'pointer', width: '1rem', height: '1rem' }} />
+                  <span style={{ fontSize: '.75rem', fontWeight: 600, color: gatesForm.us_open_blackout_enabled ? 'var(--accent)' : 'var(--text-dim)' }}>
+                    {gatesForm.us_open_blackout_enabled ? 'ON' : 'OFF'}
+                  </span>
+                </label>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '.6rem .85rem', background: 'var(--bg-elevated)', border: '1px solid var(--border)', borderRadius: 6 }}>
+                <div>
+                  <div style={{ fontSize: '.8rem', fontWeight: 600, color: 'var(--text-primary)' }}>Pre-open SL Tighten</div>
+                  <div style={{ fontSize: '.68rem', color: 'var(--text-secondary)' }}>Move profitable SLs to breakeven before the open</div>
+                </div>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '.5rem', cursor: 'pointer' }}>
+                  <input type="checkbox" checked={gatesForm.us_open_preopen_sl_tighten}
+                    onChange={e => setGatesForm(p => ({ ...p, us_open_preopen_sl_tighten: e.target.checked }))}
+                    style={{ accentColor: 'var(--accent)', cursor: 'pointer', width: '1rem', height: '1rem' }} />
+                  <span style={{ fontSize: '.75rem', fontWeight: 600, color: gatesForm.us_open_preopen_sl_tighten ? 'var(--accent)' : 'var(--text-dim)' }}>
+                    {gatesForm.us_open_preopen_sl_tighten ? 'ON' : 'OFF'}
+                  </span>
+                </label>
+              </div>
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+              <div>
+                <label className="settings-label">Pre-open Sweep Time (UTC HHMM)</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>SL tighten sweep runs at this time, e.g. 1230 = 12:30</p>
+                <input type="number" step="5" min="0" max="2359" className="settings-input"
+                  value={gatesForm.us_open_preopen_tighten_utc}
+                  onChange={e => setGatesForm(p => ({ ...p, us_open_preopen_tighten_utc: parseInt(e.target.value) }))} />
+              </div>
+              <div>
+                <label className="settings-label">Blackout Start (UTC HHMM)</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>No new entries from this time, e.g. 1245 = 12:45</p>
+                <input type="number" step="5" min="0" max="2359" className="settings-input"
+                  value={gatesForm.us_open_blackout_start_utc}
+                  onChange={e => setGatesForm(p => ({ ...p, us_open_blackout_start_utc: parseInt(e.target.value) }))} />
+              </div>
+              <div>
+                <label className="settings-label">Blackout End (UTC HHMM)</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>Entries allowed again from this time, e.g. 1330 = 13:30</p>
+                <input type="number" step="5" min="0" max="2359" className="settings-input"
+                  value={gatesForm.us_open_blackout_end_utc}
+                  onChange={e => setGatesForm(p => ({ ...p, us_open_blackout_end_utc: parseInt(e.target.value) }))} />
+              </div>
+              <div>
+                <label className="settings-label">Confirmation Window End (UTC HHMM)</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>Elevated confidence required until this time, e.g. 1415</p>
+                <input type="number" step="5" min="0" max="2359" className="settings-input"
+                  value={gatesForm.us_open_confirmation_end_utc}
+                  onChange={e => setGatesForm(p => ({ ...p, us_open_confirmation_end_utc: parseInt(e.target.value) }))} />
+              </div>
+              <div>
+                <label className="settings-label">Confirmation Min Confidence</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>Required confidence during the confirmation window (0–1)</p>
+                <input type="number" step="0.01" min="0.5" max="1.0" className="settings-input"
+                  value={gatesForm.us_open_confirmation_confidence}
+                  onChange={e => setGatesForm(p => ({ ...p, us_open_confirmation_confidence: parseFloat(e.target.value) }))} />
+              </div>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            className="settings-btn settings-btn-primary"
+            onClick={handleSaveGates}
+            disabled={saving}
+            style={{ display: 'flex', alignItems: 'center', gap: '.35rem', opacity: saving ? 0.6 : 1 }}
+          >
+            <Save size={13} /> {saving ? 'Saving…' : 'Save Gate Settings'}
+          </button>
+        </div>
+      )}
+
       {/* ── Email Tab ── */}
       {activeTab === 'email' && (
         <div className="settings-card space-y-4">
@@ -1296,6 +1681,41 @@ export function SettingsPage() {
               }}>
                 <span style={{
                   position: 'absolute', top: 2, left: telegramForm.enabled ? 22 : 2,
+                  width: 20, height: 20, borderRadius: '50%', background: '#fff', transition: 'left .2s',
+                }} />
+              </span>
+            </label>
+          </div>
+
+          {/* Inbound command polling toggle */}
+          <div style={{
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            padding: '.75rem 1rem', borderRadius: 8,
+            background: telegramForm.polling_enabled ? 'rgba(33,150,243,.06)' : 'var(--surface-2, #2a2d35)',
+            border: `1px solid ${telegramForm.polling_enabled ? 'rgba(33,150,243,.25)' : 'var(--border)'}`,
+            transition: 'all .2s',
+            opacity: telegramForm.enabled ? 1 : 0.45,
+            pointerEvents: telegramForm.enabled ? 'auto' : 'none',
+          }}>
+            <div>
+              <div style={{ fontWeight: 600, fontSize: '.85rem' }}>
+                {telegramForm.polling_enabled ? '💬 Bot Commands Enabled' : '💬 Bot Commands Disabled'}
+              </div>
+              <div style={{ fontSize: '.7rem', color: 'var(--text-secondary)', marginTop: '.15rem' }}>
+                Receive and respond to commands via Telegram — /positions, /close, /sl, /tp, /status
+              </div>
+            </div>
+            <label style={{ position: 'relative', display: 'inline-block', width: 44, height: 24, cursor: 'pointer' }}>
+              <input type="checkbox" checked={telegramForm.polling_enabled}
+                onChange={e => setTelegramForm(f => ({ ...f, polling_enabled: e.target.checked }))}
+                style={{ opacity: 0, width: 0, height: 0 }} />
+              <span style={{
+                position: 'absolute', inset: 0, borderRadius: 12,
+                background: telegramForm.polling_enabled ? '#2196f3' : 'var(--surface-2, #3a3d45)',
+                transition: 'background .2s',
+              }}>
+                <span style={{
+                  position: 'absolute', top: 2, left: telegramForm.polling_enabled ? 22 : 2,
                   width: 20, height: 20, borderRadius: '50%', background: '#fff', transition: 'left .2s',
                 }} />
               </span>

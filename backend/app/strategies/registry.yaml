@@ -1,0 +1,238 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Strategy Registry
+# =================
+# Single source of truth for all trading strategies.
+# Consumed by:
+#   • /api/strategies  (served to UI)
+#   • agent_scheduler  (STRATEGY_PROFILES, _BOOTSTRAP_RR)
+#   • strategy_review  (all_strategies pool)
+#   • trader_service   (LLM prompt descriptions)
+#   • indicators       (signal routing key)
+#
+# To add a new strategy: add an entry here, implement _<key>_signals() in
+# indicators.py, and add a dispatch branch in generate_signal(). No other
+# files need editing.
+# ─────────────────────────────────────────────────────────────────────────────
+
+strategies:
+
+  momentum:
+    label: "Momentum"
+    description: "Follows strong directional moves using RSI + MACD + SMA alignment. Best in clearly trending markets."
+    ai_guidance: |
+      Momentum agents ride strong trends. Only trade when RSI is not extreme (30-70), 
+      price is above SMA20 and SMA50 for longs, and MACD histogram is positive.
+      Best in trending_up or trending_down regimes. Avoid ranging markets.
+    market_conditions: ["trending_up", "trending_down"]
+    avoid_conditions: ["ranging"]
+    timeframes:
+      default: "15m"
+      allowed: ["15m", "30m", "1h"]
+    risk:
+      stop_loss_pct: 2.5
+      take_profit_pct: 6.0
+      trailing_stop_pct: 3.5
+    indicators:
+      rsi_period: 14
+      rsi_overbought: 70
+      rsi_oversold: 30
+      macd_fast: 12
+      macd_slow: 26
+      macd_signal: 9
+    agent_naming: ["BTC_Momentum", "ETH_Momentum", "SOL_Momentum_Bull"]
+    ai_propose: true
+    require_marina: false
+
+  ema_crossover:
+    label: "EMA Crossover"
+    description: "Trades EMA 9/21 golden/death crossovers with RSI and MACD confluence filters. Fewer but higher-conviction signals than momentum."
+    ai_guidance: |
+      EMA Crossover agents enter on a confirmed EMA 9 / 21 crossover.
+      Golden cross (EMA9 crosses above EMA21) = buy signal.
+      Death cross (EMA9 crosses below EMA21) = sell signal.
+      RSI filter: do not buy if RSI > 65, do not sell if RSI < 35.
+      MACD histogram confirms direction.
+      Best in trending markets. Generates false signals in ranging / sideways markets.
+    market_conditions: ["trending_up", "trending_down"]
+    avoid_conditions: ["ranging"]
+    timeframes:
+      default: "1h"
+      allowed: ["15m", "30m", "1h", "4h"]
+    risk:
+      stop_loss_pct: 2.5
+      take_profit_pct: 6.0
+      trailing_stop_pct: 3.0
+    indicators:
+      ema_fast: 9
+      ema_slow: 21
+      rsi_period: 14
+      rsi_overbought: 65
+      rsi_oversold: 35
+      macd_fast: 12
+      macd_slow: 26
+      macd_signal: 9
+    agent_naming: ["BTC_EMA_Cross", "ETH_EMA_Signal", "SOL_EMA_Trend"]
+    ai_propose: true
+    require_marina: false
+
+  mean_reversion:
+    label: "Mean Reversion"
+    description: "Buys oversold / sells overbought extremes using Bollinger Bands + RSI. Best in sideways, ranging markets."
+    ai_guidance: |
+      Mean reversion agents trade price returning to average.
+      Buy when price touches or breaks below the lower Bollinger Band and RSI < 30.
+      Sell when price touches or breaks above the upper Bollinger Band and RSI > 70.
+      Best in ranging or low-volatility markets. Dangerous in strong trends.
+    market_conditions: ["ranging", "low_volatility"]
+    avoid_conditions: ["trending_up", "trending_down"]
+    timeframes:
+      default: "1h"
+      allowed: ["15m", "30m", "1h", "4h"]
+    risk:
+      stop_loss_pct: 3.0
+      take_profit_pct: 4.5
+      trailing_stop_pct: 2.5
+    indicators:
+      bb_period: 20
+      bb_std: 2.0
+      rsi_period: 14
+      rsi_overbought: 75
+      rsi_oversold: 25
+    agent_naming: ["BTC_Reversion", "ETH_MeanRev", "SOL_Bounce"]
+    ai_propose: true
+    require_marina: false
+
+  breakout:
+    label: "Breakout"
+    description: "Detects and trades range breakouts confirmed by ATR and volume. Targets explosive moves."
+    ai_guidance: |
+      Breakout agents enter when price breaks decisively beyond a key level.
+      Bullish breakout: price closes above upper Bollinger Band with ATR expanding.
+      Bearish breakout: price closes below lower Bollinger Band with ATR expanding.
+      Require ATR > 1.5× recent average to confirm volatility expansion.
+      Best after a period of consolidation. Avoid if already in a mature trend.
+    market_conditions: ["consolidating", "pre_breakout"]
+    avoid_conditions: []
+    timeframes:
+      default: "1h"
+      allowed: ["30m", "1h", "4h"]
+    risk:
+      stop_loss_pct: 3.0
+      take_profit_pct: 7.5
+      trailing_stop_pct: 4.0
+    indicators:
+      atr_period: 14
+      atr_multiplier: 1.5
+      bb_period: 20
+      lookback_period: 20
+    agent_naming: ["BTC_Breakout", "ETH_Surge", "SOL_Breakout"]
+    ai_propose: true
+    require_marina: false
+
+  trend_following:
+    label: "Trend Following"
+    description: "Rides sustained multi-hour or multi-day trends using SMA 20/50 crossover with MACD confirmation."
+    ai_guidance: |
+      Trend following agents hold positions for extended periods.
+      Long when SMA20 > SMA50 and price is above both. Short when SMA20 < SMA50.
+      Wide stops (3.0%) and large targets (9%+) to accommodate noise.
+      Trailing stop at 5% to capture most of the trend.
+      Best for major pairs (BTCUSDT, ETHUSDT) on higher timeframes.
+    market_conditions: ["trending_up", "trending_down"]
+    avoid_conditions: ["ranging"]
+    timeframes:
+      default: "4h"
+      allowed: ["1h", "4h", "1d"]
+    risk:
+      stop_loss_pct: 3.0
+      take_profit_pct: 9.0
+      trailing_stop_pct: 5.0
+    indicators:
+      sma_fast: 20
+      sma_slow: 50
+      macd_fast: 12
+      macd_slow: 26
+      macd_signal: 9
+      atr_period: 14
+    agent_naming: ["BTC_Trend", "ETH_TrendRider", "Macro_Trend"]
+    ai_propose: true
+    require_marina: false
+
+  scalping:
+    label: "Scalping"
+    description: "Fast in-and-out trades on small moves using EMA 9/21 and RSI on short timeframes."
+    ai_guidance: |
+      Scalping agents make many small trades with tight stops.
+      Use EMA 9/21 crossovers on 1m-15m charts.
+      RSI overbought: 65, oversold: 35 (tighter thresholds than momentum).
+      Only trade during high-volume periods. Avoid news events.
+      Keep position sizes smaller than other strategies due to high trade frequency.
+    market_conditions: ["trending_up", "trending_down", "ranging"]
+    avoid_conditions: []
+    timeframes:
+      default: "5m"
+      allowed: ["1m", "5m", "15m"]
+    risk:
+      stop_loss_pct: 1.0
+      take_profit_pct: 2.5
+      trailing_stop_pct: 1.5
+    indicators:
+      ema_fast: 9
+      ema_slow: 21
+      rsi_period: 7
+      rsi_overbought: 65
+      rsi_oversold: 35
+    agent_naming: ["BTC_Scalp", "ETH_Scalp", "SOL_Scalper"]
+    ai_propose: true
+    require_marina: false
+
+  grid:
+    label: "Grid"
+    description: "Systematic buy/sell at fixed price intervals within a Bollinger Band range. Designed for sideways markets."
+    ai_guidance: |
+      Grid agents do NOT use directional SL/TP in the traditional sense.
+      They place a grid of buy and sell orders at equal intervals within the BB range.
+      Only propose grid when: BB width is narrow, ATR is low, market regime is ranging.
+      Use stop_loss_pct: 3.0, take_profit_pct: 6.0 as grid-exit thresholds.
+      Grid levels: 10 default. Timeframe: 15m.
+      Do NOT propose grid in trending markets — it will suffer heavy losses.
+    market_conditions: ["ranging", "low_volatility"]
+    avoid_conditions: ["trending_up", "trending_down"]
+    timeframes:
+      default: "15m"
+      allowed: ["5m", "15m", "30m", "1h"]
+    risk:
+      stop_loss_pct: 3.0
+      take_profit_pct: 6.0
+      trailing_stop_pct: null
+    indicators:
+      bb_period: 20
+      bb_std: 2.0
+      atr_period: 14
+      grid_levels: 10
+    agent_naming: ["BTC_Grid", "ETH_Grid", "SOL_Grid"]
+    ai_propose: false
+    require_marina: true
+
+  ai:
+    label: "AI Strategy"
+    description: "LLM-powered analysis and signals. The AI considers all available indicators, whale data, market regime and team context to generate decisions."
+    ai_guidance: |
+      AI strategy agents use the full LLM pipeline for each signal.
+      The LLM receives all technical indicators, market regime, whale intelligence,
+      team analysis context, and the trader's persona/style.
+      Can adapt to any market condition but uses more API calls per cycle.
+      Best for pairs where market conditions are unclear or mixed signals exist.
+    market_conditions: ["trending_up", "trending_down", "ranging", "volatile"]
+    avoid_conditions: []
+    timeframes:
+      default: "1h"
+      allowed: ["5m", "15m", "30m", "1h", "4h", "1d"]
+    risk:
+      stop_loss_pct: 2.5
+      take_profit_pct: 6.0
+      trailing_stop_pct: 3.0
+    indicators: {}
+    agent_naming: ["BTC_AI_Agent", "ETH_Intelligence", "AI_Macro"]
+    ai_propose: true
+    require_marina: false

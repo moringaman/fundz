@@ -1,16 +1,19 @@
-import { useState } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { Play } from 'lucide-react';
 import { useAppSelector } from '../store/hooks';
 import { automationApi } from '../lib/api';
-import { useAgents, useAutomationMetrics, useTraders } from '../hooks/useQueries';
+import { useAgents, useAutomationMetrics, useTraders, useStrategies } from '../hooks/useQueries';
 import { timeAgo } from '../utils/timeAgo';
 import { usePagination, Paginator } from '../components/common/Paginator';
+import { StrategyManager } from '../components/StrategyManager';
+import { Skeleton, SkeletonCard, SkeletonRows } from '../components/common/Skeleton';
 
 export function AgentsPage() {
   const selectedSymbol = useAppSelector((s) => s.market.selectedSymbol);
-  const { data: agentsData = [], refetch: refetchAgents } = useAgents();
+  const { data: agentsData = [], refetch: refetchAgents, isPending: agentsLoading } = useAgents();
   const { data: metricsData = [] } = useAutomationMetrics();
   const { data: tradersData = [] } = useTraders();
+  const { data: strategiesData = [] } = useStrategies();
 
   const agents: any[] = Array.isArray(agentsData) ? agentsData : [];
   const traders: any[] = Array.isArray(tradersData) ? tradersData : [];
@@ -27,7 +30,61 @@ export function AgentsPage() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [backtestResults, setBacktestResults] = useState<Record<string, any>>({});
   const [backtestLoading, setBacktestLoading] = useState<string | null>(null);
-  const agentsPager = usePagination(agents, 8);
+  const [gridSummaries, setGridSummaries] = useState<Record<string, any>>({});
+  const [cancellingGrid, setCancellingGrid] = useState<string | null>(null);
+
+  const fetchGridSummary = useCallback(async (agentId: string) => {
+    try {
+      const res = await fetch(`/api/grid/${agentId}/summary`);
+      if (res.ok) {
+        const data = await res.json();
+        setGridSummaries(prev => ({ ...prev, [agentId]: data }));
+      }
+    } catch { /* ignore */ }
+  }, []);
+
+  const cancelGrid = useCallback(async (agentId: string) => {
+    setCancellingGrid(agentId);
+    try {
+      const res = await fetch(`/api/grid/${agentId}/cancel`, { method: 'POST' });
+      if (res.ok) {
+        await fetchGridSummary(agentId);
+      }
+    } catch { /* ignore */ }
+    setCancellingGrid(null);
+  }, [fetchGridSummary]);
+
+  // Search / filter / sort
+  const [search, setSearch] = useState('');
+  const [filterStatus, setFilterStatus] = useState<'all' | 'enabled' | 'disabled'>('all');
+  const [activeTab, setActiveTab] = useState<'agents' | 'registry'>('agents');
+
+  const filteredAgents = agents
+    .filter((a) => {
+      const q = search.toLowerCase();
+      if (q && !(
+        a.name?.toLowerCase().includes(q) ||
+        a.strategy_type?.toLowerCase().includes(q) ||
+        (a.trading_pairs ?? []).join(' ').toLowerCase().includes(q)
+      )) return false;
+      if (filterStatus === 'enabled' && !a.is_enabled) return false;
+      if (filterStatus === 'disabled' && a.is_enabled) return false;
+      return true;
+    })
+    .sort((a, b) => {
+      // Enabled first, then by name
+      if (a.is_enabled === b.is_enabled) return (a.name ?? '').localeCompare(b.name ?? '');
+      return a.is_enabled ? -1 : 1;
+    });
+
+  const agentsPager = usePagination(filteredAgents, 8);
+
+  // Fetch grid summaries for grid-type agents
+  useEffect(() => {
+    const gridAgents = agents.filter(a => a.strategy_type === 'grid');
+    for (const a of gridAgents) fetchGridSummary(a.id);
+  }, [agents.length, fetchGridSummary]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const [formData, setFormData] = useState({
     name: '',
     strategy_type: 'momentum',
@@ -153,15 +210,27 @@ export function AgentsPage() {
     setShowForm(false);
   };
 
-  const strategies = [
-    { value: 'momentum',        label: 'Momentum',        desc: 'Follows trend strength',                    timeframes: ['15m', '30m', '1h'],        defaultTf: '15m' },
-    { value: 'mean_reversion',  label: 'Mean Reversion',  desc: 'Trades around average price',               timeframes: ['15m', '30m', '1h', '4h'],  defaultTf: '1h'  },
-    { value: 'breakout',        label: 'Breakout',        desc: 'Trades price breakouts',                    timeframes: ['30m', '1h', '4h'],          defaultTf: '1h'  },
-    { value: 'grid',            label: 'Grid',            desc: 'Buy/sell at range levels — sideways mkts',  timeframes: ['5m', '15m', '30m', '1h'],   defaultTf: '15m' },
-    { value: 'scalping',        label: 'Scalping',        desc: 'Fast entries on small moves',               timeframes: ['1m', '5m', '15m'],          defaultTf: '5m'  },
-    { value: 'trend_following', label: 'Trend Following', desc: 'Rides multi-hour / multi-day trends',       timeframes: ['1h', '4h', '1d'],           defaultTf: '4h'  },
-    { value: 'ai',              label: 'AI Strategy',     desc: 'LLM-powered analysis and signals',          timeframes: ['5m', '15m', '30m', '1h', '4h', '1d'], defaultTf: '1h' },
-  ];
+  // Map registry response to the shape used by the rest of the component
+  const strategies: any[] = Array.isArray(strategiesData) && strategiesData.length > 0
+    ? strategiesData.map((s: any) => ({
+        value: s.value,
+        label: s.label,
+        desc: s.description,
+        timeframes: s.timeframes || ['1h'],
+        defaultTf: s.defaultTf || '1h',
+        risk: s.risk,
+        indicators: s.indicators,
+      }))
+    : [
+        { value: 'momentum',        label: 'Momentum',        desc: 'Follows trend strength',                   timeframes: ['15m', '30m', '1h'],                  defaultTf: '15m' },
+        { value: 'ema_crossover',   label: 'EMA Crossover',   desc: 'EMA 9/21 crossover signals',               timeframes: ['15m', '30m', '1h', '4h'],            defaultTf: '1h'  },
+        { value: 'mean_reversion',  label: 'Mean Reversion',  desc: 'Trades around average price',              timeframes: ['15m', '30m', '1h', '4h'],            defaultTf: '1h'  },
+        { value: 'breakout',        label: 'Breakout',        desc: 'Trades price breakouts',                   timeframes: ['30m', '1h', '4h'],                   defaultTf: '1h'  },
+        { value: 'grid',            label: 'Grid',            desc: 'Buy/sell at range levels — sideways mkts', timeframes: ['5m', '15m', '30m', '1h'],            defaultTf: '15m' },
+        { value: 'scalping',        label: 'Scalping',        desc: 'Fast entries on small moves',              timeframes: ['1m', '5m', '15m'],                   defaultTf: '5m'  },
+        { value: 'trend_following', label: 'Trend Following', desc: 'Rides multi-hour / multi-day trends',      timeframes: ['1h', '4h', '1d'],                    defaultTf: '4h'  },
+        { value: 'ai',              label: 'AI Strategy',     desc: 'LLM-powered analysis and signals',         timeframes: ['5m', '15m', '30m', '1h', '4h', '1d'], defaultTf: '1h' },
+      ];
 
   const currentStrategyDef = strategies.find((s) => s.value === formData.strategy_type);
 
@@ -189,12 +258,99 @@ export function AgentsPage() {
   ];
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6" style={{ padding: '1.5rem 1.5rem 2rem' }}>
+      {/* Tab bar */}
+      <div style={{ display: 'flex', gap: '0.25rem', borderBottom: '1px solid var(--border)', paddingBottom: '0', marginBottom: '0' }}>
+        {([['agents', 'Agents'], ['registry', 'Strategy Registry']] as const).map(([tab, label]) => (
+          <button
+            key={tab}
+            onClick={() => setActiveTab(tab)}
+            style={{
+              padding: '0.45rem 1rem',
+              fontSize: '0.82rem',
+              fontWeight: activeTab === tab ? 600 : 400,
+              background: 'transparent',
+              border: 'none',
+              borderBottom: activeTab === tab ? '2px solid var(--accent)' : '2px solid transparent',
+              color: activeTab === tab ? 'var(--accent)' : 'var(--text-muted)',
+              cursor: 'pointer',
+              marginBottom: '-1px',
+              transition: 'color 0.15s',
+            }}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {activeTab === 'registry' ? (
+        <StrategyManager />
+      ) : agentsLoading ? (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '.6rem' }}>
+            <Skeleton width={80} height={24} />
+            <Skeleton width={200} height={32} rounded />
+            <div style={{ flex: 1 }} />
+            <Skeleton width={100} height={32} rounded />
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+            {Array.from({ length: 6 }, (_, i) => (
+              <SkeletonCard key={i} lines={4} height={180} />
+            ))}
+          </div>
+        </div>
+      ) : (<>
       <div className="agent-header">
-        <h1 className="page-title" style={{ marginBottom: 0 }}>Trading Strategies</h1>
-        <button type="button" className="agent-btn" onClick={() => { setShowForm(!showForm); setEditingId(null); }}>
-          {showForm ? 'Cancel' : '+ New Strategy'}
-        </button>
+        <h1 className="page-title" style={{ marginBottom: 0 }}>Agents</h1>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '.6rem', flexWrap: 'wrap' }}>
+          {/* Search */}
+          <div style={{ position: 'relative' }}>
+            <span style={{ position: 'absolute', left: '.55rem', top: '50%', transform: 'translateY(-50%)', fontSize: '.8rem', color: 'var(--text-muted)', pointerEvents: 'none' }}>🔍</span>
+            <input
+              type="text"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search agents…"
+              style={{
+                paddingLeft: '1.8rem', paddingRight: '.6rem', paddingTop: '.3rem', paddingBottom: '.3rem',
+                borderRadius: 6, border: '1px solid var(--border)', background: 'var(--bg-elevated)',
+                color: 'var(--text)', fontSize: '.8rem', width: 180, outline: 'none',
+              }}
+            />
+          </div>
+          {/* Status filter */}
+          {(['all', 'enabled', 'disabled'] as const).map((s) => (
+            <button
+              key={s}
+              type="button"
+              onClick={() => setFilterStatus(s)}
+              style={{
+                padding: '.25rem .65rem', borderRadius: 20, fontSize: '.75rem', fontWeight: 600,
+                border: '1px solid',
+                borderColor: filterStatus === s
+                  ? s === 'enabled' ? 'var(--green)' : s === 'disabled' ? 'var(--red)' : 'var(--accent)'
+                  : 'var(--border)',
+                background: filterStatus === s
+                  ? s === 'enabled' ? 'rgba(0,230,118,.12)' : s === 'disabled' ? 'rgba(231,76,60,.12)' : 'rgba(100,130,255,.12)'
+                  : 'transparent',
+                color: filterStatus === s
+                  ? s === 'enabled' ? 'var(--green)' : s === 'disabled' ? 'var(--red)' : 'var(--accent)'
+                  : 'var(--text-muted)',
+                cursor: 'pointer',
+                textTransform: 'capitalize',
+              }}
+            >
+              {s === 'all'
+                ? `All (${agents.length})`
+                : s === 'enabled'
+                ? `✓ Enabled (${agents.filter(a => a.is_enabled).length})`
+                : `✕ Disabled (${agents.filter(a => !a.is_enabled).length})`}
+            </button>
+          ))}
+          <button type="button" className="agent-btn" onClick={() => { setShowForm(!showForm); setEditingId(null); }}>
+            {showForm ? 'Cancel' : '+ New Agent'}
+          </button>
+        </div>
       </div>
 
       {showForm && (
@@ -367,12 +523,66 @@ export function AgentsPage() {
 
       {agents.length === 0 && !showForm ? (
         <div className="card">
-          <p className="text-gray-400">No strategies configured yet. Create your first strategy to start automated trading.</p>
+          <p className="text-gray-400">No agents configured yet. Create your first agent to start automated trading.</p>
+        </div>
+      ) : filteredAgents.length === 0 && !showForm ? (
+        <div className="card" style={{ textAlign: 'center', color: 'var(--text-muted)', padding: '2rem' }}>
+          No agents match <strong>"{search || filterStatus}"</strong>.{' '}
+          <button type="button" onClick={() => { setSearch(''); setFilterStatus('all'); }} style={{ color: 'var(--accent)', background: 'none', border: 'none', cursor: 'pointer', fontSize: 'inherit' }}>Clear filters</button>
         </div>
       ) : (
+        /* ── Grouped by trader ─────────────────────────────────────────── */
         <>
-          <div className="agents-grid">
-            {agentsPager.pageItems.map((agent) => (
+          {(() => {
+            // Build trader groups; agents with no trader_id go into "Unassigned"
+            const groups: Array<{ trader: any; agents: any[] }> = [];
+            const traderOrder = traders.length > 0 ? traders : [{ id: '__unassigned__', name: 'Unassigned' }];
+            for (const trader of traderOrder) {
+              const ta = filteredAgents.filter(a => a.trader_id === trader.id || (!a.trader_id && trader.id === '__unassigned__'));
+              if (ta.length > 0) groups.push({ trader, agents: ta });
+            }
+            // Catch any remaining unassigned
+            const assignedIds = new Set(groups.flatMap(g => g.agents.map((a: any) => a.id)));
+            const unassigned = filteredAgents.filter((a: any) => !assignedIds.has(a.id));
+            if (unassigned.length > 0) groups.push({ trader: { id: '__unassigned__', name: 'Unassigned' }, agents: unassigned });
+            return groups.map(({ trader, agents: groupAgents }) => {
+              const traderMetrics = metricsData as any[];
+              const agentIds = new Set(groupAgents.map((a: any) => a.id));
+              const groupPnl = traderMetrics.filter((m: any) => agentIds.has(m.agent_id)).reduce((s: number, m: any) => s + (m.total_pnl ?? 0), 0);
+              const enabledCount = groupAgents.filter((a: any) => a.is_enabled).length;
+              return (
+                <div key={trader.id} style={{ marginBottom: '1.5rem' }}>
+                  {/* Trader section header */}
+                  <div style={{
+                    display: 'flex', alignItems: 'center', gap: '0.75rem',
+                    marginBottom: '0.75rem', paddingBottom: '0.5rem',
+                    borderBottom: '1px solid var(--border)',
+                  }}>
+                    <div style={{
+                      width: 32, height: 32, borderRadius: '50%',
+                      background: 'linear-gradient(135deg, var(--accent), #7c3aed)',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      fontSize: '0.75rem', fontWeight: 700, color: 'white', flexShrink: 0,
+                    }}>
+                      {(trader.name ?? 'U').charAt(0).toUpperCase()}
+                    </div>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: '0.88rem', fontWeight: 600, color: 'var(--text)' }}>
+                        {trader.name ?? 'Unassigned'}
+                      </div>
+                      <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', display: 'flex', gap: '0.75rem' }}>
+                        <span>{enabledCount}/{groupAgents.length} active</span>
+                        <span style={{ color: groupPnl >= 0 ? 'var(--green)' : 'var(--red)' }}>
+                          {groupPnl >= 0 ? '+' : ''}{groupPnl.toFixed(2)} USDT
+                        </span>
+                        {trader.allocation_pct != null && (
+                          <span>{trader.allocation_pct.toFixed(1)}% allocation</span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="agents-grid">
+                    {groupAgents.map((agent: any) => (
             <div key={agent.id} className={`agent-card ${agent.is_enabled ? 'enabled' : ''}`}>
               {editingId === agent.id ? (
                 <div className="agent-edit-form">
@@ -667,8 +877,8 @@ export function AgentsPage() {
                     return (
                       <div className="agent-metrics-strip">
                         <div className="metric-pill">
-                          <span className="metric-pill-label">Runs</span>
-                          <span className="metric-pill-value">{m.total_runs}</span>
+                          <span className="metric-pill-label">Trades</span>
+                          <span className="metric-pill-value">{m.actual_trades ?? 0}</span>
                         </div>
                         <div className="metric-pill">
                           <span className="metric-pill-label">Win%</span>
@@ -703,7 +913,101 @@ export function AgentsPage() {
                       </div>
                     );
                   })()}
-                  <div className="agent-actions">
+                   {agent.strategy_type === 'grid' && (() => {
+                    const gs = gridSummaries[agent.id];
+                    if (!gs) return null;
+                    const hasActive = gs.active_grid;
+                    const g = gs.active_grid;
+                    const hist = gs.historical_grids ?? [];
+                    const totalPnl = (g?.realized_pnl ?? 0) + hist.reduce((s: number, x: any) => s + (x.realized_pnl ?? 0), 0);
+                    if (!hasActive && hist.length === 0) return null;
+                    return (
+                      <div style={{
+                        margin: '.75rem 0', padding: '.75rem', borderRadius: '8px',
+                        background: 'rgba(0,194,255,.04)', border: '1px solid rgba(0,194,255,.12)',
+                      }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '.5rem' }}>
+                          <span style={{ fontSize: '.65rem', fontFamily: 'var(--mono)', color: 'var(--accent)', letterSpacing: '.05em', textTransform: 'uppercase' }}>
+                            🔲 Grid Engine
+                          </span>
+                          {hasActive && (
+                            <span style={{
+                              fontSize: '.55rem', padding: '.1rem .4rem', borderRadius: '4px',
+                              background: g.status === 'active' ? 'rgba(34,197,94,.12)' : 'rgba(245,200,66,.1)',
+                              color: g.status === 'active' ? '#22c55e' : '#f5c842',
+                              border: `1px solid ${g.status === 'active' ? 'rgba(34,197,94,.3)' : 'rgba(245,200,66,.25)'}`,
+                              fontFamily: 'var(--mono)',
+                            }}>{g.status?.toUpperCase()}</span>
+                          )}
+                        </div>
+                        {hasActive && (
+                          <>
+                            <div style={{ display: 'flex', gap: '.75rem', flexWrap: 'wrap', marginBottom: '.4rem' }}>
+                              {[
+                                { label: 'Range', value: `$${g.grid_low?.toFixed(4)} – $${g.grid_high?.toFixed(4)}` },
+                                { label: 'Levels', value: `${g.open_levels ?? 0}/${g.grid_levels ?? 0} open` },
+                                { label: 'Invested', value: `$${(g.total_invested ?? 0).toFixed(2)}` },
+                                { label: 'Realised', value: `$${(g.realized_pnl ?? 0).toFixed(2)}`, color: (g.realized_pnl ?? 0) >= 0 ? '#22c55e' : '#ef4444' },
+                              ].map(({ label, value, color }) => (
+                                <div key={label} style={{ display: 'flex', flexDirection: 'column', gap: '.1rem' }}>
+                                  <span style={{ fontSize: '.55rem', color: 'var(--text-muted)', fontFamily: 'var(--mono)' }}>{label}</span>
+                                  <span style={{ fontSize: '.65rem', fontFamily: 'var(--mono)', color: color ?? 'var(--text-secondary)' }}>{value}</span>
+                                </div>
+                              ))}
+                            </div>
+                            {/* Level visualisation bar */}
+                            {g.levels && g.levels.length > 0 && (
+                              <div style={{ display: 'flex', gap: '2px', marginTop: '.25rem', height: '8px' }}>
+                                {g.levels.map((lv: any, i: number) => {
+                                  const col = lv.status === 'open' ? '#22c55e'
+                                    : lv.status === 'filled' ? '#3b82f6'
+                                    : lv.status === 'closed' ? '#6b7280'
+                                    : lv.status === 'cancelled' ? '#374151'
+                                    : 'rgba(0,194,255,.25)';
+                                  return (
+                                    <div key={i} title={`Level ${lv.level_index}: ${lv.side} @ $${lv.price?.toFixed(4)} — ${lv.status}`}
+                                      style={{ flex: 1, background: col, borderRadius: '2px', cursor: 'default' }} />
+                                  );
+                                })}
+                              </div>
+                            )}
+                            <div style={{ marginTop: '.4rem', display: 'flex', gap: '.5rem' }}>
+                              <button
+                                type="button"
+                                onClick={() => cancelGrid(agent.id)}
+                                disabled={cancellingGrid === agent.id}
+                                style={{
+                                  fontSize: '.6rem', padding: '.2rem .5rem', borderRadius: '4px', cursor: 'pointer',
+                                  background: 'rgba(239,68,68,.1)', color: '#ef4444',
+                                  border: '1px solid rgba(239,68,68,.3)',
+                                }}
+                              >
+                                {cancellingGrid === agent.id ? 'Cancelling…' : '⊗ Cancel Grid'}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => fetchGridSummary(agent.id)}
+                                style={{
+                                  fontSize: '.6rem', padding: '.2rem .5rem', borderRadius: '4px', cursor: 'pointer',
+                                  background: 'rgba(0,194,255,.06)', color: 'var(--accent)',
+                                  border: '1px solid rgba(0,194,255,.2)',
+                                }}
+                              >
+                                ↺ Refresh
+                              </button>
+                            </div>
+                          </>
+                        )}
+                        {!hasActive && hist.length > 0 && (
+                          <div style={{ fontSize: '.6rem', color: 'var(--text-muted)', fontFamily: 'var(--mono)' }}>
+                            No active grid · {hist.length} historical · Total P&L:&nbsp;
+                            <span style={{ color: totalPnl >= 0 ? '#22c55e' : '#ef4444' }}>${totalPnl.toFixed(2)}</span>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
+                   <div className="agent-actions">
                     <button
                       type="button"
                       className="run-now-btn"
@@ -728,9 +1032,14 @@ export function AgentsPage() {
             </div>
           ))}
           </div>
-          <Paginator page={agentsPager.page} totalPages={agentsPager.totalPages} total={agentsPager.total} pageSize={8} onPage={agentsPager.setPage} label="strategies" />
+                </div>
+              );
+            });
+          })()}
         </>
       )}
+    </>
+    )}
     </div>
   );
 }

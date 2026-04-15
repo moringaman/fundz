@@ -237,17 +237,37 @@ class TeamChatService:
                 )
             parts.append(f"My recommendation: **{report.analyst_recommendation}**.")
 
+            # Append strategy recommendations if present
+            recs = getattr(report, 'strategy_recommendations', None) or []
+            if recs:
+                rec_lines = [f"📊 **Strategy Research** — regime-aligned proposals:"]
+                for rec in recs[:3]:
+                    syms = ", ".join(rec.recommended_symbols[:2])
+                    rec_lines.append(
+                        f"  • **{rec.strategy_type}** on {syms} ({rec.timeframe}) — "
+                        f"priority {(rec.priority or 0):.0%}. {rec.rationale[:80]}"
+                    )
+                parts.append("\n".join(rec_lines))
+
             await self.add_message(
                 agent_role="research_analyst",
                 content=" ".join(parts),
                 message_type="analysis",
-                metadata={"regime": regime.regime, "sentiment": regime.sentiment},
+                metadata={
+                    "regime": regime.regime,
+                    "sentiment": regime.sentiment,
+                    "strategy_recommendations": [
+                        {"strategy_type": r.strategy_type, "priority": r.priority,
+                         "symbols": r.recommended_symbols}
+                        for r in recs
+                    ],
+                },
             )
         except Exception as e:
             logger.debug(f"Failed to log analyst report: {e}")
 
     async def log_portfolio_decision(self, decision: Any, agents_list: list) -> None:
-        """Generate a chat message from Portfolio Manager output."""
+        """Generate a chat message from Portfolio Manager output (no-trader mode only)."""
         try:
             alloc = decision.allocation_pct or {}
             top_allocs = sorted(alloc.items(), key=lambda x: x[1], reverse=True)[:3]
@@ -274,6 +294,39 @@ class TeamChatService:
             )
         except Exception as e:
             logger.debug(f"Failed to log portfolio decision: {e}")
+
+    async def log_trader_allocation(
+        self,
+        trader_alloc_pct: dict,
+        traders: list,
+        reasoning: str = "",
+    ) -> None:
+        """
+        Log James's trader-level allocation decision to team chat.
+        Called when traders are present — James allocates to traders, not directly to agents.
+        """
+        try:
+            trader_map = {t["id"]: t for t in traders}
+            sorted_allocs = sorted(trader_alloc_pct.items(), key=lambda x: x[1], reverse=True)
+            alloc_strs = [
+                f"{trader_map.get(tid, {}).get('name', tid)}: **{pct:.0f}%**"
+                for tid, pct in sorted_allocs
+            ]
+            content = (
+                f"Capital allocation updated across trader portfolios. "
+                f"{', '.join(alloc_strs)}."
+            )
+            if reasoning:
+                content += f" {reasoning[:150]}"
+
+            await self.add_message(
+                agent_role="portfolio_manager",
+                content=content,
+                message_type="decision",
+                metadata={"trader_allocations": trader_alloc_pct},
+            )
+        except Exception as e:
+            logger.debug(f"Failed to log trader allocation: {e}")
 
     async def log_risk_assessment(self, assessment: Any) -> None:
         """Generate a chat message from Risk Manager output."""
@@ -555,6 +608,100 @@ class TeamChatService:
                 "reason": reason,
                 "_override_name": trader_name,
                 "_override_avatar": trader_avatar,
+            },
+        )
+
+    async def log_scale_out(
+        self,
+        trader_name: str,
+        trader_avatar: str,
+        agent_name: str,
+        symbol: str,
+        side: str,
+        close_pct: float,
+        close_quantity: float,
+        close_price: float,
+        realised_pnl: float,
+        remaining_quantity: float,
+        sl_moved_to_breakeven: bool,
+        tranche_label: str,
+    ) -> None:
+        """Trader announces a scale-out (partial profit-take) in team chat."""
+        direction = "LONG" if side == "buy" else "SHORT"
+        pnl_emoji = "💰" if realised_pnl >= 0 else "📉"
+        be_note = " SL moved to breakeven — runner is risk-free. 🔒" if sl_moved_to_breakeven else ""
+        content = (
+            f"📤 **Scale-out {tranche_label}** — {direction} {symbol} | *{agent_name}*\n\n"
+            f"Closed **{close_pct:.0%}** of position ({close_quantity:.4f} units) @ ${close_price:,.4f}\n"
+            f"{pnl_emoji} Locked P&L: **${realised_pnl:+,.2f}** | Remaining: {remaining_quantity:.4f} units\n"
+            f"{be_note}"
+        )
+        await self.add_message(
+            agent_role=f"trader_{trader_name.lower().replace(' ', '_')}",
+            content=content,
+            message_type="decision",
+            mentions=["@risk_manager"],
+            metadata={
+                "trader_name": trader_name,
+                "agent_name": agent_name,
+                "symbol": symbol,
+                "side": side,
+                "close_pct": close_pct,
+                "close_quantity": close_quantity,
+                "close_price": close_price,
+                "realised_pnl": realised_pnl,
+                "remaining_quantity": remaining_quantity,
+                "sl_moved_to_breakeven": sl_moved_to_breakeven,
+                "tranche_label": tranche_label,
+                "_override_name": trader_name,
+                "_override_avatar": trader_avatar,
+            },
+        )
+
+    async def log_whale_alert(
+        self,
+        symbol: str,
+        whale_label: str,
+        side: str,
+        notional_usd: float,
+        leverage: float,
+        change_type: str,  # "opened", "closed", "increased", "decreased"
+    ) -> None:
+        """Log a significant Hyperliquid whale position change to team chat."""
+        direction = "LONG" if side == "long" else "SHORT"
+
+        def fmt_usd(v: float) -> str:
+            if v >= 1_000_000:
+                return f"${v/1_000_000:.1f}M"
+            if v >= 1_000:
+                return f"${v/1_000:.0f}K"
+            return f"${v:.0f}"
+
+        verb = {
+            "opened": "has opened a new",
+            "closed": "has closed their",
+            "increased": "has increased their",
+            "decreased": "has reduced their",
+        }.get(change_type, f"has {change_type}")
+
+        content = (
+            f"🐋 **Whale Alert — {symbol}**: _{whale_label}_ {verb} "
+            f"**{direction}** position ({fmt_usd(notional_usd)} notional, "
+            f"{leverage:.0f}x leverage). "
+            f"Monitor Hyperliquid intelligence panel for updated positioning."
+        )
+        await self.add_message(
+            agent_role="technical_analyst",
+            content=content,
+            message_type="warning",
+            mentions=["@risk_manager", "@portfolio_manager"],
+            metadata={
+                "symbol": symbol,
+                "whale_label": whale_label,
+                "side": side,
+                "notional_usd": notional_usd,
+                "leverage": leverage,
+                "change_type": change_type,
             },
         )
 

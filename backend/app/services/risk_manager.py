@@ -45,6 +45,7 @@ class RiskAssessment:
     concentration_risk: str = "low"  # low, medium, high
     recommendations: List[str] = None
     reasoning: str = ""
+    whale_short_pct: Optional[float] = None  # 0.0–1.0 fraction of whale notional that is SHORT
 
     def __post_init__(self):
         if self.recommendations is None:
@@ -138,11 +139,11 @@ class RiskManager:
         profit_triggered = False
         
         if side.lower() == 'buy':
-            stop_triggered = current_price <= position.get('stop_loss', entry_price * 0.98)
-            profit_triggered = current_price >= position.get('take_profit', entry_price * 1.02)
+            stop_triggered = current_price <= position.get('stop_loss', entry_price * 0.965)   # 3.5% SL
+            profit_triggered = current_price >= position.get('take_profit', entry_price * 1.07)  # 7% TP
         else:
-            stop_triggered = current_price >= position.get('stop_loss', entry_price * 1.02)
-            profit_triggered = current_price <= position.get('take_profit', entry_price * 0.98)
+            stop_triggered = current_price >= position.get('stop_loss', entry_price * 1.035)   # 3.5% SL
+            profit_triggered = current_price <= position.get('take_profit', entry_price * 0.93)  # 7% TP
         
         if stop_triggered:
             return RiskCheckResult(
@@ -245,7 +246,9 @@ class RiskManager:
                 largest_symbol = largest_pos.get('symbol')
 
             # Determine concentration risk
-            if largest_pos:
+            # Only meaningful when 2+ positions exist — a single position is always "100%"
+            # but that's not a concentration problem, just a small active portfolio.
+            if largest_pos and len(current_positions) >= 2:
                 largest_exposure = (
                     largest_pos.get('quantity', 0) * largest_pos.get('current_price', largest_pos.get('entry_price', 0))
                 ) / (total_exposure or 1) * 100
@@ -274,20 +277,113 @@ class RiskManager:
             else:
                 risk_level = "safe"
 
+            # --- Whale intelligence signals ---
+            whale_signals: List[str] = []
+            _whale_short_pct: Optional[float] = None  # tracked for direction-aware gate
+            try:
+                from app.services.whale_intelligence import whale_intelligence as _whale_svc
+                whale_report = await _whale_svc.fetch_whale_report()
+                if whale_report and whale_report.coin_biases:
+                    # 1. Check each open position for opposing whale bias or exit pressure
+                    for pos in current_positions:
+                        symbol = pos.get("symbol", "")
+                        pos_side = pos.get("side", "").lower()  # "long" or "short"
+                        coin = _whale_svc.symbol_to_coin(symbol)
+                        bias = whale_report.coin_biases.get(coin)
+                        if bias is None:
+                            continue
+
+                        # Opposing bias: whale net is the opposite of our position
+                        whale_dir = "long" if bias.net_notional > 0 else "short"
+                        if pos_side and whale_dir != pos_side and abs(bias.net_notional) > 10_000:
+                            whale_signals.append(
+                                f"⚠️ Whale opposition on {coin}: we are {pos_side.upper()}, "
+                                f"whales are NET {whale_dir.upper()} "
+                                f"(${abs(bias.net_notional)/1000:.0f}K net, {bias.whale_count} wallet(s))"
+                            )
+                            if risk_level == "safe":
+                                risk_level = "caution"
+
+                        # Exit pressure: top whale sitting on large unrealised gain
+                        if bias.top_positions:
+                            top = bias.top_positions[0]
+                            if top.notional_usd > 0:
+                                pnl_ratio = top.unrealized_pnl / top.notional_usd
+                                if pnl_ratio >= 0.25 and top.side.lower() == pos_side:
+                                    # Whale is long & in huge profit on same coin we're long = dump risk
+                                    whale_signals.append(
+                                        f"⚠️ Exit pressure on {coin}: lead whale is {top.side.upper()} "
+                                        f"+{pnl_ratio:.0%} unrealised — profit-taking may reverse price"
+                                    )
+                                    if risk_level == "safe":
+                                        risk_level = "caution"
+                                elif pnl_ratio <= -0.20 and top.side.lower() != pos_side:
+                                    # Whale is trapped on opposite side — acts as a wall against our direction
+                                    whale_signals.append(
+                                        f"📌 Trapped whale on {coin}: lead whale {top.side.upper()} "
+                                        f"is {pnl_ratio:.0%} underwater near {top.entry_price:.4g} "
+                                        f"— price resistance/support wall"
+                                    )
+
+                    # 2. Aggregate market-level whale sentiment
+                    bullish_notional = sum(
+                        b.long_notional for b in whale_report.coin_biases.values()
+                        if b.long_notional + b.short_notional > 10_000
+                    )
+                    bearish_notional = sum(
+                        b.short_notional for b in whale_report.coin_biases.values()
+                        if b.long_notional + b.short_notional > 10_000
+                    )
+                    total_whale_notional = bullish_notional + bearish_notional
+                    if total_whale_notional > 0:
+                        bear_pct = bearish_notional / total_whale_notional
+                        _whale_short_pct = bear_pct  # expose for direction-aware entry gate
+                        try:
+                            from app.api.routes.settings import get_trading_gates as _get_whale_gates
+                            _wg = _get_whale_gates()
+                            _w_caution = _wg.whale_caution_threshold
+                            _w_info = _wg.whale_info_threshold
+                            _w_bull = _wg.whale_bull_threshold
+                        except Exception:
+                            _w_caution = 0.75
+                            _w_info = 0.65
+                            _w_bull = 0.30
+                        if bear_pct >= _w_caution:
+                            # Strong bearish whale positioning — genuine caution signal
+                            whale_signals.append(
+                                f"🐋 Macro whale sentiment: {bear_pct:.0%} SHORT across all tracked coins "
+                                f"— broad bearish smart-money positioning"
+                            )
+                            if risk_level == "safe":
+                                risk_level = "caution"
+                        elif bear_pct >= _w_info:
+                            # Moderately bearish — note it but don't elevate risk level
+                            whale_signals.append(
+                                f"🐋 Macro whale sentiment: {bear_pct:.0%} SHORT across tracked coins "
+                                f"— bearish lean, monitor positions"
+                            )
+                        elif bear_pct <= _w_bull:
+                            whale_signals.append(
+                                f"🐋 Macro whale sentiment: {(1-bear_pct):.0%} LONG across tracked coins "
+                                f"— broad bullish smart-money positioning"
+                            )
+            except Exception as _whale_err:
+                logger.debug(f"Whale signals skipped: {_whale_err}")
+
             # Generate recommendations
             recommendations = []
-            if risk_level != "safe":
-                recommendations.append(f"Current risk level: {risk_level}")
             if exposure_pct > exposure_threshold:
                 recommendations.append(f"Portfolio exposure high ({exposure_pct:.1f}% of capital, threshold: {exposure_threshold:.0f}%)")
             if daily_pnl < 0:
                 recommendations.append(f"Daily P&L negative: ${daily_pnl:.2f} ({daily_pnl_pct:+.2f}% of capital)")
             if concentration == "high":
                 recommendations.append(f"Concentration risk high: {largest_symbol} is {largest_exposure:.1f}% of portfolio")
+            recommendations.extend(whale_signals)
 
             # Use LLM for detailed risk reasoning
             reasoning = await self._generate_risk_reasoning(
-                risk_level, daily_pnl, exposure_pct, concentration, max_daily_loss_pct
+                risk_level, daily_pnl, exposure_pct, concentration, max_daily_loss_pct,
+                whale_signals=whale_signals
             )
 
             return RiskAssessment(
@@ -301,7 +397,8 @@ class RiskManager:
                 largest_position_size=largest_pos.get('quantity', 0) if largest_pos else 0.0,
                 concentration_risk=concentration,
                 recommendations=recommendations,
-                reasoning=reasoning
+                reasoning=reasoning,
+                whale_short_pct=_whale_short_pct,
             )
 
         except Exception as e:
@@ -366,10 +463,15 @@ class RiskManager:
         daily_pnl: float,
         exposure_pct: float,
         concentration: str,
-        max_daily_loss: float
+        max_daily_loss: float,
+        whale_signals: List[str] = None
     ) -> str:
         """Generate LLM-based risk reasoning"""
         try:
+            whale_section = ""
+            if whale_signals:
+                whale_section = "\nWHALE INTELLIGENCE SIGNALS:\n" + "\n".join(f"- {s}" for s in whale_signals) + "\n"
+
             prompt = f"""Assess the risk profile of this trading portfolio:
 
 RISK METRICS:
@@ -378,10 +480,13 @@ RISK METRICS:
 - Max Daily Loss Limit: {max_daily_loss}%
 - Portfolio Exposure: {exposure_pct:.1f}% of capital
 - Concentration Risk: {concentration}
+{whale_section}
+FUND POLICY CONTEXT:
+This fund uses a scale-out exit strategy: positions are partially closed at 25% (33% of TP range), 35% (60% of TP range), with the remainder riding to full TP or trailing stop. Open positions therefore carry reducing risk as price progresses — factor this into your exposure assessment. A position that has already scaled out tranche 1 has its SL at breakeven, so the residual risk on the runner is effectively zero.
 
 Provide brief risk assessment in JSON:
 {{
-  "risk_interpretation": "brief assessment of what these metrics mean",
+  "risk_interpretation": "brief assessment including scale-out status and whale signals if present",
   "primary_concern": "main risk factor",
   "recommended_action": "specific action if needed"
 }}

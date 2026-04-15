@@ -13,6 +13,7 @@ import logging
 
 from app.config import settings
 from app.services.llm import LLMService, LLMRegistry
+import app.strategies as strategy_registry
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +121,7 @@ class TraderService:
         agent_metrics: List[dict],
         market_condition: dict,
         confluence_scores: Optional[Dict[str, dict]] = None,
+        analyst_report=None,  # Optional[ResearchReport]
     ) -> List[dict]:
         """
         Trader reviews its own agents and proposes actions (create/disable/adjust).
@@ -153,6 +155,30 @@ class TraderService:
                 )
             confluence_block = "\nTECHNICAL CONFLUENCE:\n" + "\n".join(lines)
 
+        # Additive: inject Hyperliquid whale intelligence context (graceful degradation)
+        whale_block = ""
+        try:
+            from app.services.whale_intelligence import whale_intelligence
+            whale_report = await whale_intelligence.fetch_whale_report()
+            whale_block = whale_intelligence.build_llm_context_block(whale_report)
+        except Exception:
+            pass  # Trader prompt continues without whale data
+
+        # Additive: inject Marina's regime-derived strategy recommendations
+        marina_block = ""
+        if analyst_report and getattr(analyst_report, 'strategy_recommendations', None):
+            recs = analyst_report.strategy_recommendations
+            regime = getattr(analyst_report, 'market_regime', None)
+            regime_str = f"{regime.regime} / {regime.sentiment}" if regime else "unknown"
+            lines = [f"\nMARINA'S RESEARCH (regime: {regime_str}):"]
+            for rec in recs[:4]:
+                syms = ", ".join(rec.recommended_symbols[:3])
+                lines.append(
+                    f"  • {rec.strategy_type.upper()} on {syms} ({rec.timeframe}) "
+                    f"— priority {(rec.priority or 0):.0%}. {rec.rationale[:100]}"
+                )
+            marina_block = "\n".join(lines)
+
         prompt = f"""You are Trader "{trader['name']}", a competing portfolio trader in a hedge fund.
 
 YOUR TRADING STYLE: {config.get('style', 'Balanced approach')}
@@ -165,6 +191,11 @@ MARKET CONDITIONS:
   Volatility: {market_condition.get('volatility', '?')}
   Momentum: {market_condition.get('momentum', '?')}
 {confluence_block}
+{whale_block}
+{marina_block}
+
+STRATEGY REFERENCE:
+{strategy_registry.ai_prompt_summary()}
 
 YOUR CURRENT AGENTS:
 {agent_block}
@@ -177,15 +208,20 @@ Review your portfolio of agents. You may propose actions:
 
 Rules:
 - Maximum 4 agents per trader
+- Each agent should have a **single primary trading pair** — do NOT pass a list of pairs. Pick one symbol that best fits the strategy and current conditions (e.g., "BTCUSDT" or "SOLUSDT"). Multiple-pair agents reduce signal clarity.
+- The agent name must reflect the primary pair. Format: "SYMBOL_StrategyType", e.g., "BTC_Momentum", "SOL_Breakout", "ETH_MeanRev". Never name an agent after a symbol it doesn't trade.
 - Each agent should have a clear purpose and differentiated strategy
 - Don't create duplicates of existing agents
 - Disable agents with consistently negative P&L after 10+ runs
-- If market is sideways, prefer mean_reversion; if trending, prefer momentum/breakout
+- If market is sideways / ranging with low volatility, prefer mean_reversion or grid; if trending, prefer momentum/breakout/ema_crossover
+- Grid strategy (`strategy_type: "grid"`) requires Marina's explicit recommendation or confirmed ranging/low-volatility regime before proposing
+- Marina's research recommendations above are research-grade signals — strongly consider them when proposing new agents or re-enabling existing ones
+- Refer to the strategy reference below for guidance on which strategy to use in current conditions
 
 Return JSON:
 {{
   "actions": [
-    {{"action": "create_agent", "name": "...", "strategy_type": "...", "trading_pairs": [...], "stop_loss_pct": 2.0, "take_profit_pct": 6.0, "reason": "..."}},
+    {{"action": "create_agent", "name": "SOL_Momentum", "strategy_type": "momentum", "trading_pairs": ["SOLUSDT"], "stop_loss_pct": 3.5, "take_profit_pct": 7.0, "reason": "..."}},
     ...
   ],
   "reasoning": "explanation of your decisions"
@@ -273,10 +309,17 @@ If no changes needed, return {{"actions": [], "reasoning": "All agents performin
         for a in trader_agents:
             m = metrics_by_id.get(a["id"], {})
             total_pnl += m.get("total_pnl", 0) or 0
-            runs = m.get("total_runs", 0) or 0
-            wr = m.get("win_rate", 0) or 0
-            total_trades += runs
-            winning_trades += int(runs * wr)
+            # Use actual_trades (filled orders), not total_runs (scheduler cycles incl. holds)
+            actual = m.get("actual_trades", 0) or 0
+            wins = m.get("winning_trades", 0) or 0
+            if actual == 0:
+                # Fallback: derive from win_rate × total_runs only if actual_trades missing
+                runs = m.get("total_runs", 0) or 0
+                wr = m.get("win_rate", 0) or 0
+                actual = runs
+                wins = int(runs * wr)
+            total_trades += actual
+            winning_trades += wins
 
         win_rate = winning_trades / total_trades if total_trades > 0 else 0.0
 
