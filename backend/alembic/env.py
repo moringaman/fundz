@@ -17,7 +17,7 @@ if config.config_file_name is not None:
 
 target_metadata = Base.metadata
 
-async_url = settings.database_url
+async_url = settings.resolved_database_url
 config.set_main_option("sqlalchemy.url", async_url)
 
 

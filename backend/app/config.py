@@ -15,7 +15,36 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
 
-    database_url: str = "postgresql+asyncpg://postgres:postgres@db:5432/phemex_ai_trader"
+    # Primary database URL — used directly when set as a single variable.
+    # On Railway, the managed Postgres add-on exposes individual PGHOST/PGPORT/etc.
+    # variables. We build the URL from those when DATABASE_URL is not set, so an
+    # empty PGPORT (or any missing piece) doesn't cause a URL parse error at startup.
+    database_url: Optional[str] = None
+    pghost: Optional[str] = None
+    pgport: Optional[str] = None
+    pguser: Optional[str] = None
+    pgpassword: Optional[str] = None
+    pgdatabase: Optional[str] = None
+
+    @property
+    def resolved_database_url(self) -> str:
+        if self.database_url:
+            url = self.database_url
+            # Ensure asyncpg driver prefix
+            if url.startswith("postgres://"):
+                url = "postgresql+asyncpg://" + url[len("postgres://"):]
+            elif url.startswith("postgresql://") and "+asyncpg" not in url:
+                url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+            return url
+        if self.pghost and self.pguser and self.pgpassword and self.pgdatabase:
+            port = self.pgport or "5432"
+            return (
+                f"postgresql+asyncpg://{self.pguser}:{self.pgpassword}"
+                f"@{self.pghost}:{port}/{self.pgdatabase}"
+            )
+        # Local docker-compose fallback
+        return "postgresql+asyncpg://postgres:postgres@db:5432/phemex_ai_trader"
+
     redis_url: str = "redis://redis:6379/0"
 
     phemex_api_key: Optional[str] = None
