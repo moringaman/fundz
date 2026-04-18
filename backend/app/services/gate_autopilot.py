@@ -25,17 +25,30 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 # ── Regime constants ──────────────────────────────────────────────────────────
-REGIME_AGGRESSIVE = "AGGRESSIVE"
-REGIME_BALANCED   = "BALANCED"
-REGIME_CAUTIOUS   = "CAUTIOUS"
-REGIME_DEFENSIVE  = "DEFENSIVE"
+REGIME_AGGRESSIVE        = "AGGRESSIVE"
+REGIME_BALANCED          = "BALANCED"
+REGIME_CAUTIOUS          = "CAUTIOUS"
+REGIME_DEFENSIVE         = "DEFENSIVE"
+# Fee-drag overlays: checked before win-rate regime.
+# Severe:   gross_pnl / total_fees < 1.5  (fees eating >40% of gross profit)
+# Moderate: gross_pnl / total_fees < 2.5  (fees eating >28% of gross profit)
+REGIME_FEE_DRAG_SEVERE   = "FEE_DRAG_SEVERE"
+REGIME_FEE_DRAG_MODERATE = "FEE_DRAG_MODERATE"
 
 REGIME_COLORS = {
-    REGIME_AGGRESSIVE: "green",
-    REGIME_BALANCED:   "accent",
-    REGIME_CAUTIOUS:   "amber",
-    REGIME_DEFENSIVE:  "red",
+    REGIME_AGGRESSIVE:        "green",
+    REGIME_BALANCED:          "accent",
+    REGIME_CAUTIOUS:          "amber",
+    REGIME_DEFENSIVE:         "red",
+    REGIME_FEE_DRAG_SEVERE:   "red",
+    REGIME_FEE_DRAG_MODERATE: "amber",
 }
+
+# Fee drag detection thresholds
+_FEE_DRAG_MIN_FEES_USD      = 50.0   # don't activate on cold-start noise
+_FEE_DRAG_SEVERE_RATIO      = 1.5    # gross PnL / fees < 1.5 → severe
+_FEE_DRAG_MODERATE_RATIO    = 2.5    # gross PnL / fees < 2.5 → moderate
+_FEE_DRAG_MIN_CLOSED_TRADES = 20     # need meaningful sample before activating
 
 _AUTOPILOT_SETTING_KEY = "gate_autopilot"
 _RUN_INTERVAL_SECONDS  = 1800   # 30 minutes
@@ -252,10 +265,40 @@ class GateAutopilot:
 
             metrics["daily_fees"] = daily_fees
             # Assume 50k starting capital for % calculation
-            # TODO: read actual starting capital from risk_limits or config
             metrics["daily_fees_pct"] = (daily_fees / 50000.0) * 100.0
         except Exception as exc:
             logger.debug(f"Failed to gather UTC-day fees: {exc}")
+
+        # ── Lifetime fee drag metrics (gross PnL vs total fees ever paid) ──────
+        # A strategy can show an acceptable win rate while fees silently consume
+        # the majority of gross returns (high-frequency, small-profit pattern).
+        try:
+            async with get_async_session() as db:
+                fee_drag_row = await db.execute(
+                    select(
+                        sqlfunc.coalesce(sqlfunc.sum(Trade.fee), 0.0).label("total_fees"),
+                        sqlfunc.coalesce(sqlfunc.sum(Trade.pnl), 0.0).label("gross_pnl"),
+                        sqlfunc.count(Trade.id).label("trade_count"),
+                    ).where(
+                        Trade.user_id == "default-user",
+                        Trade.is_paper.is_(True),
+                        Trade.status == OrderStatus.FILLED,
+                        Trade.pnl.isnot(None),
+                    )
+                )
+                drag_row = fee_drag_row.one_or_none()
+                if drag_row:
+                    _total_fees  = float(drag_row.total_fees or 0.0)
+                    _gross_pnl   = float(drag_row.gross_pnl or 0.0)
+                    _trade_count = int(drag_row.trade_count or 0)
+                    metrics["total_fees_lifetime"]  = _total_fees
+                    metrics["gross_realized_pnl"]   = _gross_pnl
+                    metrics["fee_coverage_ratio"]   = (_gross_pnl / _total_fees) if _total_fees > 0 else None
+                    metrics["avg_trade_gross_pnl"]  = (_gross_pnl / _trade_count) if _trade_count > 0 else 0.0
+                    metrics["avg_fee_per_trade"]    = (_total_fees / _trade_count) if _trade_count > 0 else 0.0
+                    metrics["lifetime_trade_count"] = _trade_count
+        except Exception as exc:
+            logger.debug(f"Failed to gather fee drag metrics: {exc}")
 
         return metrics
 
@@ -272,6 +315,23 @@ class GateAutopilot:
         # Insufficient data → stay balanced
         if n < 5:
             return REGIME_BALANCED
+
+        # ── Fee drag detection (checked before win-rate regime) ───────────────
+        # High-frequency low-profit trading can show an acceptable win rate while
+        # fees silently consume the majority of gross returns.  Detect and
+        # correct independently of the standard win-rate classification.
+        _coverage   = metrics.get("fee_coverage_ratio")
+        _lifetime_n = metrics.get("lifetime_trade_count", 0)
+        _total_fees = metrics.get("total_fees_lifetime", 0.0)
+        if (
+            _coverage is not None
+            and _lifetime_n >= _FEE_DRAG_MIN_CLOSED_TRADES
+            and _total_fees >= _FEE_DRAG_MIN_FEES_USD
+        ):
+            if _coverage < _FEE_DRAG_SEVERE_RATIO:
+                return REGIME_FEE_DRAG_SEVERE
+            if _coverage < _FEE_DRAG_MODERATE_RATIO:
+                return REGIME_FEE_DRAG_MODERATE
 
         if cld >= 3:
             return REGIME_DEFENSIVE
@@ -342,6 +402,42 @@ class GateAutopilot:
             _set("sr_proximity_block_pct", _clamp(defaults.sr_proximity_block_pct + 0.0015, 0.003, 0.02))
             reason = (f"Win rate {wr:.0%} below target or negative daily PnL → "
                       f"tightened gates to reduce low-quality entries. {trade_sample_summary}")
+
+        elif regime == REGIME_FEE_DRAG_MODERATE:
+            _coverage  = metrics.get("fee_coverage_ratio", 0.0) or 0.0
+            _avg_gross = metrics.get("avg_trade_gross_pnl", 0.0) or 0.0
+            _avg_fee   = metrics.get("avg_fee_per_trade", 0.0) or 0.0
+            _set("min_entry_confidence",       _clamp(defaults.min_entry_confidence + 0.08, 0.62, 0.75))
+            _set("fee_coverage_min_ratio",     _clamp(defaults.fee_coverage_min_ratio + 0.5, 3.0, 4.0))
+            _set("circuit_breaker_max_trades", _clamp(defaults.circuit_breaker_max_trades - 5, 12, 20))
+            _set("confidence_size_floor",      _clamp(defaults.confidence_size_floor + 0.05, 0.30, 0.45))
+            _set("mtf_mixed_penalty",          _clamp(defaults.mtf_mixed_penalty + 0.05, 0.20, 0.35))
+            reason = (
+                f"Fee drag MODERATE: coverage ratio {_coverage:.2f}x "
+                f"(avg gross ${_avg_gross:.2f} vs avg fee ${_avg_fee:.2f}) — "
+                f"raised entry confidence and fee-coverage guard, reduced daily trade cap "
+                f"to favour fewer higher-quality setups. {trade_sample_summary}"
+            )
+
+        elif regime == REGIME_FEE_DRAG_SEVERE:
+            _coverage  = metrics.get("fee_coverage_ratio", 0.0) or 0.0
+            _avg_gross = metrics.get("avg_trade_gross_pnl", 0.0) or 0.0
+            _avg_fee   = metrics.get("avg_fee_per_trade", 0.0) or 0.0
+            _set("min_entry_confidence",       _clamp(defaults.min_entry_confidence + 0.15, 0.72, 0.82))
+            _set("fee_coverage_min_ratio",     _clamp(defaults.fee_coverage_min_ratio + 1.5, 4.0, 6.0))
+            _set("circuit_breaker_max_trades", _clamp(defaults.circuit_breaker_max_trades - 10, 8, 15))
+            _set("confidence_size_floor",      _clamp(defaults.confidence_size_floor + 0.10, 0.35, 0.50))
+            _set("confidence_size_reference",  _clamp(defaults.confidence_size_reference - 0.05, 0.72, 0.85))
+            _set("mtf_mixed_penalty",          _clamp(defaults.mtf_mixed_penalty + 0.10, 0.25, 0.45))
+            _set("mtf_opposed_penalty",        _clamp(defaults.mtf_opposed_penalty + 0.10, 0.35, 0.55))
+            _set("dead_zone_noop_enabled",     True)
+            reason = (
+                f"Fee drag SEVERE: coverage ratio {_coverage:.2f}x "
+                f"(avg gross ${_avg_gross:.2f} vs avg fee ${_avg_fee:.2f}) — "
+                f"gates aggressively tightened for fewer, larger, higher-conviction trades only. "
+                f"Fee coverage guard raised to {d.get('fee_coverage_min_ratio', 4.0):.1f}x. "
+                f"Daily trade cap → {d.get('circuit_breaker_max_trades', 10)}. {trade_sample_summary}"
+            )
 
         else:  # DEFENSIVE
             _set("min_entry_confidence",   _clamp(defaults.min_entry_confidence + 0.12, 0.62, 0.80))
