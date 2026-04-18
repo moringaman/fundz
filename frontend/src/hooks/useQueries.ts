@@ -43,6 +43,7 @@ export function useOpenOrders(symbol?: string) {
   return useQuery({
     queryKey: ['openOrders', symbol],
     queryFn: () => tradingApi.getOpenOrders(symbol).then((r) => r.data),
+    select: (d: unknown) => Array.isArray(d) ? d : [],
     refetchInterval: 15_000,
   });
 }
@@ -52,6 +53,7 @@ export function useTradeHistory(symbol?: string, limit = 50) {
   return useQuery({
     queryKey: ['tradeHistory', symbol, limit],
     queryFn: () => tradingApi.getHistory(symbol, limit).then((r) => r.data),
+    select: (d: unknown) => Array.isArray(d) ? d : [],
     refetchInterval: 15_000,
     staleTime: 10_000,
   });
@@ -71,6 +73,7 @@ export function useAgents() {
   return useQuery({
     queryKey: ['agents'],
     queryFn: () => agentApi.getAgents().then((r) => r.data),
+    select: (d: unknown) => Array.isArray(d) ? d : [],
     refetchInterval: 60_000,
     staleTime: 30_000,
   });
@@ -81,6 +84,7 @@ export function useStrategies() {
   return useQuery({
     queryKey: ['strategies'],
     queryFn: () => agentApi.getStrategies().then((r) => r.data),
+    select: (d: unknown) => Array.isArray(d) ? d : [],
     staleTime: 60_000,
   });
 }
@@ -115,6 +119,7 @@ export function useAgentSignals(agentId?: string) {
   return useQuery({
     queryKey: ['agentSignals', agentId],
     queryFn: () => agentApi.getSignals(agentId).then((r) => r.data),
+    select: (d: unknown) => Array.isArray(d) ? d : [],
     refetchInterval: 30_000,
   });
 }
@@ -124,6 +129,7 @@ export function useAutomationMetrics() {
   return useQuery({
     queryKey: ['automationMetrics'],
     queryFn: () => automationApi.getMetrics().then((r) => r.data),
+    select: (d: unknown) => Array.isArray(d) ? d : [],
     refetchInterval: 60_000,
   });
 }
@@ -142,6 +148,7 @@ export function useAutomationRuns(agentId?: string, limit = 50) {
   return useQuery({
     queryKey: ['automationRuns', agentId, limit],
     queryFn: () => automationApi.getRuns(agentId, limit).then((r) => r.data),
+    select: (d: unknown) => Array.isArray(d) ? d : [],
     refetchInterval: 30_000,
   });
 }
@@ -189,6 +196,7 @@ export function usePaperOrders(symbol?: string, limit = 50) {
   return useQuery({
     queryKey: ['paperOrders', symbol, limit],
     queryFn: () => paperApi.getOrders(symbol, limit).then((r) => r.data),
+    select: (d: unknown) => Array.isArray(d) ? d : [],
     refetchInterval: 15_000,
     staleTime: 10_000,
   });
@@ -199,6 +207,7 @@ export function usePaperPositions() {
   return useQuery({
     queryKey: ['paperPositions'],
     queryFn: () => paperApi.getPositions().then((r) => r.data),
+    select: (d: unknown) => Array.isArray(d) ? d : [],
     refetchInterval: 15_000,
   });
 }
@@ -236,6 +245,7 @@ export function useClosedTrades(symbol?: string, limit = 100) {
   return useQuery({
     queryKey: ['closedTrades', symbol, limit],
     queryFn: () => paperApi.getClosedTrades(symbol, limit).then((r) => r.data),
+    select: (d: unknown) => Array.isArray(d) ? d : [],
     refetchInterval: 30_000,
   });
 }
@@ -461,6 +471,7 @@ export function useFundConversations(limit = 50) {
   return useQuery({
     queryKey: ['fundConversations', limit],
     queryFn: () => fundApi.getConversations(limit).then((r) => r.data),
+    select: (d: unknown) => Array.isArray(d) ? d : [],
     staleTime: 30_000,
     refetchInterval: 15_000,
   });
@@ -480,6 +491,7 @@ export function useDailyReports(limit = 30) {
   return useQuery({
     queryKey: ['dailyReports', limit],
     queryFn: () => fundApi.getDailyReports(limit).then((r) => r.data),
+    select: (d: unknown) => Array.isArray(d) ? d : [],
     staleTime: 300_000,
   });
 }
@@ -528,6 +540,7 @@ export function useTraders() {
   return useQuery({
     queryKey: ['traders'],
     queryFn: () => traderApi.list().then(r => r.data),
+    select: (d: unknown) => Array.isArray(d) ? d : [],
     staleTime: 60_000,
     refetchInterval: 60_000,
   });
@@ -537,6 +550,7 @@ export function useTraderLeaderboard() {
   return useQuery({
     queryKey: ['traderLeaderboard'],
     queryFn: () => traderApi.getLeaderboard().then(r => r.data),
+    select: (d: unknown) => Array.isArray(d) ? d : [],
     staleTime: 120_000,
     refetchInterval: 120_000,
   });
@@ -566,6 +580,7 @@ export function useWhaleWatchlist() {
   return useQuery({
     queryKey: ['whaleWatchlist'],
     queryFn: () => whaleApi.getWatchlist().then((r) => r.data),
+    select: (d: unknown) => Array.isArray(d) ? d : [],
     staleTime: 30_000,
     refetchInterval: 60_000,
   });
