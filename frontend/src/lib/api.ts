@@ -140,6 +140,7 @@ export const automationApi = {
     agent_id: string;
     name: string;
     strategy_type: string;
+    trading_pairs?: string[];
     allocation_percentage: number;
     max_position_size: number;
     stop_loss_pct?: number;
