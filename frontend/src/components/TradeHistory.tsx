@@ -182,8 +182,8 @@ const TradeHistoryComponent: React.FC = () => {
           tradingApi.getPositions(),
           tradingApi.getPnl(),
         ]);
-        setTrades(historyRes.data);
-        setPositions(positionsRes.data);
+        setTrades(Array.isArray(historyRes.data) ? historyRes.data : []);
+        setPositions(Array.isArray(positionsRes.data) ? positionsRes.data : []);
         setPnl(pnlRes.data);
       } catch (error) {
         console.error('Failed to load history:', error);

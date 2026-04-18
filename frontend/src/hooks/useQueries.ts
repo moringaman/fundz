@@ -10,6 +10,14 @@ export function setQueryClient(qc: QueryClient) {
   queryClient = qc;
 }
 
+/** Fetch wrapper that throws on non-2xx so React Query treats HTTP errors as errors, not data. */
+function safeFetch(url: string) {
+  return fetch(url).then(r => {
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return r.json();
+  });
+}
+
 // ─── Positions ────────────────────────────────────────────────────────────────
 export function usePositions() {
   return useQuery({
@@ -246,7 +254,7 @@ export function usePerformanceChart() {
 export function useFundMarketAnalysis() {
   return useQuery({
     queryKey: ['fundMarketAnalysis'],
-    queryFn: () => fetch('/api/fund/market-analysis').then(r => r.json()),
+    queryFn: () => safeFetch('/api/fund/market-analysis'),
     staleTime: 60_000,      // 1 minute stale
     refetchInterval: 300_000, // Refresh every 5 minutes (aligns with team analysis tier)
   });
@@ -255,7 +263,7 @@ export function useFundMarketAnalysis() {
 export function useFundAllocationDecision(totalCapital = 10000) {
   return useQuery({
     queryKey: ['fundAllocationDecision', totalCapital],
-    queryFn: () => fetch(`/api/fund/allocation-decision?total_capital=${totalCapital}`).then(r => r.json()),
+    queryFn: () => safeFetch(`/api/fund/allocation-decision?total_capital=${totalCapital}`),
     staleTime: 60_000,
     refetchInterval: 300_000,
   });
@@ -264,7 +272,7 @@ export function useFundAllocationDecision(totalCapital = 10000) {
 export function useFundRiskAssessment() {
   return useQuery({
     queryKey: ['fundRiskAssessment'],
-    queryFn: () => fetch('/api/fund/risk-assessment').then(r => r.json()),
+    queryFn: () => safeFetch('/api/fund/risk-assessment'),
     staleTime: 30_000,       // 30 seconds stale - risk is more time sensitive
     refetchInterval: 120_000, // Refresh every 2 minutes
   });
@@ -273,7 +281,7 @@ export function useFundRiskAssessment() {
 export function useFundCIOReport(period = 'daily') {
   return useQuery({
     queryKey: ['fundCIOReport', period],
-    queryFn: () => fetch(`/api/fund/cio-report?period=${period}`).then(r => r.json()),
+    queryFn: () => safeFetch(`/api/fund/cio-report?period=${period}`),
     staleTime: 120_000,
     refetchInterval: 600_000, // Refresh every 10 minutes - CIO report is less time sensitive
   });
@@ -282,7 +290,7 @@ export function useFundCIOReport(period = 'daily') {
 export function useFundPerformanceAttribution() {
   return useQuery({
     queryKey: ['fundPerformanceAttribution'],
-    queryFn: () => fetch('/api/fund/performance-attribution').then(r => r.json()),
+    queryFn: () => safeFetch('/api/fund/performance-attribution'),
     staleTime: 60_000,
     refetchInterval: 300_000,
   });
@@ -320,7 +328,7 @@ export function useClearAdvisorHistory() {
 export function useFundTeamStatus() {
   return useQuery({
     queryKey: ['fundTeamStatus'],
-    queryFn: () => fetch('/api/fund/team-status').then(r => r.json()),
+    queryFn: () => safeFetch('/api/fund/team-status'),
     staleTime: 30_000,
     refetchInterval: 120_000,
   });
@@ -329,7 +337,7 @@ export function useFundTeamStatus() {
 export function useFundTeamRoster() {
   return useQuery({
     queryKey: ['fundTeamRoster'],
-    queryFn: () => fetch('/api/fund/team-roster').then(r => r.json()),
+    queryFn: () => safeFetch('/api/fund/team-roster'),
     staleTime: 3600_000,  // 1 hour - roster doesn't change
     refetchInterval: undefined,  // Don't auto-refetch
   });
@@ -338,7 +346,7 @@ export function useFundTeamRoster() {
 export function useFundTechnicalAnalysis(symbol = 'BTCUSDT') {
   return useQuery({
     queryKey: ['fundTechnicalAnalysis', symbol],
-    queryFn: () => fetch(`/api/fund/technical-analysis?symbol=${symbol}`).then(r => r.json()),
+    queryFn: () => safeFetch(`/api/fund/technical-analysis?symbol=${symbol}`),
     staleTime: 60_000,
     refetchInterval: 300_000,
   });
@@ -347,7 +355,7 @@ export function useFundTechnicalAnalysis(symbol = 'BTCUSDT') {
 export function useFundTechnicalAnalysisBatch() {
   return useQuery({
     queryKey: ['fundTechnicalAnalysisBatch'],
-    queryFn: () => fetch('/api/fund/technical-analysis/batch').then(r => r.json()),
+    queryFn: () => safeFetch('/api/fund/technical-analysis/batch'),
     staleTime: 60_000,
     refetchInterval: 300_000,
   });
@@ -357,7 +365,7 @@ export function useFundTechnicalAnalysisBatch() {
 export function useStrategyActions(limit = 20) {
   return useQuery({
     queryKey: ['strategyActions', limit],
-    queryFn: () => fetch(`/api/fund/strategy-actions?limit=${limit}`).then(r => r.json()),
+    queryFn: () => safeFetch(`/api/fund/strategy-actions?limit=${limit}`),
     staleTime: 60_000,
     refetchInterval: 300_000,
   });
@@ -370,7 +378,7 @@ export function useBacktestHistory(agentId?: string, limit = 20) {
     queryFn: () => {
       const params = new URLSearchParams({ limit: String(limit) });
       if (agentId) params.set('agent_id', agentId);
-      return fetch(`/api/backtest/history?${params}`).then(r => r.json());
+      return safeFetch(`/api/backtest/history?${params}`);
     },
     staleTime: 120_000,
   });
@@ -380,7 +388,7 @@ export function useBacktestHistory(agentId?: string, limit = 20) {
 export function useTradeRetrospective() {
   return useQuery({
     queryKey: ['tradeRetrospective'],
-    queryFn: () => fetch('/api/fund/trade-retrospective').then(r => r.json()),
+    queryFn: () => safeFetch('/api/fund/trade-retrospective'),
     staleTime: 300_000,
     refetchInterval: 600_000,
   });
@@ -537,7 +545,7 @@ export function useTraderLeaderboard() {
 export function useTraderAllocation() {
   return useQuery({
     queryKey: ['traderAllocation'],
-    queryFn: () => fetch('/api/fund/trader-allocation').then(r => r.json()),
+    queryFn: () => safeFetch('/api/fund/trader-allocation'),
     staleTime: 30_000,
     refetchInterval: 30_000,
   });

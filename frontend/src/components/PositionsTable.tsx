@@ -137,7 +137,8 @@ export const PositionsTableComponent: React.FC = () => {
       // Paper mode → /api/paper/positions, Live mode → /api/trading/positions
       const url = isPaper ? '/api/paper/positions' : '/api/trading/positions';
       const response = await axios.get(url);
-      setPositions(response.data);
+      const data = response.data;
+      setPositions(Array.isArray(data) ? data : []);
       setError(null);
     } catch (err) {
       setError('Failed to fetch positions');
