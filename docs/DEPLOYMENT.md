@@ -17,6 +17,18 @@ Production deployment guide for the AI-powered trading platform.
 
 ---
 
+## How Database Migrations Work
+
+> **Important:** This app does **not** use Alembic for production deployments.
+
+On every startup the FastAPI lifespan handler runs `Base.metadata.create_all`, which creates every table from the SQLAlchemy models. It then applies incremental `ALTER TABLE` migrations for columns added after the initial schema. This means:
+
+- **First deploy:** all tables are created automatically when the backend first starts.
+- **Subsequent deploys:** any new columns are added automatically — no manual migration step required.
+- Alembic migrations in `alembic/versions/` exist for local development history only. **Do not run `alembic upgrade head` in production** — it would only apply 2 partial migrations and leave the schema incomplete.
+
+---
+
 ## Pre-Deployment Checklist
 
 Before deploying to any platform:
@@ -120,30 +132,56 @@ docker compose down
 
 ### Step 3 — Configure Backend service
 
-1. Click on the backend service (or create one pointing to `/backend`)
+1. Click on the auto-created service (or **"+ New"** → **"GitHub Repo"**, root dir `backend`)
 2. **Settings** tab:
    - **Root Directory:** `backend`
    - **Builder:** Dockerfile
-   - **Start Command:** `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+   - No start command override needed — the Dockerfile CMD handles `$PORT` automatically
 3. **Variables** tab — add all backend env vars:
-   ```
-   DATABASE_URL        → ${{Postgres.DATABASE_URL}}   (Railway reference variable)
-   REDIS_URL           → ${{Redis.REDIS_URL}}         (Railway reference variable)
-   DEBUG               → false
-   PHEMEX_API_KEY      → your_key
-   PHEMEX_API_SECRET   → your_secret
-   PHEMEX_TESTNET      → false
-   JWT_SECRET          → (generated 64-char secret)
-   LLM_PROVIDER        → openrouter
-   OPENROUTER_API_KEY  → your_key
-   LLM_MODEL           → mistralai/mixtral-8x7b-instruct
-   CORS_ORIGINS        → https://your-frontend.up.railway.app
-   ```
 
-> **Note:** Railway's `DATABASE_URL` uses `postgresql://` scheme. The app uses `postgresql+asyncpg://`. Add a variable:
-> ```
-> DATABASE_URL → postgresql+asyncpg://${PGUSER}:${PGPASSWORD}@${PGHOST}:${PGPORT}/${PGDATABASE}
-> ```
+```
+# Database — use the individual PG* reference variables (Railway injects these automatically
+# from the Postgres add-on). The app builds postgresql+asyncpg:// from them at startup.
+# Do NOT use DATABASE_URL — Railway sets it to postgresql:// which breaks asyncpg.
+PGHOST     = ${{Postgres.PGHOST}}
+PGPORT     = ${{Postgres.PGPORT}}
+PGUSER     = ${{Postgres.PGUSER}}
+PGPASSWORD = ${{Postgres.PGPASSWORD}}
+PGDATABASE = ${{Postgres.PGDATABASE}}
+
+# Redis
+REDIS_URL           = ${{Redis.REDIS_URL}}
+
+# Core
+DEBUG               = false
+JWT_SECRET          = <generated 64-char secret>   # python3 -c "import secrets; print(secrets.token_urlsafe(64))"
+JWT_ALGORITHM       = HS256
+JWT_EXPIRATION_MINUTES = 10080
+
+# CORS — set to your frontend domain after Step 5
+CORS_ORIGINS        = https://your-frontend.up.railway.app
+
+# Phemex API
+PHEMEX_API_KEY      = <your_production_api_key>
+PHEMEX_API_SECRET   = <your_production_api_secret>
+PHEMEX_TESTNET      = false
+
+# LLM (at least one required for agents to function)
+LLM_PROVIDER        = openrouter
+OPENROUTER_API_KEY  = <your_openrouter_key>
+LLM_MODEL           = openai/gpt-4o-mini
+LLM_TEMPERATURE     = 0.7
+LLM_MAX_TOKENS      = 1000
+
+# Email (optional)
+MAIL_SERVER_DOMAIN  = <your_email_service>
+MAIL_SERVER_API_KEY = <your_mail_key>
+MAIL_TO_ADDRESS     = trading@yourdomain.com
+MAIL_FROM_ADDRESS   = noreply@yourdomain.com
+MAIL_DAILY_HOUR     = 17
+```
+
+> **DATABASE_URL note:** Railway's `${{Postgres.DATABASE_URL}}` uses `postgresql://` (no asyncpg driver) and can inject an empty `PGPORT` during container startup, causing a crash. The app's `config.py` builds the correct `postgresql+asyncpg://` URL from the individual `PGHOST`/`PGPORT`/`PGUSER`/`PGPASSWORD`/`PGDATABASE` variables, which Railway auto-links from the Postgres add-on. Use those instead of `DATABASE_URL`.
 
 ### Step 4 — Configure Frontend service
 
@@ -153,15 +191,10 @@ docker compose down
    - **Builder:** Dockerfile
 3. **Variables** tab:
    ```
-   VITE_API_URL → /api
+   BACKEND_HOST = backend.railway.internal
    ```
-4. Update `frontend/nginx.conf` to proxy to the backend's Railway internal URL:
-   ```nginx
-   location /api/ {
-       proxy_pass http://backend.railway.internal:8000/api/;
-       # ... keep existing proxy headers
-   }
-   ```
+
+> **How it works:** The `frontend/nginx.conf` uses `${BACKEND_HOST}` as a placeholder. The Dockerfile runs `envsubst` at container startup to substitute the backend hostname into the nginx config. On Railway, this points to the backend via private networking. For local docker-compose it defaults to `phemex-ai-trader-backend` (the Docker container name) — no change needed locally.
 
 ### Step 5 — Configure networking
 
@@ -177,12 +210,52 @@ git add -A && git commit -m "deploy: production configuration"
 git push origin main
 ```
 
-### Step 7 — Run database migrations
+Watch the backend deployment logs. The lifespan handler will:
+1. Run `create_all` — creates all PostgreSQL tables from the ORM models
+2. Apply incremental column migrations (ALTER TABLE)
+3. Seed strategy overrides
+4. Start the agent scheduler, market broadcast, and whale intelligence
+
+### Step 7 — Seed the database (run once)
+
+PostgreSQL enforces foreign-key constraints. The app uses a hardcoded `"default-user"` ID as the `user_id` FK for positions, trades, and balances — so that row must exist before any agents or trades can be created.
+
+In the Railway dashboard → Backend service → **"Shell"** tab:
 
 ```bash
-# In Railway dashboard → Backend service → "Shell" tab
-alembic upgrade head
+# From inside the backend container (/app)
+python scripts/seed_production.py
 ```
+
+This creates:
+- A `default-user` account (username: `admin`, password: `ChangeMe123!`)
+- A `position_sync` service account (used internally by the live position sync service)
+- Initial USDT paper trading balance ($50,000)
+- Three fund traders (Alex, Jordan, Sam) backed by different LLM models
+- Three starter agents (Momentum Rider, Mean Reversion, Breakout Hunter)
+
+> **Security:** Change the default `admin` password immediately after first login.
+
+### Step 8 — Verify deployment
+
+1. Open your frontend public domain — the dashboard should load
+2. Check **Settings** → risk limits, trading gates, and 15 default pairs should all be visible
+3. Check **Fund** → three traders should appear
+4. Check **Agents** → three starter agents should be listed
+5. Backend health: `https://your-backend.up.railway.app/health` → `{"status":"ok"}`
+
+### Step 9 — Configure live trading via the Settings UI
+
+All trading settings are stored in the database and configured through the UI (not environment variables):
+
+1. **Settings → API Keys** — enter your Phemex API key and secret
+2. **Settings → LLM Config** — confirm your provider key is active
+3. **Settings → Trading Preferences** — review the 15 default pairs, adjust as needed
+4. **Settings → Risk Limits** — review max position size, daily loss limit, leverage
+5. **Settings → Trading Gates** — review confidence thresholds and session filters
+6. **Agents** → enable the agents you want to run
+
+> Telegram notifications are also configured via **Settings → Telegram** in the UI.
 
 ---
 
@@ -286,8 +359,9 @@ echo "POSTGRES_PASSWORD=$POSTGRES_PASSWORD" >> ~/.env
 # Build and start
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
 
-# Run database migrations
-docker compose exec backend alembic upgrade head
+# Tables are created automatically on first startup via create_all.
+# Seed required base data (run once after first deploy):
+docker compose exec backend python scripts/seed_production.py
 
 # Verify
 docker compose ps
@@ -346,7 +420,7 @@ jobs:
             cd ~/phemex-ai-trader
             git pull origin main
             docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
-            docker compose exec -T backend alembic upgrade head
+            docker compose exec -T backend python scripts/seed_production.py
 ```
 
 Add `DO_HOST` and `DO_SSH_KEY` to GitHub repo → Settings → Secrets.
@@ -423,7 +497,8 @@ docker compose logs -f backend
 
 # Production (DO Droplet)
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
-docker compose exec backend alembic upgrade head
+# Tables are auto-created on startup; run seed once on first deploy:
+docker compose exec backend python scripts/seed_production.py
 docker compose logs -f --tail=50
 
 # Database backup (DO Droplet)

@@ -577,3 +577,127 @@ required_liq_buffer = entry_price * 0.50              # must be 50%+ away
   - Active theses that trader has open
 - [ ] **Settings tab**: Accumulation capital %, max assets, default tranches, DCA trigger %, leverage cap
 - [ ] Visual indicator distinguishing accumulation positions from active trading positions (different colour/badge)
+
+---
+
+## Phase 11: Live Trading Parity
+
+### Background
+
+The system currently has a complete, battle-tested paper trading implementation with SL/TP progression, scale-out partial closes, trailing stops, LLM-driven position reviews, and full P&L tracking. The live trading path (`paper_trading_default=false`) can place real Phemex orders with SL/TP attached at entry, but **all active position management runs exclusively on paper positions**. This phase brings live trading to full parity with paper.
+
+### Current State
+
+| Feature | Paper | Live | Gap |
+|---|---|---|---|
+| Order entry (spot + contract) | ✅ | ✅ | None |
+| SL/TP attached at entry | ✅ | ✅ | None |
+| Risk gate before entry | ✅ | ✅ | None |
+| Breakeven SL progression (33% to TP) | ✅ | ❌ | No live SL adjustment |
+| Profit-lock SL (50% lock @ 66% to TP) | ✅ | ❌ | No live SL adjustment |
+| Trailing stop watermark | ✅ | ⚠️ Initial placement only | No progressive tightening |
+| Scale-out partial closes (3-tier) | ✅ | ❌ | No reduce-only orders |
+| LLM-driven SL/TP amendments (FM review) | ✅ | ❌ | Monitor only checks paper |
+| Position monitoring loop (60s) | ✅ | ❌ | `_monitor_open_positions()` fetches paper only |
+| P&L tracking (win rate, agent stats) | ✅ | ❌ | No live P&L pipeline |
+| Position sync from Phemex | N/A | ❌ | `position_sync.py` exists but orphaned |
+
+### 11.1 Trading Service Abstraction Layer
+
+- [ ] Create `backend/app/services/trading_service.py` — unified interface that routes to paper or live:
+  - `async def place_order(symbol, side, qty, price, agent_id, sl, tp, trailing_stop) → OrderResult`
+  - `async def close_position(position_id) → CloseResult`
+  - `async def partial_close(position_id, qty, label) → PartialCloseResult`
+  - `async def update_position_sl_tp(position_id, sl, tp, trailing_stop) → UpdateResult`
+  - `async def get_positions(symbol?, agent_id?) → List[Position]`
+  - `async def get_closed_trades(symbol?, limit?) → List[ClosedTrade]`
+- [ ] Reads `paper_trading_default` setting at call time — routes to `PaperTradingService` or `LiveTradingService`
+- [ ] All callers in `agent_scheduler.py` migrate from `paper_trading.*` to `trading_service.*`
+- [ ] Common return types (`OrderResult`, `CloseResult`, etc.) so callers don't know or care which mode is active
+
+### 11.2 Live Trading Service
+
+- [ ] Create `backend/app/services/live_trading.py` — mirrors `PaperTradingService` public API using real Phemex client:
+  - `place_order()` → calls `phemex.place_spot_order_with_sl_tp()` or `phemex.place_contract_order()` based on side
+  - `close_position()` → places a reduce-only market order for the full remaining quantity
+  - `partial_close(position_id, qty, label)` → places a reduce-only market order for `qty`; updates DB position `realized_pnl` and `scale_out_levels` identically to paper
+  - `update_position_sl_tp()` → calls `phemex.amend_order()` to modify the server-side conditional orders; also updates local DB record so the monitoring loop has the latest values
+  - `get_positions()` → queries local DB positions where `is_paper=False` (synced by position_sync)
+  - `get_closed_trades()` → queries local DB closed trades where `is_paper=False`
+- [ ] All mutations log to DB with `is_paper=False` and `phemex_order_id` for audit trail
+- [ ] Fee rates pulled from Phemex account tier (or configurable override) rather than hardcoded paper rates
+
+### 11.3 Position Sync Integration
+
+- [ ] Wire `position_sync.py` into `agent_scheduler._scheduler_loop()` on a 30-second cadence
+- [ ] Sync creates/updates local `Position` records from Phemex API response (`phemex.get_positions()`)
+- [ ] Maps Phemex position fields → local DB fields: `symbol`, `side`, `quantity`, `entry_price`, `unrealized_pnl`, `leverage`
+- [ ] Detects externally closed positions (Phemex SL/TP triggered server-side) and marks them closed in local DB
+- [ ] Handles partial fills: if Phemex reports reduced quantity vs local record, infer a partial close occurred
+- [ ] Reconciliation: compare local `stop_loss_price`/`take_profit_price` with Phemex conditional orders; flag drift
+- [ ] Log sync summary to team chat every 5 minutes: positions synced, any discrepancies
+
+### 11.4 Position Monitoring for Live
+
+- [ ] Extend `_monitor_open_positions()` to fetch both paper AND live positions:
+  - Paper: `paper_trading.get_positions()` (existing)
+  - Live: `live_trading.get_positions()` (new, reads synced DB records)
+- [ ] Apply identical SL/TP progression rules to live positions:
+  - **Breakeven SL** at 33% to TP → `live_trading.update_position_sl_tp()`
+  - **Profit-lock SL** at 66% to TP → `live_trading.update_position_sl_tp()`
+  - **Trailing stop watermark** → `live_trading.update_position_sl_tp()`
+- [ ] Apply identical scale-out logic to live positions:
+  - Tranche 1 (25%) at 50% to TP → `live_trading.partial_close()`
+  - Tranche 2 (35%) at 75% to TP → `live_trading.partial_close()`
+  - Tranche 3 (40% runner) at full TP → `live_trading.close_position()`
+- [ ] Exit triggers (risk manager `check_exit`) route to `live_trading.close_position()`
+- [ ] SL/TP review (`_review_open_position_levels`) routes amendments to `live_trading.update_position_sl_tp()`
+
+### 11.5 Live P&L Tracking
+
+- [ ] `_record_run()` records live trade P&L identically to paper — `actual_trades` / `winning_trades` counters increment
+- [ ] `get_agent_performance_from_db()` includes `is_paper=False` trades in aggregation (or filtered by mode)
+- [ ] Leaderboard and trader detail pages show live performance when in live mode
+- [ ] Daily performance chart (`/paper/performance-chart`) extended to support live mode data source
+- [ ] Telegram alerts fire for ALL live trades: entry, scale-out, SL/TP hit, full exit
+
+### 11.6 Circuit Breakers & Safety
+
+- [ ] **Daily loss hard kill**: if cumulative live P&L for the day breaches `max_daily_loss_pct`, immediately:
+  - Close all open live positions via reduce-only market orders
+  - Disable all agents
+  - Send Telegram + team chat critical alert
+  - Require manual re-enable (no auto-recovery)
+- [ ] **Position size sanity check**: before any live order, verify `quantity × price` does not exceed `max_position_size_pct` of actual Phemex account balance (not simulated)
+- [ ] **Balance verification**: before live entry, call `phemex.get_account_balance()` and verify sufficient margin/balance; reject if insufficient
+- [ ] **Order confirmation**: after placing a live order, poll `phemex.get_open_orders()` to confirm fill; retry or alert on timeout
+- [ ] **Rate limiting**: cap live order frequency to max 1 order per agent per 60 seconds to prevent rapid-fire entries on volatile signals
+- [ ] **Kill switch API endpoint**: `POST /live/emergency-stop` — closes all live positions, disables all agents, halts scheduler
+
+### 11.7 Live API Routes
+
+- [ ] Create `/live/positions` — GET open live positions (from synced DB)
+- [ ] Create `/live/positions/{id}/close` — POST close a live position
+- [ ] Create `/live/positions/{id}` — PATCH update SL/TP on live position
+- [ ] Create `/live/orders` — GET recent live order history
+- [ ] Create `/live/pnl` — GET live P&L summary
+- [ ] Create `/live/performance-chart` — GET daily live performance metrics
+- [ ] Create `/live/emergency-stop` — POST kill switch
+- [ ] Create `/live/status` — GET sync status, last sync time, account balance, open order count
+
+### 11.8 Configuration & Mode Switching
+
+- [ ] Add `trading_mode` enum to settings: `paper` | `live` | `shadow` (shadow = live signals logged but not executed)
+- [ ] Shadow mode: entire pipeline runs, orders are logged to DB with `is_shadow=True`, but no Phemex API calls made — useful for validating live readiness
+- [ ] Mode switch requires confirmation: changing from paper → live triggers a confirmation dialog with checklist (API keys set, balance verified, risk limits reviewed)
+- [ ] API keys validated on mode switch: test `phemex.get_account_balance()` before allowing live mode activation
+- [ ] Live mode indicator in frontend header bar (red badge) so it's always visible
+
+### 11.9 Frontend
+
+- [ ] **Mode toggle** on Settings page: Paper / Shadow / Live with confirmation flow
+- [ ] **Live positions panel** on Dashboard: real-time positions from `/live/positions`
+- [ ] **Live P&L chart** alongside paper chart (or unified with mode filter)
+- [ ] **Emergency stop button** in header (live mode only) — calls `/live/emergency-stop`
+- [ ] **Sync status indicator**: last sync time, connection health, any reconciliation warnings
+- [ ] **Paper vs Live comparison view**: side-by-side performance metrics to validate before switching

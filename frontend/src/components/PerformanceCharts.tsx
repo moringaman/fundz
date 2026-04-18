@@ -1,6 +1,6 @@
 import { useRef, useEffect, useState } from 'react';
 import { createChart, ColorType, LineSeries, HistogramSeries, AreaSeries } from 'lightweight-charts';
-import type { IChartApi, ISeriesApi, Time } from 'lightweight-charts';
+import type { ISeriesApi, Time } from 'lightweight-charts';
 import { usePerformanceChart } from '../hooks/useQueries';
 
 interface ChartRow {
