@@ -535,21 +535,28 @@ Return JSON only:
                 # performance differences, override with deterministic scoring.
                 alloc_values = list(alloc_pct.values())
                 allocation_spread = max(alloc_values) - min(alloc_values)
-                max_pnl_diff = max(
-                    abs(
-                        (a.get("gross_pnl") if a.get("gross_pnl") is not None else a.get("total_pnl", 0))
-                        - (b.get("gross_pnl") if b.get("gross_pnl") is not None else b.get("total_pnl", 0))
-                    )
-                    for a in trader_performance
-                    for b in trader_performance
-                ) if len(trader_performance) > 1 else 0
+                _gross_vals = [
+                    (p.get("gross_pnl") if p.get("gross_pnl") is not None else p.get("total_pnl", 0)) or 0
+                    for p in trader_performance
+                ]
+                max_pnl_diff = max(_gross_vals) - min(_gross_vals) if len(_gross_vals) > 1 else 0
+                wr_vals = [(p.get("win_rate") or 0) for p in trader_performance]
+                max_wr_diff = max(wr_vals) - min(wr_vals) if len(wr_vals) > 1 else 0
                 min_trades = min(
                     (p.get("total_trades", 0) for p in trader_performance), default=0
                 )
-                if allocation_spread < 5.0 and max_pnl_diff > 150 and min_trades >= 3:
+                # Trigger deterministic fallback when:
+                # - LLM spread is suspiciously flat (<5%), AND
+                # - Either gross P&L differs by >$50, OR win rates differ by >5%
+                _meaningful_difference = (
+                    (max_pnl_diff > 50 and min_trades >= 3)
+                    or (max_wr_diff > 0.05 and min_trades >= 10)
+                )
+                if allocation_spread < 5.0 and _meaningful_difference:
                     logger.warning(
                         f"LLM returned near-equal allocation (spread {allocation_spread:.1f}%) "
-                        f"despite P&L diff of ${max_pnl_diff:.0f} — using deterministic scoring"
+                        f"despite gross P&L diff ${max_pnl_diff:.0f} / WR diff {max_wr_diff:.1%} "
+                        f"— using deterministic scoring"
                     )
                     return self._deterministic_trader_allocation(traders, trader_performance)
 

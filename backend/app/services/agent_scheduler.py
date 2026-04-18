@@ -2737,9 +2737,21 @@ class AgentScheduler:
                                 ))
                             self._consistency_flags[_t["id"]] = _cr.consistency_flag
 
-                        # Re-normalize after gating adjustments
+                        # Re-normalize after gating adjustments.
+                        # IMPORTANT: skip if Sharpe multipliers already created a meaningful
+                        # spread — re-normalizing a 50/30/20 split back to 33/33/33 defeats
+                        # the entire purpose of performance-based allocation.
+                        _gated_vals = list(trader_alloc_pct.values())
+                        _gated_spread = (max(_gated_vals) - min(_gated_vals)) if _gated_vals else 0
                         _total = sum(trader_alloc_pct.values())
-                        if _total > 0:
+                        if _total > 0 and _gated_spread < 5.0:
+                            # Spread is still flat — normalize so allocations sum to 100
+                            trader_alloc_pct = {
+                                tid: pct / _total * 100
+                                for tid, pct in trader_alloc_pct.items()
+                            }
+                        elif _total > 0 and abs(_total - 100.0) > 5.0:
+                            # Spread is meaningful — only normalize if total has drifted >5% from 100
                             trader_alloc_pct = {
                                 tid: pct / _total * 100
                                 for tid, pct in trader_alloc_pct.items()
