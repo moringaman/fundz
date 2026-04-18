@@ -17,7 +17,6 @@ router = APIRouter(prefix="/agents", tags=["agents"])
 class AgentConfig(BaseModel):
     name: str
     strategy_type: str
-    trading_pairs: List[str]
     trader_id: Optional[str] = None
     allocation_percentage: float = 10.0
     max_position_size: float = 0.1
@@ -163,7 +162,7 @@ async def create_agent(config: AgentConfig, db: AsyncSession = Depends(get_db)):
         name=config.name,
         strategy_type=config.strategy_type,
         config={
-            "trading_pairs": config.trading_pairs,
+            "trading_pairs": [],  # populated automatically as trades execute
             "indicators_config": config.indicators_config,
             "stop_loss_pct": config.stop_loss_pct,
             "take_profit_pct": config.take_profit_pct,
@@ -200,8 +199,9 @@ async def update_agent(agent_id: str, config: AgentConfig, db: AsyncSession = De
     
     agent.name = config.name
     agent.strategy_type = config.strategy_type
+    _existing_traded_pairs = agent.config.get("trading_pairs", []) if isinstance(agent.config, dict) else []
     agent.config = {
-        "trading_pairs": config.trading_pairs,
+        "trading_pairs": _existing_traded_pairs,  # preserve trade history — not user-editable
         "indicators_config": config.indicators_config,
         "stop_loss_pct": config.stop_loss_pct,
         "take_profit_pct": config.take_profit_pct,

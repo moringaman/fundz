@@ -184,6 +184,24 @@ def snap_sl_to_structure(
     return candidate_sl
 
 
+def _is_near_resistance(current_price: float, price_levels: Optional[PriceLevels], proximity_pct: float = 0.005) -> bool:
+    """Check if current price is within proximity_pct of nearest resistance (0.5% default)."""
+    if not price_levels or not price_levels.resistance:
+        return False
+    nearest_res = min(price_levels.resistance, key=lambda x: abs(x - current_price))
+    distance_pct = abs(nearest_res - current_price) / max(nearest_res, 1e-10)
+    return distance_pct <= proximity_pct
+
+
+def _is_near_support(current_price: float, price_levels: Optional[PriceLevels], proximity_pct: float = 0.005) -> bool:
+    """Check if current price is within proximity_pct of nearest support (0.5% default)."""
+    if not price_levels or not price_levels.support:
+        return False
+    nearest_sup = min(price_levels.support, key=lambda x: abs(x - current_price))
+    distance_pct = abs(current_price - nearest_sup) / max(nearest_sup, 1e-10)
+    return distance_pct <= proximity_pct
+
+
 @dataclass
 class PatternSignal:
     pattern_type: str
@@ -238,10 +256,11 @@ class TechnicalAnalyst:
     async def analyze(self, symbol: str = "BTCUSDT", timeframe: str = "1h") -> TechnicalAnalystReport:
         try:
             tf_primary, tf_mid, tf_high = _TF_LADDER.get(timeframe, _DEFAULT_LADDER)
-            # Use enough candles for reliable indicators; higher frames need fewer
-            bars_primary = 200
-            bars_mid = 200
-            bars_high = 100
+            # EXPANDED candle counts for robust indicator calculation and multi-timeframe confirmation
+            # Requires: RSI (14), MACD (26), EMA (50), SMA (200) for full reliability
+            bars_primary = 500  # EXPANDED from 200: ~20.8 days on 1h, ~3.5 days on 15m, ~83 days on 4h
+            bars_mid = 300      # EXPANDED from 200: mid-frame trend confirmation
+            bars_high = 150     # EXPANDED from 100: longer-term structural support
 
             klines_primary = await self.phemex.get_klines(symbol, tf_primary, bars_primary)
             klines_mid     = await self.phemex.get_klines(symbol, tf_mid,     bars_mid)
@@ -253,7 +272,8 @@ class TechnicalAnalyst:
 
             if data_primary is None or (isinstance(data_primary, pd.DataFrame) and data_primary.empty) or (not isinstance(data_primary, pd.DataFrame) and not data_primary):
                 return self._empty_report(symbol)
-            if len(data_primary) < 50:
+            # Require 200+ candles for accurate RSI, MACD, and trend analysis
+            if len(data_primary) < 200:
                 return self._empty_report(symbol)
 
             current_price = data_primary['close'].iloc[-1]
@@ -409,89 +429,105 @@ class TechnicalAnalyst:
         _levels_above: List[float] = price_levels.all_levels_above(current_price) if price_levels else []
         _levels_below: List[float] = price_levels.all_levels_below(current_price) if price_levels else []
 
+        # Configurable entry block distance to opposing structure (support/resistance).
+        _sr_block_pct = 0.005  # fallback: 0.5%
+        try:
+            from app.api.routes.settings import get_trading_gates
+            _sr_block_pct = float(get_trading_gates().sr_proximity_block_pct)
+        except Exception:
+            pass
+
         if rsi < 35 and current_price <= bb_lower:
             # Oversold bounce — bullish
-            # SL: just below nearest support (or BB lower × 0.98 fallback)
-            _sl_candidates = [s for s in _levels_below if s < bb_lower]
-            _sl = _sl_candidates[0] * 0.998 if _sl_candidates else bb_lower * 0.98
-            # TP1: nearest resistance above price (or BB middle fallback)
-            _tp1 = _levels_above[0] * 0.9985 if _levels_above else bb_middle
-            # TP2: second resistance or BB upper
-            _tp2 = _levels_above[1] * 0.9985 if len(_levels_above) > 1 else bb_upper
-            _risk = abs(current_price - _sl)
-            rr = abs(_tp1 - current_price) / _risk if _risk > 0 else 3.0
-            patterns.append(PatternSignal(
-                pattern_type="oversold_bounce",
-                direction="bullish",
-                confidence=0.75,
-                entry_price=current_price,
-                stop_loss=_sl,
-                take_profit_1=_tp1,
-                take_profit_2=_tp2,
-                risk_reward=round(rr, 2),
-                reasoning=f"RSI oversold ({rsi:.1f}) + price at lower BB. TP targets at structural levels."
-            ))
+            # ✓ Block entry if price is too close to resistance (avoid long at top of range)
+            if not _is_near_resistance(current_price, price_levels, proximity_pct=_sr_block_pct):
+                # SL: just below nearest support (or BB lower × 0.98 fallback)
+                _sl_candidates = [s for s in _levels_below if s < bb_lower]
+                _sl = _sl_candidates[0] * 0.998 if _sl_candidates else bb_lower * 0.98
+                # TP1: nearest resistance above price (or BB middle fallback)
+                _tp1 = _levels_above[0] * 0.9985 if _levels_above else bb_middle
+                # TP2: second resistance or BB upper
+                _tp2 = _levels_above[1] * 0.9985 if len(_levels_above) > 1 else bb_upper
+                _risk = abs(current_price - _sl)
+                rr = abs(_tp1 - current_price) / _risk if _risk > 0 else 3.0
+                patterns.append(PatternSignal(
+                    pattern_type="oversold_bounce",
+                    direction="bullish",
+                    confidence=0.75,
+                    entry_price=current_price,
+                    stop_loss=_sl,
+                    take_profit_1=_tp1,
+                    take_profit_2=_tp2,
+                    risk_reward=round(rr, 2),
+                    reasoning=f"RSI oversold ({rsi:.1f}) + price at lower BB. TP targets at structural levels."
+                ))
 
         if rsi > 65 and current_price >= bb_upper:
             # Overbought reversal — bearish
-            # SL: just above nearest resistance (or BB upper × 1.02 fallback)
-            _sl_candidates = [r for r in _levels_above if r > bb_upper]
-            _sl = _sl_candidates[0] * 1.002 if _sl_candidates else bb_upper * 1.02
-            # TP1: nearest support below price (or BB middle fallback)
-            _tp1 = _levels_below[0] * 1.0015 if _levels_below else bb_middle
-            # TP2: second support or BB lower
-            _tp2 = _levels_below[1] * 1.0015 if len(_levels_below) > 1 else bb_lower
-            _risk = abs(_sl - current_price)
-            rr = abs(current_price - _tp1) / _risk if _risk > 0 else 3.0
-            patterns.append(PatternSignal(
-                pattern_type="overbought_reversal",
-                direction="bearish",
-                confidence=0.75,
-                entry_price=current_price,
-                stop_loss=_sl,
-                take_profit_1=_tp1,
-                take_profit_2=_tp2,
-                risk_reward=round(rr, 2),
-                reasoning=f"RSI overbought ({rsi:.1f}) + price at upper BB. TP targets at structural levels."
-            ))
+            # ✓ Block entry if price is too close to support (avoid short at bottom of range)
+            if not _is_near_support(current_price, price_levels, proximity_pct=_sr_block_pct):
+                # SL: just above nearest resistance (or BB upper × 1.02 fallback)
+                _sl_candidates = [r for r in _levels_above if r > bb_upper]
+                _sl = _sl_candidates[0] * 1.002 if _sl_candidates else bb_upper * 1.02
+                # TP1: nearest support below price (or BB middle fallback)
+                _tp1 = _levels_below[0] * 1.0015 if _levels_below else bb_middle
+                # TP2: second support or BB lower
+                _tp2 = _levels_below[1] * 1.0015 if len(_levels_below) > 1 else bb_lower
+                _risk = abs(_sl - current_price)
+                rr = abs(current_price - _tp1) / _risk if _risk > 0 else 3.0
+                patterns.append(PatternSignal(
+                    pattern_type="overbought_reversal",
+                    direction="bearish",
+                    confidence=0.75,
+                    entry_price=current_price,
+                    stop_loss=_sl,
+                    take_profit_1=_tp1,
+                    take_profit_2=_tp2,
+                    risk_reward=round(rr, 2),
+                    reasoning=f"RSI overbought ({rsi:.1f}) + price at upper BB. TP targets at structural levels."
+                ))
 
         if macd > macd_signal and macd > 0:
             # MACD bullish — use nearest resistance for TP, nearest support for SL
-            _sl = _levels_below[0] * 0.998 if _levels_below else current_price * 0.97
-            _tp1 = _levels_above[0] * 0.9985 if _levels_above else current_price * 1.05
-            _tp2 = _levels_above[1] * 0.9985 if len(_levels_above) > 1 else current_price * 1.08
-            _risk = abs(current_price - _sl)
-            rr = abs(_tp1 - current_price) / _risk if _risk > 0 else 2.0
-            patterns.append(PatternSignal(
-                pattern_type="macd_bullish_cross",
-                direction="bullish",
-                confidence=0.6,
-                entry_price=current_price,
-                stop_loss=_sl,
-                take_profit_1=_tp1,
-                take_profit_2=_tp2,
-                risk_reward=round(rr, 2),
-                reasoning="MACD bullish crossover above zero line. Targets at structural levels."
-            ))
+            # ✓ Block entry if price is too close to resistance (avoid long at top of range)
+            if not _is_near_resistance(current_price, price_levels, proximity_pct=_sr_block_pct):
+                _sl = _levels_below[0] * 0.998 if _levels_below else current_price * 0.97
+                _tp1 = _levels_above[0] * 0.9985 if _levels_above else current_price * 1.05
+                _tp2 = _levels_above[1] * 0.9985 if len(_levels_above) > 1 else current_price * 1.08
+                _risk = abs(current_price - _sl)
+                rr = abs(_tp1 - current_price) / _risk if _risk > 0 else 2.0
+                patterns.append(PatternSignal(
+                    pattern_type="macd_bullish_cross",
+                    direction="bullish",
+                    confidence=0.6,
+                    entry_price=current_price,
+                    stop_loss=_sl,
+                    take_profit_1=_tp1,
+                    take_profit_2=_tp2,
+                    risk_reward=round(rr, 2),
+                    reasoning="MACD bullish crossover above zero line. Targets at structural levels."
+                ))
 
         if macd < macd_signal and macd < 0:
             # MACD bearish — use nearest support for TP, nearest resistance for SL
-            _sl = _levels_above[0] * 1.002 if _levels_above else current_price * 1.03
-            _tp1 = _levels_below[0] * 1.0015 if _levels_below else current_price * 0.95
-            _tp2 = _levels_below[1] * 1.0015 if len(_levels_below) > 1 else current_price * 0.92
-            _risk = abs(_sl - current_price)
-            rr = abs(current_price - _tp1) / _risk if _risk > 0 else 2.0
-            patterns.append(PatternSignal(
-                pattern_type="macd_bearish_cross",
-                direction="bearish",
-                confidence=0.6,
-                entry_price=current_price,
-                stop_loss=_sl,
-                take_profit_1=_tp1,
-                take_profit_2=_tp2,
-                risk_reward=round(rr, 2),
-                reasoning="MACD bearish crossover below zero line. Targets at structural levels."
-            ))
+            # ✓ Block entry if price is too close to support (avoid short at bottom of range)
+            if not _is_near_support(current_price, price_levels, proximity_pct=_sr_block_pct):
+                _sl = _levels_above[0] * 1.002 if _levels_above else current_price * 1.03
+                _tp1 = _levels_below[0] * 1.0015 if _levels_below else current_price * 0.95
+                _tp2 = _levels_below[1] * 1.0015 if len(_levels_below) > 1 else current_price * 0.92
+                _risk = abs(_sl - current_price)
+                rr = abs(current_price - _tp1) / _risk if _risk > 0 else 2.0
+                patterns.append(PatternSignal(
+                    pattern_type="macd_bearish_cross",
+                    direction="bearish",
+                    confidence=0.6,
+                    entry_price=current_price,
+                    stop_loss=_sl,
+                    take_profit_1=_tp1,
+                    take_profit_2=_tp2,
+                    risk_reward=round(rr, 2),
+                    reasoning="MACD bearish crossover below zero line. Targets at structural levels."
+                ))
 
         return patterns
 

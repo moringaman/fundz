@@ -53,8 +53,10 @@ class BacktestConfig:
     # Trailing stop
     use_trailing_stop: bool = False
     trailing_stop_pct: float = 0.03  # 3% trailing stop
-    # Data window — 1000 candles: ~42 days on 1h, ~10 days on 15m, ~167 days on 4h
-    candle_limit: int = 2000      # configurable; fetched in paginated 1000-candle batches
+    # Data window — EXPANDED for better signal quality
+    # 5000 candles: ~208 days on 1h, ~35 days on 15m, ~833 days on 4h, ~13.7 years on 1d
+    # Minimum 500 candles for robust indicator calculation
+    candle_limit: int = 5000      # EXPANDED from 2000; fetched in paginated 1000-candle batches
 
 
 class BacktestEngine:
@@ -69,8 +71,9 @@ class BacktestEngine:
     async def run_backtest(self, config: BacktestConfig) -> BacktestResult:
         klines = await self._fetch_historical_data(config)
 
-        if len(klines) < 100:
-            raise ValueError(f"Not enough data. Need at least 100 candles, got {len(klines)}")
+        # Require minimum 500 candles for robust indicator calculation (RSI, MACD, Bollinger Bands need warmup)
+        if len(klines) < 500:
+            raise ValueError(f"Not enough data. Need at least 500 candles for quality indicators, got {len(klines)}")
 
         df = pd.DataFrame(klines)
         df = df.sort_values('time').reset_index(drop=True)
@@ -93,7 +96,8 @@ class BacktestEngine:
         # [(pct_of_tp_range, close_pct), ...]
         _SCALE_LEVELS = [(0.33, 0.25), (0.60, 0.35)]
 
-        for i in range(50, len(df)):
+        # Start at candle 150 to allow full warmup for long-period indicators (200-candle SMA, etc.)
+        for i in range(150, len(df)):
             current_time = df.iloc[i]['time']
             current_price = float(df.iloc[i]['close'])
 

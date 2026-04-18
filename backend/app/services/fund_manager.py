@@ -492,12 +492,13 @@ ALLOCATION RULES:
 2. A trader with 2× the win rate of another should receive roughly 2× the capital
 3. Minimum allocation: 10% per enabled trader (floor so all traders can operate)
 4. Maximum allocation: 60% to any single trader (diversification cap)
-5. New traders with zero trades receive equal share until they have ≥5 completed trades
+5. New traders with zero trades and zero P&L may receive equal share, but if P&L already differs significantly between traders, reflect that in allocations even with few trades
 6. In high-volatility markets, shift weight toward traders with highest win rates over P&L
 7. In trending markets, shift weight toward traders with the highest P&L growth
 8. Underperforming traders (win rate < 40% AND negative P&L) should be at the floor (10%)
 9. Allocations must sum to exactly 100%
 10. Do NOT equalise allocations — performance differences MUST result in allocation differences
+11. If one trader has significantly more P&L than others, they MUST receive more capital — even a ${100:,.0f} advantage warrants a 5%+ reallocation
 
 Return JSON only:
 {{
@@ -523,19 +524,84 @@ Return JSON only:
 
                 reasoning = data.get("reasoning", "LLM trader allocation")
                 logger.info(f"PM trader allocation: {reasoning[:120]}")
+
+                # Sanity-check: if LLM returned near-equal allocation despite meaningful
+                # performance differences, override with deterministic scoring.
+                alloc_values = list(alloc_pct.values())
+                allocation_spread = max(alloc_values) - min(alloc_values)
+                max_pnl_diff = max(
+                    abs(a.get("total_pnl", 0) - b.get("total_pnl", 0))
+                    for a in trader_performance
+                    for b in trader_performance
+                ) if len(trader_performance) > 1 else 0
+                min_trades = min(
+                    (p.get("total_trades", 0) for p in trader_performance), default=0
+                )
+                if allocation_spread < 5.0 and max_pnl_diff > 150 and min_trades >= 3:
+                    logger.warning(
+                        f"LLM returned near-equal allocation (spread {allocation_spread:.1f}%) "
+                        f"despite P&L diff of ${max_pnl_diff:.0f} — using deterministic scoring"
+                    )
+                    return self._deterministic_trader_allocation(traders, trader_performance)
+
                 return alloc_pct
 
             except (json.JSONDecodeError, ValueError):
-                logger.warning("PM trader allocation parse failed — using equal split")
-                equal = 100.0 / len(trader_ids) if trader_ids else 33.3
-                return {tid: equal for tid in trader_ids}
+                logger.warning("PM trader allocation parse failed — using deterministic scoring")
+                return self._deterministic_trader_allocation(traders, trader_performance)
 
         except Exception as e:
             logger.error(f"PM trader allocation failed: {e}")
-            # Equal split fallback
-            enabled = [t["id"] for t in traders if t.get("is_enabled", True)]
-            equal = 100.0 / len(enabled) if enabled else 33.3
-            return {tid: equal for tid in enabled}
+            return self._deterministic_trader_allocation(traders, trader_performance)
+
+    @staticmethod
+    def _deterministic_trader_allocation(
+        traders: List[Dict],
+        trader_performance: List[Dict],
+    ) -> Dict[str, float]:
+        """
+        Performance-weighted allocation that always differentiates based on P&L and win rate.
+        Used as the authoritative fallback when LLM allocation fails or returns unusable output.
+
+        Scoring (per trader):
+          base   = win_rate × 0.50
+                 + pnl_score × 0.40   (pnl_score = clamp(pnl/500 + 0.5, 0→1))
+                 + trade_bonus × 0.10  (trade_bonus = min(total_trades/50, 1))
+        Bounds: 10% floor, 60% ceiling, normalised to 100%.
+        """
+        MIN_PCT = 10.0
+        MAX_PCT = 60.0
+
+        perf_map = {p.get("trader_id"): p for p in trader_performance}
+        enabled = [t for t in traders if t.get("is_enabled", True)]
+        if not enabled:
+            return {}
+        if len(enabled) == 1:
+            return {enabled[0]["id"]: 100.0}
+
+        scores: Dict[str, float] = {}
+        for t in enabled:
+            tid = t["id"]
+            p = perf_map.get(tid, {})
+            wr          = float(p.get("win_rate", 0.5) or 0.5)
+            pnl         = float(p.get("total_pnl", 0) or 0)
+            n_trades    = int(p.get("total_trades", 0) or 0)
+            pnl_score   = min(max(pnl / 500 + 0.5, 0.0), 1.0)
+            trade_bonus = min(n_trades / 50, 1.0)
+            scores[tid] = max(wr * 0.50 + pnl_score * 0.40 + trade_bonus * 0.10, 0.05)
+
+        total = sum(scores.values())
+        raw   = {tid: (s / total) * 100 for tid, s in scores.items()}
+
+        clamped = {tid: max(MIN_PCT, min(MAX_PCT, pct)) for tid, pct in raw.items()}
+        total_c = sum(clamped.values())
+        result  = {tid: pct / total_c * 100 for tid, pct in clamped.items()}
+
+        parts = [f"{perf_map.get(tid,{}).get('trader_name', tid)}: "
+                 f"P&L=${perf_map.get(tid,{}).get('total_pnl',0):+.0f} → {result[tid]:.1f}%"
+                 for tid in result]
+        logger.info("Deterministic trader allocation: " + ", ".join(parts))
+        return result
 
 
     async def recommend_rebalancing(

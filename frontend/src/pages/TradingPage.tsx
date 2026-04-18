@@ -1,11 +1,15 @@
 import { useState } from 'react';
-import { ArrowUpRight, ArrowDownRight, Minus } from 'lucide-react';
-import { useAppSelector } from '../store/hooks';
+import { ArrowUpRight, ArrowDownRight, Minus, ChevronDown } from 'lucide-react';
+import { useAppSelector, useAppDispatch } from '../store/hooks';
+import { setSelectedSymbol } from '../store/slices/marketSlice';
 import { Chart } from '../components/Chart';
 import { WsIndicator } from '../components/common/WsIndicator';
+import { useTradingPairs } from '../hooks/useQueries';
 
 export function TradingPage({ timeframe, onTimeframeChange }: { timeframe: string; onTimeframeChange: (tf: string) => void }) {
   const selectedSymbol = useAppSelector((s) => s.market.selectedSymbol);
+  const dispatch = useAppDispatch();
+  const { data: tradingPairs = [] } = useTradingPairs();
   const ticker = useAppSelector((s) => s.market.ticker);
   const klines = useAppSelector((s) => s.market.klines);
   const indicators = useAppSelector((s) => s.market.indicators);
@@ -13,6 +17,7 @@ export function TradingPage({ timeframe, onTimeframeChange }: { timeframe: strin
 
   const [orderSide, setOrderSide] = useState<'buy' | 'sell'>('buy');
   const [quantity, setQuantity] = useState('');
+  const [showPairSelector, setShowPairSelector] = useState(false);
 
   const sigAction = signal?.action ?? 'hold';
   const sigConf   = signal?.confidence ?? 0;
@@ -32,6 +37,91 @@ export function TradingPage({ timeframe, onTimeframeChange }: { timeframe: strin
 
       {/* Header row */}
       <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap', flexShrink: 0 }}>
+        {/* Pair Selector Dropdown */}
+        <div style={{ position: 'relative' }}>
+          <button
+            type="button"
+            onClick={() => setShowPairSelector(!showPairSelector)}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '.4rem',
+              padding: '.5rem .75rem',
+              borderRadius: '6px',
+              border: '1px solid var(--border)',
+              background: 'var(--bg-secondary)',
+              color: 'var(--text-primary)',
+              cursor: 'pointer',
+              fontSize: '.85rem',
+              fontFamily: 'var(--mono)',
+              fontWeight: 600,
+              transition: 'all .2s',
+            }}
+          >
+            <span style={{ minWidth: '70px', textAlign: 'left' }}>{selectedSymbol}</span>
+            <ChevronDown size={14} style={{ opacity: 0.6 }} />
+          </button>
+          {showPairSelector && (
+            <div
+              style={{
+                position: 'absolute',
+                top: '100%',
+                left: 0,
+                marginTop: '.4rem',
+                background: 'var(--bg-secondary)',
+                border: '1px solid var(--border)',
+                borderRadius: '6px',
+                minWidth: '160px',
+                maxHeight: '320px',
+                overflowY: 'auto',
+                zIndex: 1000,
+                boxShadow: '0 8px 24px rgba(0,0,0,0.15)',
+              }}
+            >
+              {tradingPairs.map((pair) => (
+                <button
+                  key={pair}
+                  type="button"
+                  onClick={() => {
+                    dispatch(setSelectedSymbol(pair));
+                    setShowPairSelector(false);
+                  }}
+                  style={{
+                    display: 'block',
+                    width: '100%',
+                    padding: '.5rem .75rem',
+                    border: 'none',
+                    background: selectedSymbol === pair ? 'var(--accent-dim)' : 'transparent',
+                    color: selectedSymbol === pair ? 'var(--accent)' : 'var(--text-secondary)',
+                    cursor: 'pointer',
+                    fontSize: '.8rem',
+                    fontFamily: 'var(--mono)',
+                    textAlign: 'left',
+                    transition: 'all .15s',
+                    borderLeft: selectedSymbol === pair ? '2px solid var(--accent)' : 'none',
+                    paddingLeft: selectedSymbol === pair ? '0.65rem' : '.75rem',
+                  }}
+                  onMouseEnter={(e) => {
+                    if (selectedSymbol !== pair) {
+                      e.currentTarget.style.background = 'var(--bg-hover)';
+                    }
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.background = selectedSymbol === pair ? 'var(--accent-dim)' : 'transparent';
+                  }}
+                >
+                  {pair}
+                </button>
+              ))}
+              {tradingPairs.length === 0 && (
+                <div style={{ padding: '.5rem .75rem', fontSize: '.72rem', color: 'var(--text-dim)', textAlign: 'center' }}>
+                  No pairs configured
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
         <div style={{ display: 'flex', alignItems: 'baseline', gap: '.75rem' }}>
           <span style={{ fontFamily: 'var(--mono)', fontSize: '1rem', color: 'var(--accent)', letterSpacing: '.06em' }}>{selectedSymbol}</span>
           <span style={{ fontFamily: 'var(--mono)', fontSize: '1.4rem', color: 'var(--text-primary)' }}>

@@ -970,6 +970,23 @@ async def get_trader_leaderboard():
             total_trades = perf.total_trades
 
         alloc_pct = allocations.get(t["id"], t.get("allocation_pct", 33.3))
+
+        # Phase 9.1 — attach live consistency & Sharpe data
+        consistency_flag = agent_scheduler._consistency_flags.get(t["id"], "INSUFFICIENT_DATA")
+        from app.services.consistency_scorer import compute_consistency
+        agent_ids = [a["id"] for a in t_agents]
+        is_paper = not bool(t.get("live_mode"))
+        try:
+            cr = await compute_consistency(t["id"], agent_ids, is_paper=is_paper)
+            consistency_flag = cr.consistency_flag
+            consistency_score = cr.consistency_score
+            sharpe = cr.sharpe
+            sharpe_tier = cr.sharpe_tier
+        except Exception:
+            consistency_score = 0.5
+            sharpe = 0.0
+            sharpe_tier = "medium"
+
         leaderboard.append({
             "id": t["id"],
             "name": t["name"],
@@ -983,6 +1000,14 @@ async def get_trader_leaderboard():
             "win_rate": win_rate,
             "total_trades": total_trades,
             "agent_count": len(t_agents),
+            "consistency_flag": consistency_flag,
+            "consistency_score": consistency_score,
+            "sharpe": sharpe,
+            "sharpe_tier": sharpe_tier,
+            # Phase 9.2 — drawdown fields
+            "drawdown_warning_level": t.get("drawdown_warning_level"),
+            "lifetime_drawdown_pct": t.get("lifetime_drawdown_pct"),
+            "successor_of": t.get("successor_of"),
         })
 
     leaderboard.sort(key=lambda x: x["total_pnl"], reverse=True)

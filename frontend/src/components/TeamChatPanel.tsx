@@ -1,15 +1,27 @@
-import { useRef } from 'react';
+import { useEffect, useRef } from 'react';
 import { MessageCircle } from 'lucide-react';
 import { useFundConversations } from '../hooks/useQueries';
+
+type ConversationMessage = {
+  id: string;
+  agent_name: string;
+  avatar: string;
+  message_type: string;
+  timestamp: string;
+  content: string;
+  mentions?: string[];
+};
 
 export function TeamChatPanel() {
   const { data: conversations = [], isLoading } = useFundConversations(100);
   const chatEndRef = useRef<HTMLDivElement>(null);
-  const msgs: any[] = Array.isArray(conversations) ? conversations : [];
+  const msgs: ConversationMessage[] = Array.isArray(conversations)
+    ? (conversations as ConversationMessage[])
+    : [];
 
-  // useEffect(() => {
-  //   chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  // }, [msgs.length]);
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [msgs.length]);
 
   const typeColors: Record<string, string> = {
     warning: 'var(--red)',
@@ -50,7 +62,11 @@ export function TeamChatPanel() {
   const formatTime = (iso: string) => {
     try {
       const d = new Date(iso);
-      return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      return d.toLocaleTimeString([], {
+        hour: '2-digit',
+        minute: '2-digit',
+        timeZoneName: 'short',
+      });
     } catch { return ''; }
   };
 
@@ -73,7 +89,7 @@ export function TeamChatPanel() {
             No conversations yet. Team discussions appear when the scheduler runs.
           </div>
         )}
-        {msgs.map((msg: any) => (
+        {msgs.map((msg) => (
           <div key={msg.id} className="team-chat-msg">
             <div className="team-chat-msg-avatar">{msg.avatar}</div>
             <div className="team-chat-msg-body">

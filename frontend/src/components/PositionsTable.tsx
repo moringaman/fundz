@@ -9,6 +9,9 @@ interface Position {
   entry_price: number;
   current_price: number;
   unrealized_pnl: number;
+  leverage?: number;
+  margin_used?: number;
+  liquidation_price?: number;
   is_paper?: boolean;
 }
 
@@ -85,6 +88,25 @@ const PnlCell = styled.td<{ profit: number }>`
     : 'var(--red, #ff5370) !important'};
 `;
 
+const LeverageBadge = styled.span<{ lev: number }>`
+  display: inline-block;
+  padding: 0.15rem 0.45rem;
+  border-radius: 4px;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  background: ${({ lev }) => lev >= 4
+    ? 'rgba(255,83,112,.18)'
+    : lev >= 2
+      ? 'rgba(255,180,0,.15)'
+      : 'rgba(100,180,255,.10)'};
+  color: ${({ lev }) => lev >= 4
+    ? 'var(--red, #ff5370)'
+    : lev >= 2
+      ? '#ffb400'
+      : 'var(--text-secondary, #8ba3c7)'};
+`;
+
 const StateMessage = styled.div`
   font-size: 0.82rem;
   color: var(--text-secondary, #8ba3c7);
@@ -151,32 +173,65 @@ export const PositionsTableComponent: React.FC = () => {
               <th>Symbol</th>
               <th>Side</th>
               <th>Mode</th>
-              <th>Quantity</th>
-              <th>Entry Price</th>
-              <th>Current Price</th>
+              <th>Qty</th>
+              <th>Entry</th>
+              <th>Current</th>
+              <th>Leverage</th>
+              <th>Margin Used</th>
+              <th>Liq. Price</th>
               <th>Unrealised P&amp;L</th>
             </tr>
           </thead>
           <tbody>
-            {positions.map((position) => (
-              <tr key={`${position.symbol}-${position.side}-${position.is_paper}`}>
-                <td>{position.symbol}</td>
-                <td><SideBadge side={position.side}>{position.side}</SideBadge></td>
-                <td>
-                  {position.is_paper === false ? (
-                    <span style={{ fontSize: '0.68rem', fontWeight: 700, color: '#ff4444', letterSpacing: '0.08em' }}>LIVE</span>
-                  ) : (
-                    <span style={{ fontSize: '0.68rem', color: '#888', letterSpacing: '0.05em' }}>PAPER</span>
-                  )}
-                </td>
-                <td>{position.quantity.toFixed(4)}</td>
-                <td>${position.entry_price.toFixed(2)}</td>
-                <td>${position.current_price.toFixed(2)}</td>
-                <PnlCell profit={position.unrealized_pnl}>
-                  {position.unrealized_pnl >= 0 ? '+' : ''}${position.unrealized_pnl.toFixed(2)}
-                </PnlCell>
-              </tr>
-            ))}
+            {positions.map((position) => {
+              const lev = position.leverage ?? 1;
+              const isLeveraged = lev > 1;
+              return (
+                <tr key={`${position.symbol}-${position.side}-${position.is_paper}`}>
+                  <td>{position.symbol}</td>
+                  <td><SideBadge side={position.side}>{position.side}</SideBadge></td>
+                  <td>
+                    {position.is_paper === false ? (
+                      <span style={{ fontSize: '0.68rem', fontWeight: 700, color: '#ff4444', letterSpacing: '0.08em' }}>LIVE</span>
+                    ) : (
+                      <span style={{ fontSize: '0.68rem', color: '#888', letterSpacing: '0.05em' }}>PAPER</span>
+                    )}
+                  </td>
+                  <td>{position.quantity.toFixed(4)}</td>
+                  <td>${position.entry_price.toFixed(2)}</td>
+                  <td>${position.current_price.toFixed(2)}</td>
+                  <td>
+                    {isLeveraged ? (
+                      <LeverageBadge lev={lev}>{lev.toFixed(1)}x</LeverageBadge>
+                    ) : (
+                      <span style={{ fontSize: '0.72rem', color: 'var(--text-secondary, #8ba3c7)' }}>1x</span>
+                    )}
+                  </td>
+                  <td>
+                    {position.margin_used != null
+                      ? <span style={{ color: 'var(--text-secondary, #8ba3c7)' }}>${position.margin_used.toFixed(2)}</span>
+                      : <span style={{ color: 'var(--border-mid, #243650)' }}>—</span>}
+                  </td>
+                  <td>
+                    {position.liquidation_price != null ? (
+                      <span style={{
+                        color: Math.abs(position.current_price - position.liquidation_price) / position.current_price < 0.12
+                          ? 'var(--red, #ff5370)'
+                          : 'var(--text-secondary, #8ba3c7)',
+                        fontWeight: Math.abs(position.current_price - position.liquidation_price) / position.current_price < 0.12 ? 700 : 400,
+                      }}>
+                        ${position.liquidation_price.toFixed(2)}
+                      </span>
+                    ) : (
+                      <span style={{ color: 'var(--border-mid, #243650)' }}>—</span>
+                    )}
+                  </td>
+                  <PnlCell profit={position.unrealized_pnl}>
+                    {position.unrealized_pnl >= 0 ? '+' : ''}${position.unrealized_pnl.toFixed(2)}
+                  </PnlCell>
+                </tr>
+              );
+            })}
           </tbody>
         </StyledTable>
       )}

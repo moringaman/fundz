@@ -21,9 +21,9 @@ async def create_default_agents():
             # Create default agents
             agents_config = [
                 {
-                    "name": "Momentum BTC Strategy",
+                    "name": "Momentum Strategy",
                     "strategy_type": "momentum",
-                    "trading_pairs": ["BTCUSDT"],
+                    "trading_pairs": [],
                     "allocation_percentage": 10,
                     "max_position_size": 0.1,
                     "run_interval_seconds": 3600,  # 1 hour
@@ -32,9 +32,9 @@ async def create_default_agents():
                     "is_enabled": True
                 },
                 {
-                    "name": "Mean Reversion ETH Strategy",
+                    "name": "Mean Reversion Strategy",
                     "strategy_type": "mean_reversion",
-                    "trading_pairs": ["ETHUSDT"],
+                    "trading_pairs": [],
                     "allocation_percentage": 5,
                     "max_position_size": 0.05,
                     "run_interval_seconds": 1800,  # 30 minutes
@@ -43,9 +43,9 @@ async def create_default_agents():
                     "is_enabled": True
                 },
                 {
-                    "name": "AI-Powered Trading Agent",
+                    "name": "AI Strategy Agent",
                     "strategy_type": "ai",
-                    "trading_pairs": ["BTCUSDT", "ETHUSDT"],
+                    "trading_pairs": [],
                     "allocation_percentage": 15,
                     "max_position_size": 0.2,
                     "run_interval_seconds": 7200,  # 2 hours

@@ -423,6 +423,23 @@ export function useSetTradingMode() {
   });
 }
 
+// ─── Gate Autopilot ──────────────────────────────────────────────────────────
+export function useGateAutopilot() {
+  return useQuery({
+    queryKey: ['gateAutopilot'],
+    queryFn: () => settingsApi.getGateAutopilot() as Promise<{
+      enabled: boolean;
+      regime: string;
+      reason: string;
+      last_run: string | null;
+      changes: Record<string, { from: number; to: number }>;
+      color: string;
+    }>,
+    staleTime: 60_000,
+    refetchInterval: 120_000,
+  });
+}
+
 export function useTradingPairs() {
   return useQuery({
     queryKey: ['tradingPairs'],
@@ -437,7 +454,7 @@ export function useFundConversations(limit = 50) {
     queryKey: ['fundConversations', limit],
     queryFn: () => fundApi.getConversations(limit).then((r) => r.data),
     staleTime: 30_000,
-    refetchInterval: 60_000,
+    refetchInterval: 15_000,
   });
 }
 

@@ -390,6 +390,7 @@ async def lifespan(app: FastAPI):
     from app.database import engine, Base
     from app.models import AgentRunRecord, AgentMetricRecord, TeamChatMessageRecord, DailyReport, Trader  # noqa: F401
     from app.models import GridState, GridLevel  # noqa: F401 — ensure grid tables are created
+    from app.models import TraderLegacy  # noqa: F401 — Phase 9.2
 
     # ── Step 1: create all tables ────────────────────────────────────────────
     async with engine.begin() as conn:
@@ -403,9 +404,14 @@ async def lifespan(app: FastAPI):
         ("positions", "take_profit_price", "ALTER TABLE positions ADD COLUMN take_profit_price FLOAT"),
         ("positions", "highest_price",     "ALTER TABLE positions ADD COLUMN highest_price FLOAT"),
         ("positions", "trailing_stop_pct", "ALTER TABLE positions ADD COLUMN trailing_stop_pct FLOAT"),
+        ("positions", "leverage",          "ALTER TABLE positions ADD COLUMN leverage FLOAT DEFAULT 1.0"),
+        ("positions", "margin_used",       "ALTER TABLE positions ADD COLUMN margin_used FLOAT DEFAULT 0.0"),
+        ("positions", "liquidation_price", "ALTER TABLE positions ADD COLUMN liquidation_price FLOAT"),
         ("positions", "is_paper",          "ALTER TABLE positions ADD COLUMN is_paper BOOLEAN DEFAULT TRUE"),
         ("positions", "scale_out_levels",  "ALTER TABLE positions ADD COLUMN scale_out_levels TEXT"),
         ("trades",    "is_paper",          "ALTER TABLE trades ADD COLUMN is_paper BOOLEAN DEFAULT TRUE"),
+        ("trades",    "leverage",          "ALTER TABLE trades ADD COLUMN leverage FLOAT DEFAULT 1.0"),
+        ("trades",    "margin_used",       "ALTER TABLE trades ADD COLUMN margin_used FLOAT DEFAULT 0.0"),
         ("agents",    "trader_id",         "ALTER TABLE agents ADD COLUMN trader_id VARCHAR(36)"),
         ("trades",    "trader_id",         "ALTER TABLE trades ADD COLUMN trader_id VARCHAR(36)"),
         ("agent_metric_records", "actual_trades",  "ALTER TABLE agent_metric_records ADD COLUMN actual_trades INTEGER DEFAULT 0"),
@@ -414,6 +420,13 @@ async def lifespan(app: FastAPI):
         ("positions", "grid_level_id", "ALTER TABLE positions ADD COLUMN grid_level_id VARCHAR(36)"),
         ("positions", "phemex_order_id", "ALTER TABLE positions ADD COLUMN phemex_order_id VARCHAR(100)"),
         ("agent_metric_records", "is_paper", "ALTER TABLE agent_metric_records ADD COLUMN is_paper BOOLEAN DEFAULT TRUE"),
+        # Phase 9.2 — Drawdown tracking
+        ("traders", "lifetime_peak_balance",  "ALTER TABLE traders ADD COLUMN lifetime_peak_balance FLOAT"),
+        ("traders", "lifetime_drawdown_pct",  "ALTER TABLE traders ADD COLUMN lifetime_drawdown_pct FLOAT"),
+        ("traders", "drawdown_warning_level", "ALTER TABLE traders ADD COLUMN drawdown_warning_level VARCHAR(20)"),
+        ("traders", "successor_of",           "ALTER TABLE traders ADD COLUMN successor_of VARCHAR(36)"),
+        # Grid engine — capital tracking
+        ("grid_states", "initial_capital",    "ALTER TABLE grid_states ADD COLUMN initial_capital FLOAT"),
     ]
     for table, column, ddl in _migrations:
         try:
@@ -447,6 +460,25 @@ async def lifespan(app: FastAPI):
             ))
     except Exception:
         pass  # already exists
+
+    # ── Step 3b: deduplicate balances and add unique constraint on (user_id, asset) ─
+    try:
+        async with engine.begin() as conn:
+            # Remove duplicate balance rows, keeping the one with the highest available value
+            await conn.execute(text("""
+                DELETE FROM balances
+                WHERE id NOT IN (
+                    SELECT DISTINCT ON (user_id, asset) id
+                    FROM balances
+                    ORDER BY user_id, asset, available DESC
+                )
+            """))
+            await conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_balance_user_asset "
+                "ON balances (user_id, asset)"
+            ))
+    except Exception as e:
+        logger.warning(f"Balance dedup/unique index failed (non-fatal): {e}")
 
     # ── Step 4: seed strategy_overrides with enabled=True for all known types ─
     try:
@@ -496,6 +528,10 @@ async def lifespan(app: FastAPI):
 
     broadcast_task = asyncio.create_task(_market_broadcast_loop())
     whale_task = asyncio.create_task(_whale_broadcast_loop())
+
+    # Gate autopilot — auto-adjusts TradingGates every 30 min when enabled.
+    from app.services.gate_autopilot import gate_autopilot as _gate_autopilot
+    asyncio.create_task(_gate_autopilot.start_loop())
 
     # Telegram inbound polling — starts only if polling_enabled=True in config.
     # Zero overhead when disabled; a single idle long-poll connection when enabled.

@@ -159,6 +159,45 @@ body {
 }
 .sidebar-select select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(0,194,255,.18); }
 
+.sidebar-market-clocks {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: .45rem;
+  padding: .8rem 1rem .9rem;
+  border-bottom: 1px solid var(--border);
+  background:
+    linear-gradient(180deg, rgba(0, 194, 255, 0.08), rgba(0, 194, 255, 0.02)),
+    var(--bg-panel);
+}
+
+.sidebar-market-clock {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: .75rem;
+  padding: .45rem .6rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.sidebar-market-clock-label {
+  font-family: var(--mono);
+  font-size: .62rem;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.sidebar-market-clock-time {
+  font-family: var(--mono);
+  font-size: .72rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+
 .sidebar-nav {
   padding: .6rem .5rem;
   display: flex;

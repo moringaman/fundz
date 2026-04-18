@@ -5,7 +5,7 @@ import asyncio
 import json
 import logging
 
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, func as sqlfunc
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.clients.phemex import PhemexClient
@@ -16,8 +16,8 @@ from app.services.paper_trading import paper_trading
 from app.services.trading_service import trading_service, _is_paper_mode
 from app.services.position_sync import position_sync_service
 from app.services.backtest import BacktestEngine
-from app.services.risk_manager import risk_manager, RiskConfig
-from app.models import OrderSide, OrderStatus
+from app.services.risk_manager import risk_manager, RiskCheckResult, RiskConfig
+from app.models import OrderSide, OrderStatus, Trade
 from app.services.research_analyst import research_analyst
 from app.services.fund_manager import fund_manager
 from app.services.cio_agent import cio_agent
@@ -39,6 +39,15 @@ async def _send_telegram(coro) -> None:
         await coro
     except Exception as e:
         logger.warning(f"Telegram alert failed: {e}")
+
+
+async def _run_drawdown_check(trader_id: str, agent_ids: list, is_paper: bool) -> None:
+    """Phase 9.2: fire-and-forget drawdown check after a position closes."""
+    try:
+        from app.services.drawdown_monitor import update_trader_drawdown
+        await update_trader_drawdown(trader_id, agent_ids, is_paper)
+    except Exception as e:
+        logger.warning(f"Drawdown check failed for trader {trader_id}: {e}")
 
 
 
@@ -128,6 +137,22 @@ class AgentScheduler:
         # US Open session management
         self._us_open_sweep_date: Optional[str] = None      # ISO date of last pre-open sweep
         self._us_open_blackout_notified: bool = False        # team chat posted for current blackout window
+        self._dead_zone_noop_notified: bool = False          # team chat posted for overnight no-op window
+        self._last_trader_checkin: Optional[datetime] = None
+
+        # Phase 9.1 — Consistency gating
+        self._consistency_flags: Dict[str, str] = {}  # {trader_id: last_known_flag}
+
+        # ── Setup Maturing Watchlist ───────────────────────────────────────
+        # When a scan produces a near-miss signal (confidence 0.55–0.65) the
+        # symbol is added here with its last confidence and timestamp. On the
+        # next cycle the agent checks watchlisted symbols FIRST so a maturing
+        # setup doesn't wait a full interval before being reconsidered.
+        # key = "agent_id:symbol", value = {"confidence": float, "signal": str, "at": datetime}
+        self._setup_watchlist: Dict[str, dict] = {}
+        self._WATCHLIST_CONF_LOW  = 0.55   # enter watchlist above this
+        self._WATCHLIST_CONF_HIGH = 0.65   # remove from watchlist above this (trade or expired)
+        self._WATCHLIST_TTL_SECS  = 3600   # expire after 1 hour
 
     async def _get_total_capital(self, positions_value: float = 0.0) -> float:
         """Return total fund capital.
@@ -425,6 +450,33 @@ class AgentScheduler:
         except Exception:
             pass
 
+        # Phase 9.2 — inject trader drawdown / Pink Slip pressure into per-trade context
+        try:
+            _agent_cfg_tc = self._enabled_agents.get(agent_id, {})
+            _trader_id_tc = _agent_cfg_tc.get("trader_id") or _agent_cfg_tc.get("_trader_id_pre")
+            if _trader_id_tc:
+                _trader_tc = next((t for t in self._traders if t["id"] == _trader_id_tc), None)
+                if _trader_tc:
+                    _dd_level = _trader_tc.get("drawdown_warning_level")
+                    _dd_pct = _trader_tc.get("lifetime_drawdown_pct") or 0.0
+                    if _dd_level:
+                        from app.services.drawdown_monitor import get_pink_slip_text
+                        _dd_note = (
+                            get_pink_slip_text(_dd_pct)
+                            if _dd_level == "warning"
+                            else (
+                                f"⚠️ CAUTION: Your trader is in drawdown ({_dd_pct:.1f}% from peak). "
+                                f"Only enter with conviction ≥ 0.70. Preserve capital."
+                            )
+                        )
+                        ctx["trader_risk_status"] = {
+                            "warning_level": _dd_level,
+                            "drawdown_pct": round(_dd_pct, 2),
+                            "note": _dd_note,
+                        }
+        except Exception:
+            pass
+
         return ctx if ctx else None
 
     _HTF_MAP = {
@@ -605,31 +657,6 @@ class AgentScheduler:
 
             agents = await self._fetch_agents_from_db()
 
-            # Sync all agents' trading_pairs with the globally configured pairs
-            try:
-                from app.api.routes.settings import get_trading_prefs
-                global_pairs = get_trading_prefs().trading_pairs
-                if global_pairs:
-                    from app.models import Agent as DBAgentModel
-                    async with get_async_session() as sync_session:
-                        result = await sync_session.execute(select(DBAgentModel))
-                        all_db_agents = result.scalars().all()
-                        updated = 0
-                        for db_agent in all_db_agents:
-                            cfg = dict(db_agent.config) if isinstance(db_agent.config, dict) else {}
-                            existing_pairs = cfg.get("trading_pairs", [])
-                            if set(existing_pairs) != set(global_pairs):
-                                cfg["trading_pairs"] = global_pairs
-                                db_agent.config = cfg
-                                updated += 1
-                        if updated:
-                            await sync_session.commit()
-                            logger.info(f"Synced trading pairs on {updated} agents → {global_pairs}")
-                    # Refresh agents list after update
-                    agents = await self._fetch_agents_from_db()
-            except Exception as e:
-                logger.warning(f"Could not sync agent trading pairs: {e}")
-
             registered = 0
             for agent in agents:
                 if agent.get("is_enabled"):
@@ -789,6 +816,11 @@ class AgentScheduler:
                 await self._maybe_us_open_preopen_sweep()
                 _us_sess = self._get_market_session_info()
 
+                # Trader heartbeat: emit a concise check-in every 30 minutes so
+                # operators can see that trader processes are active even when
+                # market conditions produce few/no entries.
+                await self._maybe_emit_trader_checkins(_us_sess)
+
                 if _us_sess["in_blackout"]:
                     # Blackout window (default 12:45–13:30 UTC): block all new entries.
                     # Position monitoring (SL/TP exits) continues normally.
@@ -825,6 +857,37 @@ class AgentScheduler:
                         ))
                     self._us_open_blackout_notified = False
 
+                # OVERNIGHT DEAD ZONE NO-OP
+                # Skip team/trader/agent decision loops to conserve LLM/API tokens.
+                # Position monitoring remains active so exits still trigger.
+                if _us_sess.get("in_dead_zone") and _us_sess.get("dead_zone_noop_enabled", True):
+                    if not self._dead_zone_noop_notified:
+                        asyncio.create_task(team_chat.add_message(
+                            agent_role="risk_manager",
+                            content=(
+                                "🌙 **Overnight dead zone no-op active — decision engines paused.** "
+                                "Skipping trader/team/agent analysis to conserve LLM tokens during thin liquidity "
+                                "window. Open positions are still monitored for SL/TP exits."
+                            ),
+                            message_type="alert",
+                        ))
+                        self._dead_zone_noop_notified = True
+
+                    await self._monitor_open_positions()
+                    await asyncio.sleep(60)
+                    continue
+                else:
+                    if self._dead_zone_noop_notified:
+                        asyncio.create_task(team_chat.add_message(
+                            agent_role="risk_manager",
+                            content=(
+                                "🌅 **Overnight dead zone ended — decision engines resumed.** "
+                                "Trader/team/agent cycles are back online for active-session execution."
+                            ),
+                            message_type="alert",
+                        ))
+                    self._dead_zone_noop_notified = False
+
                 # TEAM DECISION TIER (NEW): Run every 5 minutes (300 seconds)
                 if self._last_team_analysis is None or \
                    (datetime.now() - self._last_team_analysis).total_seconds() >= 300:
@@ -849,11 +912,83 @@ class AgentScheduler:
 
             await asyncio.sleep(60)
 
+    async def _maybe_emit_trader_checkins(self, session_info: Optional[dict] = None) -> None:
+        """Post a heartbeat check-in from each enabled trader every 30 minutes."""
+        if not self._traders:
+            return
+
+        now = datetime.now()
+        if self._last_trader_checkin and (now - self._last_trader_checkin).total_seconds() < 1800:
+            return
+
+        _session_label = (session_info or {}).get("session", "unknown").replace("_", " ")
+
+        # Build latest execution lookup once for this heartbeat.
+        latest_exec_by_agent: Dict[str, datetime] = {}
+        for run in reversed(self._agent_runs):
+            if not run.executed:
+                continue
+            if run.agent_id not in latest_exec_by_agent:
+                latest_exec_by_agent[run.agent_id] = run.timestamp
+
+        for trader in [t for t in self._traders if t.get("is_enabled", True)]:
+            try:
+                trader_id = trader.get("id")
+                trader_name = trader.get("name", "Trader")
+                trader_cfg = trader.get("config") or {}
+                trader_avatar = trader_cfg.get("avatar", "🤖") if isinstance(trader_cfg, dict) else "🤖"
+                alloc = float(self._trader_allocations.get(trader_id, trader.get("allocation_pct", 0.0) or 0.0))
+
+                trader_agents = [
+                    a for a in self._enabled_agents.values()
+                    if a.get("trader_id") == trader_id and a.get("is_enabled", True)
+                ]
+                trader_agent_ids = {a.get("id") for a in trader_agents}
+
+                latest_exec = None
+                for aid in trader_agent_ids:
+                    ts = latest_exec_by_agent.get(aid)
+                    if ts and (latest_exec is None or ts > latest_exec):
+                        latest_exec = ts
+
+                if latest_exec is None:
+                    last_exec_text = "No recent executions yet"
+                else:
+                    mins_ago = max(0, int((now - latest_exec).total_seconds() // 60))
+                    if mins_ago < 1:
+                        last_exec_text = "Last execution: just now"
+                    else:
+                        last_exec_text = f"Last execution: {mins_ago}m ago"
+
+                content = (
+                    f"30-minute check-in: actively managing **{len(trader_agents)}** agent(s) "
+                    f"at **{alloc:.1f}%** fund allocation. "
+                    f"Session: **{_session_label}**. {last_exec_text}."
+                )
+
+                await team_chat.add_message(
+                    agent_role=f"trader_{trader_name.lower().replace(' ', '_')}",
+                    content=content,
+                    message_type="analysis",
+                    metadata={
+                        "_override_name": trader_name,
+                        "_override_avatar": trader_avatar,
+                        "trader_checkin": True,
+                        "allocation_pct": alloc,
+                        "active_agents": len(trader_agents),
+                        "session": _session_label,
+                    },
+                )
+            except Exception as e:
+                logger.debug(f"Trader check-in emit failed for {trader.get('name', 'trader')}: {e}")
+
+        self._last_trader_checkin = now
+
     # ------------------------------------------------------------------
     # Circuit Breaker (11.6)
     # ------------------------------------------------------------------
     _DAILY_LOSS_PCT = 5.0          # fallback if trading gates not loaded
-    _DAILY_TRADE_MAX = 30          # fallback if trading gates not loaded
+    _DAILY_TRADE_MAX = 20          # fallback if trading gates not loaded
     _cb_halted: bool = False
     _cb_halt_reason: str = ""
 
@@ -908,6 +1043,204 @@ class AgentScheduler:
             self._cb_halt_reason = ""
         return False
 
+    async def _get_daily_fee_pressure(self) -> dict:
+        """Return UTC-day fee-budget usage so entry quality can tighten immediately."""
+        try:
+            from app.api.routes.settings import get_trading_gates
+
+            gates = get_trading_gates()
+            max_daily_fees_pct = float(getattr(gates, "max_daily_fees_pct", 0.5) or 0.5)
+            fee_coverage_guard_enabled = bool(getattr(gates, "fee_coverage_guard_enabled", True))
+            fee_coverage_min_ratio = float(getattr(gates, "fee_coverage_min_ratio", 2.5) or 2.5)
+            fee_coverage_min_fees_usd = float(getattr(gates, "fee_coverage_min_fees_usd", 25.0) or 25.0)
+            fee_coverage_window_trades = int(getattr(gates, "fee_coverage_window_trades", 60) or 60)
+            fee_coverage_min_closed_trades = int(getattr(gates, "fee_coverage_min_closed_trades", 8) or 8)
+            fee_coverage_include_slippage = bool(getattr(gates, "fee_coverage_include_slippage", True))
+            fee_coverage_slippage_bps = float(getattr(gates, "fee_coverage_slippage_bps", 2.0) or 2.0)
+            fee_coverage_include_funding = bool(getattr(gates, "fee_coverage_include_funding", True))
+        except Exception:
+            max_daily_fees_pct = 0.5
+            fee_coverage_guard_enabled = True
+            fee_coverage_min_ratio = 2.5
+            fee_coverage_min_fees_usd = 25.0
+            fee_coverage_window_trades = 60
+            fee_coverage_min_closed_trades = 8
+            fee_coverage_include_slippage = True
+            fee_coverage_slippage_bps = 2.0
+            fee_coverage_include_funding = True
+
+        metrics = {
+            "daily_fees_paid": 0.0,
+            "daily_fees_pct": 0.0,
+            "max_daily_fees_pct": max_daily_fees_pct,
+            "budget_used_ratio": 0.0,
+            "realized_pnl": 0.0,
+            "total_fees": 0.0,
+            "fee_coverage_ratio": None,
+            "fee_coverage_guard_enabled": fee_coverage_guard_enabled,
+            "fee_coverage_min_ratio": fee_coverage_min_ratio,
+            "fee_coverage_min_fees_usd": fee_coverage_min_fees_usd,
+            "fee_coverage_window_trades": fee_coverage_window_trades,
+            "fee_coverage_min_closed_trades": fee_coverage_min_closed_trades,
+            "fee_coverage_include_slippage": fee_coverage_include_slippage,
+            "fee_coverage_slippage_bps": fee_coverage_slippage_bps,
+            "fee_coverage_include_funding": fee_coverage_include_funding,
+            "closed_trades_count": 0,
+            "gross_realized_pnl": 0.0,
+            "net_realized_edge": 0.0,
+            "slippage_costs": 0.0,
+            "funding_costs": 0.0,
+            "fee_coverage_guard_active": False,
+        }
+
+        try:
+            day_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+            async with get_async_session() as session:
+                result = await session.execute(
+                    select(sqlfunc.coalesce(sqlfunc.sum(Trade.fee), 0.0)).where(
+                        Trade.user_id == "default-user",
+                        Trade.is_paper.is_(_is_paper_mode()),
+                        Trade.status == OrderStatus.FILLED,
+                        Trade.created_at >= day_start,
+                    )
+                )
+                daily_fees_paid = float(result.scalar_one_or_none() or 0.0)
+
+            capital_base = self._total_capital or 50_000.0
+            daily_fees_pct = (daily_fees_paid / capital_base) * 100 if capital_base > 0 else 0.0
+            budget_used_ratio = (daily_fees_pct / max_daily_fees_pct) if max_daily_fees_pct > 0 else 0.0
+
+            metrics.update({
+                "daily_fees_paid": daily_fees_paid,
+                "daily_fees_pct": daily_fees_pct,
+                "budget_used_ratio": budget_used_ratio,
+            })
+
+            # Fee coverage diagnostics (paper mode): compute a rolling net-edge
+            # ratio using recent closed trades. This avoids leverage-based boosts
+            # and evaluates edge quality after real execution costs.
+            if _is_paper_mode():
+                closed_trades = await paper_trading.get_closed_trades(limit=fee_coverage_window_trades)
+                closed_count = len(closed_trades)
+                total_fees = float(sum(float(t.get("fee", 0.0) or 0.0) for t in closed_trades))
+                gross_realized_pnl = float(
+                    sum(
+                        float(t.get("gross_pnl", (float(t.get("net_pnl", 0.0) or 0.0) + float(t.get("fee", 0.0) or 0.0))))
+                        for t in closed_trades
+                    )
+                )
+                realized_pnl = float(sum(float(t.get("net_pnl", 0.0) or 0.0) for t in closed_trades))
+
+                slippage_costs = 0.0
+                if fee_coverage_include_slippage and fee_coverage_slippage_bps > 0:
+                    slippage_rate = fee_coverage_slippage_bps / 10_000.0
+                    for t in closed_trades:
+                        qty = abs(float(t.get("quantity", 0.0) or 0.0))
+                        entry = abs(float(t.get("entry_price", 0.0) or 0.0))
+                        exit_ = abs(float(t.get("exit_price", 0.0) or 0.0))
+                        # Two-leg slippage estimate for round-trip fills.
+                        slippage_costs += ((qty * entry) + (qty * exit_)) * slippage_rate
+
+                # Funding is included as an explicit placeholder so the metric
+                # contract remains stable while exchange funding data is wired in.
+                funding_costs = 0.0
+                if fee_coverage_include_funding:
+                    funding_costs = 0.0
+
+                net_realized_edge = realized_pnl - slippage_costs - funding_costs
+                fee_coverage_ratio = (net_realized_edge / total_fees) if total_fees > 0 else None
+
+                metrics.update({
+                    "realized_pnl": realized_pnl,
+                    "total_fees": total_fees,
+                    "closed_trades_count": closed_count,
+                    "gross_realized_pnl": gross_realized_pnl,
+                    "net_realized_edge": net_realized_edge,
+                    "slippage_costs": slippage_costs,
+                    "funding_costs": funding_costs,
+                    "fee_coverage_ratio": fee_coverage_ratio,
+                })
+
+                if (
+                    fee_coverage_guard_enabled
+                    and closed_count >= fee_coverage_min_closed_trades
+                    and total_fees >= fee_coverage_min_fees_usd
+                    and fee_coverage_ratio is not None
+                    and fee_coverage_ratio < fee_coverage_min_ratio
+                ):
+                    metrics["fee_coverage_guard_active"] = True
+        except Exception as exc:
+            logger.debug(f"Daily fee pressure lookup failed: {exc}")
+
+        return metrics
+
+    async def _determine_leverage(
+        self,
+        side: str,
+        confidence: float,
+        entry_price: float,
+        base_position_value: float,
+        total_capital: float,
+        current_positions: List[dict],
+    ) -> dict:
+        """Resolve leverage tier, cap it against current portfolio usage, and compute liquidation."""
+        try:
+            from app.api.routes.settings import get_trading_gates, get_risk_limits
+
+            gates = get_trading_gates()
+            limits = get_risk_limits()
+        except Exception:
+            return {
+                "leverage": 1.0,
+                "margin_used": base_position_value,
+                "leveraged_notional": base_position_value,
+                "liquidation_price": None,
+            }
+
+        leverage = 1.0
+        max_leverage = float(getattr(limits, "max_leverage", 1.0) or 1.0)
+        if bool(getattr(gates, "leverage_enabled", True)) and confidence >= float(getattr(gates, "leverage_confidence_threshold", 0.75) or 0.75):
+            tier_1 = min(float(getattr(gates, "leverage_tier_1_multiplier", 2.0) or 2.0), max_leverage)
+            tier_2 = min(float(getattr(gates, "leverage_tier_2_multiplier", 3.0) or 3.0), max_leverage)
+            tier_3 = min(float(getattr(gates, "leverage_tier_3_multiplier", 5.0) or 5.0), max_leverage)
+
+            if confidence >= float(getattr(gates, "leverage_tier_3_min_confidence", 0.95) or 0.95):
+                leverage = max(1.0, tier_3)
+            elif confidence >= float(getattr(gates, "leverage_tier_2_min_confidence", 0.85) or 0.85):
+                leverage = max(1.0, tier_2)
+            elif confidence >= float(getattr(gates, "leverage_tier_1_min_confidence", 0.75) or 0.75):
+                leverage = max(1.0, tier_1)
+
+        current_notional = sum(
+            p.get("notional", (p.get("quantity", 0) or 0) * (p.get("current_price") or p.get("entry_price") or 0))
+            for p in current_positions
+        )
+        max_leveraged_notional = 0.0
+        if total_capital > 0:
+            max_leveraged_notional = total_capital * (float(getattr(limits, "max_leveraged_notional_pct", 200.0) or 200.0) / 100)
+
+        tier_1_floor = min(float(getattr(gates, "leverage_tier_1_multiplier", 2.0) or 2.0), max_leverage)
+        tier_2_floor = min(float(getattr(gates, "leverage_tier_2_multiplier", 3.0) or 3.0), max_leverage)
+        while leverage > 1.0 and max_leveraged_notional > 0:
+            leveraged_notional = base_position_value * leverage
+            if current_notional + leveraged_notional <= max_leveraged_notional:
+                break
+            if leverage > tier_2_floor:
+                leverage = tier_2_floor
+            elif leverage > tier_1_floor:
+                leverage = tier_1_floor
+            else:
+                leverage = 1.0
+
+        leveraged_notional = base_position_value * leverage
+        liquidation_price = risk_manager.calculate_liquidation_price(entry_price, side, leverage)
+        return {
+            "leverage": leverage,
+            "margin_used": base_position_value,
+            "leveraged_notional": leveraged_notional,
+            "liquidation_price": liquidation_price,
+        }
+
     # ------------------------------------------------------------------
     # US Market Open Session Management
     # ------------------------------------------------------------------
@@ -917,17 +1250,21 @@ class AgentScheduler:
 
         Session windows (all UTC):
             asia              00:00–08:00 — Asian markets, low vol
-            europe            08:00–12:00 — European session, moderate trends
+            london_open       08:00–08:30 — London open accumulation phase
+            london_fakeout    08:30–09:00 — Fake-out spike before real direction; confidence dampened
+            europe            09:00–12:00 — European session, moderate trends, cleaner signals
             europe_late       12:00 → blackout_start — end of European liquidity
             us_open_chaos     blackout_start → blackout_end (default 12:45–13:30)
             us_open_confirm   blackout_end → confirm_end (default 13:30–14:15)
-            us_session        confirm_end → 21:00 — cleanest trending window
-            us_late           21:00–00:00
+            us_session        confirm_end → 20:00 — cleanest trending window
+            dead_zone         20:00–00:00 — thin volume, noise-heavy; confidence dampened
 
         The 12:30 UTC pre-open sweep moves profitable SLs to breakeven so that
         the typical 13:00 reversal exits us at scratch rather than a loss.
         After 13:30, direction is established — the confirmation window requires
         high conviction (default 80%) before entering any new position.
+        London open (08:30–09:00): sharp spike often reverses; confidence penalty applied.
+        Overnight dead zone (20:00–00:00): thin liquidity; confidence penalty for trending strategies.
         """
         from datetime import datetime, timezone as _tz
         now_utc = datetime.now(_tz.utc)
@@ -944,6 +1281,17 @@ class AgentScheduler:
             confirm_thresh    = _g.us_open_confirmation_confidence
             preopen_tighten   = _g.us_open_preopen_sl_tighten
             preopen_tighten_t = _g.us_open_preopen_tighten_utc
+            london_fakeout_enabled   = getattr(_g, 'london_open_fakeout_enabled', True)
+            london_fakeout_start     = getattr(_g, 'london_open_fakeout_start_utc', 830)
+            london_fakeout_end       = getattr(_g, 'london_open_fakeout_end_utc', 900)
+            london_fakeout_penalty   = getattr(_g, 'london_open_fakeout_penalty', 0.15)
+            london_fakeout_min_conf  = getattr(_g, 'london_open_fakeout_min_confidence', 0.75)
+            dead_zone_enabled        = getattr(_g, 'dead_zone_enabled', True)
+            dead_zone_start          = getattr(_g, 'dead_zone_start_utc', 2000)
+            dead_zone_end            = getattr(_g, 'dead_zone_end_utc', 2359)
+            dead_zone_penalty        = getattr(_g, 'dead_zone_penalty', 0.15)
+            dead_zone_min_conf       = getattr(_g, 'dead_zone_min_confidence', 0.70)
+            dead_zone_noop_enabled   = getattr(_g, 'dead_zone_noop_enabled', True)
         except Exception:
             blackout_enabled  = True
             blackout_start    = 1245
@@ -952,17 +1300,38 @@ class AgentScheduler:
             confirm_thresh    = 0.80
             preopen_tighten   = True
             preopen_tighten_t = 1230
+            london_fakeout_enabled  = True
+            london_fakeout_start    = 830
+            london_fakeout_end      = 900
+            london_fakeout_penalty  = 0.15
+            london_fakeout_min_conf = 0.75
+            dead_zone_enabled       = True
+            dead_zone_start         = 2000
+            dead_zone_end           = 2359
+            dead_zone_penalty       = 0.15
+            dead_zone_min_conf      = 0.70
+            dead_zone_noop_enabled  = True
 
         def _hhmm_to_mins(h: int) -> int:
             return (h // 100) * 60 + (h % 100)
 
-        in_blackout     = blackout_enabled and blackout_start <= hhmm < blackout_end
-        in_confirmation = blackout_end <= hhmm < confirm_end
-        in_preopen      = preopen_tighten and preopen_tighten_t <= hhmm < blackout_start
-        mins_to_open    = max(0, _hhmm_to_mins(blackout_start) - mins_now) if hhmm < blackout_start else 0
+        in_blackout          = blackout_enabled and blackout_start <= hhmm < blackout_end
+        in_confirmation      = blackout_end <= hhmm < confirm_end
+        in_preopen           = preopen_tighten and preopen_tighten_t <= hhmm < blackout_start
+        in_london_fakeout    = london_fakeout_enabled and london_fakeout_start <= hhmm < london_fakeout_end
+        if dead_zone_start <= dead_zone_end:
+            in_dead_zone = dead_zone_enabled and dead_zone_start <= hhmm < dead_zone_end
+        else:
+            # Wrap-around window support (e.g. 20:00 -> 02:00)
+            in_dead_zone = dead_zone_enabled and (hhmm >= dead_zone_start or hhmm < dead_zone_end)
+        mins_to_open         = max(0, _hhmm_to_mins(blackout_start) - mins_now) if hhmm < blackout_start else 0
 
         if hhmm < 800:
             session = "asia"
+        elif hhmm < london_fakeout_start:
+            session = "london_open"
+        elif in_london_fakeout:
+            session = "london_fakeout"
         elif hhmm < 1200:
             session = "europe"
         elif hhmm < blackout_start:
@@ -971,10 +1340,10 @@ class AgentScheduler:
             session = "us_open_chaos"
         elif in_confirmation:
             session = "us_open_confirmation"
-        elif hhmm < 2100:
+        elif hhmm < dead_zone_start:
             session = "us_session"
         else:
-            session = "us_late"
+            session = "dead_zone"
 
         return {
             "session": session,
@@ -982,6 +1351,13 @@ class AgentScheduler:
             "in_blackout": in_blackout,
             "in_confirmation": in_confirmation,
             "in_preopen": in_preopen,
+            "in_london_fakeout": in_london_fakeout,
+            "london_fakeout_penalty": london_fakeout_penalty,
+            "london_fakeout_min_conf": london_fakeout_min_conf,
+            "in_dead_zone": in_dead_zone,
+            "dead_zone_penalty": dead_zone_penalty,
+            "dead_zone_min_conf": dead_zone_min_conf,
+            "dead_zone_noop_enabled": dead_zone_noop_enabled,
             "minutes_to_us_open": mins_to_open,
             "confirmation_confidence": confirm_thresh,
         }
@@ -1139,6 +1515,11 @@ class AgentScheduler:
                     _pos_levels = self._get_cached_price_levels(pos.symbol, agent_config)
                     sl_pct = agent_config.get('stop_loss_pct', 3.5) or 3.5
                     tp_pct = agent_config.get('take_profit_pct', 7.0) or 7.0
+                    try:
+                        from app.api.routes.settings import get_risk_limits as _get_risk_limits
+                        _liq_buffer_pct = float(_get_risk_limits().liquidation_buffer_pct or 12.5)
+                    except Exception:
+                        _liq_buffer_pct = 12.5
                     trailing_pct = (
                         getattr(pos, 'trailing_stop_pct', None)
                         or agent_config.get('trailing_stop_pct')
@@ -1196,6 +1577,7 @@ class AgentScheduler:
                         stop_loss_pct=sl_pct,
                         take_profit_pct=tp_pct,
                         trailing_stop_pct=trailing_pct,
+                        liquidation_buffer_pct=_liq_buffer_pct,
                     )
 
                     # ── Stage 1 & 2: Breakeven + profit-lock SL progression ──────
@@ -1488,7 +1870,23 @@ class AgentScheduler:
                         'highest_price': highest,
                     }
 
-                    check = risk_manager.check_exit(position_dict, current_price, risk_config)
+                    _liq_check = risk_manager.check_liquidation_risk(
+                        side=pos_side,
+                        current_price=current_price,
+                        liquidation_price=getattr(pos, 'liquidation_price', None),
+                        liquidation_buffer_pct=risk_config.liquidation_buffer_pct,
+                    )
+                    if _liq_check and _liq_check.get('action') == 'FORCE_CLOSE':
+                        check = RiskCheckResult(
+                            allowed=True,
+                            action="exit",
+                            reason=(
+                                f"Liquidation protection triggered at ${current_price:.2f} "
+                                f"({_liq_check['distance_pct']:.2f}% from liquidation ${_liq_check['liquidation_price']:.2f})"
+                            ),
+                        )
+                    else:
+                        check = risk_manager.check_exit(position_dict, current_price, risk_config)
 
                     if is_short:
                         pnl_pct = ((entry - current_price) / entry) * 100
@@ -1521,15 +1919,19 @@ class AgentScheduler:
                                 (_fresh_pos.realized_pnl or 0.0) if _fresh_pos else (pos.realized_pnl or 0.0)
                             )
 
-                            # Exit: sell for longs, buy-to-cover for shorts
+                            # Exit: for live positions use close_position (reduce-only);
+                            # for paper use place_order which correctly closes via P&L netting.
                             exit_side = "buy" if is_short else "sell"
-                            await _svc.place_order(
-                                symbol=pos.symbol,
-                                side=exit_side,
-                                quantity=_close_qty,
-                                price=current_price,
-                                agent_id=pos.agent_id,
-                            )
+                            if _pos_is_paper:
+                                await _svc.place_order(
+                                    symbol=pos.symbol,
+                                    side=exit_side,
+                                    quantity=_close_qty,
+                                    price=current_price,
+                                    agent_id=pos.agent_id,
+                                )
+                            else:
+                                await _svc.close_position(pos.id)
                             action_word = "covered" if is_short else "sold"
                             logger.info(f"SL/TP exit executed: {action_word} {_close_qty} {pos.symbol} @ ${current_price:.2f}")
 
@@ -1608,6 +2010,20 @@ class AgentScheduler:
                                     close_reason=exit_type.replace("-", " ").title(),
                                 )))
 
+                            # Phase 9.2 — update trader drawdown after every close
+                            if pos.agent_id:
+                                _agent_cfg_dd = self._enabled_agents.get(pos.agent_id, {})
+                                _trader_id_dd = _agent_cfg_dd.get("trader_id") or _agent_cfg_dd.get("_trader_id_pre")
+                                if _trader_id_dd:
+                                    _trader_agents_dd = [
+                                        a["id"] for a in self._enabled_agents.values()
+                                        if a.get("trader_id") == _trader_id_dd
+                                        or a.get("_trader_id_pre") == _trader_id_dd
+                                    ]
+                                    asyncio.create_task(
+                                        _run_drawdown_check(_trader_id_dd, _trader_agents_dd, _is_paper_mode())
+                                    )
+
                         except Exception as e:
                             logger.error(f"Failed to execute SL/TP exit for {pos.symbol}: {e}")
 
@@ -1627,7 +2043,13 @@ class AgentScheduler:
         Adjustments are persisted to DB so the 60-second position monitor
         picks them up immediately."""
         try:
-            positions = await paper_trading.get_positions()
+            positions = list(await paper_trading.get_positions() or [])
+            if not _is_paper_mode():
+                try:
+                    from app.services.live_trading import live_trading as _lt_rev
+                    positions += list(await _lt_rev.get_positions() or [])
+                except Exception:
+                    pass
             if not positions:
                 return
 
@@ -2004,8 +2426,8 @@ class AgentScheduler:
                     )
                     continue
 
-                # Apply the approved adjustment
-                result = await paper_trading.update_position_sl_tp(pid, **kwargs)
+                # Apply the approved adjustment — route to correct backend (paper or live)
+                result = await trading_service.update_position_sl_tp(pid, **kwargs)
                 if result:
                     adjusted_count += 1
                     logger.info(f"SL/TP Review: {symbol} {proposal_str} — approved & applied")
@@ -2086,16 +2508,26 @@ class AgentScheduler:
         return metrics_list
 
     async def _get_current_positions(self) -> List[dict]:
-        """Fetch current paper trading positions for risk assessment"""
+        """Fetch current open positions (paper + live) for risk assessment"""
         try:
-            positions = await paper_trading.get_positions()
+            positions = list(await paper_trading.get_positions() or [])
+            if not _is_paper_mode():
+                try:
+                    from app.services.live_trading import live_trading as _lt_pos
+                    positions += list(await _lt_pos.get_positions() or [])
+                except Exception:
+                    pass
             return [
                 {
                     "symbol": p.symbol,
+                    "side": p.side.value if hasattr(p.side, 'value') else str(p.side),
                     "quantity": p.quantity,
                     "entry_price": p.entry_price,
-                    "current_price": p.current_price,
-                    "unrealized_pnl": p.unrealized_pnl,
+                    "current_price": getattr(p, 'current_price', p.entry_price),
+                    "unrealized_pnl": getattr(p, 'unrealized_pnl', None),
+                    "leverage": getattr(p, 'leverage', 1.0) or 1.0,
+                    "margin_used": getattr(p, 'margin_used', None),
+                    "notional": (p.quantity or 0) * (getattr(p, 'current_price', None) or p.entry_price or 0),
                 }
                 for p in positions
             ]
@@ -2222,6 +2654,71 @@ class AgentScheduler:
                         total_capital=total_capital,
                         confluence_scores=confluence_scores,
                     )
+
+                    # ── Phase 9.1: Consistency & Sharpe gating ──────────────
+                    try:
+                        from app.services.consistency_scorer import compute_consistency
+                        import asyncio as _asyncio
+                        _is_paper = _is_paper_mode()
+                        _cscores = {}
+                        _tasks = [
+                            compute_consistency(
+                                t["id"],
+                                [a["id"] for a in agents_list if a.get("trader_id") == t["id"]],
+                                is_paper=_is_paper,
+                            )
+                            for t in self._traders if t.get("is_enabled", True)
+                        ]
+                        _results = await _asyncio.gather(*_tasks, return_exceptions=True)
+                        for _t, _cr in zip(
+                            [t for t in self._traders if t.get("is_enabled", True)], _results
+                        ):
+                            if isinstance(_cr, Exception):
+                                continue
+                            _cscores[_t["id"]] = _cr
+                            proposed = trader_alloc_pct.get(_t["id"], 33.3)
+                            prev = _t.get("allocation_pct", 33.3)
+
+                            # 40% Rule: block capital increase
+                            if _cr.consistency_flag == "INCONSISTENT":
+                                trader_alloc_pct[_t["id"]] = min(proposed, prev)
+
+                            # Sharpe gate multiplier
+                            trader_alloc_pct[_t["id"]] = max(
+                                trader_service.MIN_ALLOCATION_PCT,
+                                min(
+                                    trader_service.MAX_ALLOCATION_PCT,
+                                    trader_alloc_pct[_t["id"]] * _cr.sharpe_multiplier,
+                                ),
+                            )
+
+                            # Team chat alert on newly INCONSISTENT traders
+                            prev_flag = self._consistency_flags.get(_t["id"])
+                            if _cr.consistency_flag == "INCONSISTENT" and prev_flag != "INCONSISTENT":
+                                _name = _t.get("name", _t["id"])
+                                asyncio.create_task(team_chat.add_message(
+                                    agent_role="risk_manager",
+                                    content=(
+                                        f"⚠️ **Consistency Gate triggered — {_name}**: "
+                                        f"a single trade represents {_cr.offending_trade_pct:.0%} of "
+                                        f"period profit (40% rule exceeded). "
+                                        f"Capital increase blocked until distribution improves."
+                                    ),
+                                    message_type="alert",
+                                ))
+                            self._consistency_flags[_t["id"]] = _cr.consistency_flag
+
+                        # Re-normalize after gating adjustments
+                        _total = sum(trader_alloc_pct.values())
+                        if _total > 0:
+                            trader_alloc_pct = {
+                                tid: pct / _total * 100
+                                for tid, pct in trader_alloc_pct.items()
+                            }
+                    except Exception as _ce:
+                        logger.warning(f"9.1 consistency gating failed (using raw allocations): {_ce}")
+                    # ─────────────────────────────────────────────────────────
+
                     self._trader_allocations = trader_alloc_pct
 
                     # Persist trader allocations to DB
@@ -2483,6 +2980,19 @@ class AgentScheduler:
                 if _s_poll in ('momentum', 'breakout', 'ema_crossover'):
                     interval = min(interval, 300)   # max 5-minute poll for trend strategies
 
+                # ── Session-aware interval scaling ────────────────────────────
+                # London/NY overlap (13:00–17:00 UTC) is the highest-liquidity window.
+                # Halve the interval so agents fire twice as often during peak hours.
+                # Outside active sessions, double the interval to save LLM budget.
+                _sess_now = self._get_market_session_info()
+                _hhmm = _sess_now.get("utc_hhmm", 0)
+                _in_overlap = 1300 <= _hhmm < 1700          # London/NY overlap
+                _in_active  = _in_overlap or (800 <= _hhmm < 1300)  # London + pre-overlap
+                if _in_overlap:
+                    interval = max(60, interval // 2)        # 2× faster during overlap
+                elif not _in_active:
+                    interval = interval * 2                  # 0.5× outside active windows
+
                 last_run = config.get('_last_run')
 
                 if last_run:
@@ -2557,7 +3067,7 @@ class AgentScheduler:
                     agent_id=config['id'],
                     name=config.get('name', ''),
                     strategy_type=_s_type,
-                    trading_pairs=config.get('trading_pairs', []),
+                    trading_pairs=get_trading_prefs().trading_pairs or ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
                     allocation_pct=allocation_pct,
                     max_position=config.get('max_position_size', 0.1),
                     stop_loss_pct=_sl,
@@ -2666,7 +3176,7 @@ class AgentScheduler:
                 # Close all open positions associated with this grid
                 for pos_id in position_ids:
                     try:
-                        await paper_trading.close_position(pos_id)
+                        await trading_service.close_position(pos_id)
                     except Exception as ce:
                         logger.warning(f"Grid: failed to close position {pos_id}: {ce}")
 
@@ -2784,7 +3294,18 @@ class AgentScheduler:
                             stop_loss_price=sl,
                             take_profit_price=tp,
                         )
-                        if order:
+                    else:
+                        from app.services.live_trading import live_trading as _grid_live_svc
+                        order = await _grid_live_svc.place_order(
+                            symbol=symbol,
+                            side=level.side,
+                            quantity=level.quantity,
+                            price=level.price,
+                            agent_id=agent_id,
+                            stop_loss_price=sl,
+                            take_profit_price=tp,
+                        )
+                    if order:
                             await grid_engine.mark_level_open(level.id, order.id if hasattr(order, 'id') else str(order))
                             logger.info(
                                 f"Grid {symbol}: placed {level.side.value} @ {level.price:.4f} "
@@ -2793,28 +3314,89 @@ class AgentScheduler:
                 except Exception as oe:
                     logger.warning(f"Grid {agent_id}: failed to place order at level {level.price}: {oe}")
 
-        # ── Check filled levels for P&L and counter placement ───────────────
+        # ── Check open levels: confirm entries + detect external closes ─────────
+        # Pre-fetch position set ONCE to avoid N+1 DB calls inside the loop.
+        from app.models import GridLevelStatus
+        try:
+            all_positions = list(await trading_service.get_positions(symbol=symbol, agent_id=agent_id))
+            open_position_ids = {p.id for p in all_positions}
+        except Exception as _pe:
+            logger.warning(f"Grid {agent_id}: failed to fetch positions: {_pe}")
+            open_position_ids = set()
+
         open_levels = await grid_engine.get_open_levels(active_grid)
         for level in open_levels:
             if not level.position_id:
                 continue
             try:
-                positions = await paper_trading.get_positions(symbol=symbol, agent_id=agent_id)
-                pos = next((p for p in positions if p.id == level.position_id), None)
-                if not pos:
-                    # Position was closed externally (SL/TP hit) — record level as closed
-                    closed_trades = await paper_trading.get_closed_trades(symbol=symbol)
-                    matching = next((t for t in closed_trades if t.get('entry_order_id') == level.position_id
-                                    or t.get('position_id') == level.position_id), None)
-                    exit_price = matching.get('exit_price', current_price) if matching else current_price
-                    pnl = await grid_engine.close_level(level.id, exit_price)
-                    if pnl is not None:
-                        self._record_run(agent_id, symbol,
-                                         "buy" if level.side == OrderSide.BUY else "sell",
-                                         0.7, exit_price, True, pnl=pnl)
-                        await grid_engine.on_fill(level.id, exit_price, level.position_id)
+                if level.status == GridLevelStatus.open:
+                    # Entry order placed; check if the position is now live (entry confirmed)
+                    if level.position_id in open_position_ids:
+                        counter = await grid_engine.on_fill(level.id, level.price, level.position_id)
+                        if counter:
+                            # Place the counter order immediately rather than waiting for the next tick
+                            spacing = active_grid.grid_spacing_pct / 100 * current_price
+                            if counter.side == OrderSide.BUY:
+                                c_sl = active_grid.grid_low * 0.995
+                                c_tp = counter.price + spacing
+                            else:
+                                c_sl = active_grid.grid_high * 1.005
+                                c_tp = counter.price - spacing
+                            try:
+                                if use_paper:
+                                    c_order = await paper_trading.place_order(
+                                        symbol=symbol, side=counter.side,
+                                        quantity=counter.quantity, price=counter.price,
+                                        agent_id=agent_id,
+                                        stop_loss_price=c_sl, take_profit_price=c_tp,
+                                    )
+                                else:
+                                    from app.services.live_trading import live_trading as _grid_live_svc
+                                    c_order = await _grid_live_svc.place_order(
+                                        symbol=symbol, side=counter.side,
+                                        quantity=counter.quantity, price=counter.price,
+                                        agent_id=agent_id,
+                                        stop_loss_price=c_sl, take_profit_price=c_tp,
+                                    )
+                                if c_order:
+                                    await grid_engine.mark_level_open(
+                                        counter.id,
+                                        c_order.id if hasattr(c_order, 'id') else str(c_order),
+                                    )
+                                    logger.info(
+                                        f"Grid {symbol}: counter {counter.side.value} "
+                                        f"@ {counter.price:.4f} placed after entry fill"
+                                    )
+                            except Exception as _co:
+                                logger.warning(f"Grid {agent_id}: counter order placement failed: {_co}")
+
+                elif level.status in (GridLevelStatus.filled, GridLevelStatus.counter_placed):
+                    # Entry was confirmed; if the position is gone it was closed externally (SL/TP hit)
+                    if level.position_id not in open_position_ids:
+                        try:
+                            closed_trades = await trading_service.get_closed_trades(symbol=symbol)
+                        except Exception:
+                            closed_trades = []
+                        matching = next(
+                            (t for t in closed_trades
+                             if t.get('entry_order_id') == level.position_id
+                             or t.get('position_id') == level.position_id),
+                            None,
+                        )
+                        exit_price = matching.get('exit_price', current_price) if matching else current_price
+                        pnl = await grid_engine.close_level(level.id, exit_price)
+                        if pnl is not None:
+                            self._record_run(
+                                agent_id, symbol,
+                                "buy" if level.side == OrderSide.BUY else "sell",
+                                0.7, exit_price, True, pnl=pnl,
+                            )
+                            logger.info(
+                                f"Grid {symbol}: level {level.level_index} closed externally "
+                                f"@ {exit_price:.4f} pnl={pnl:+.4f}"
+                            )
             except Exception as ce:
-                logger.debug(f"Grid: level fill check error for {level.id}: {ce}")
+                logger.debug(f"Grid: level check error for {level.id}: {ce}")
 
         self._record_run(agent_id, symbol, "hold", 0.5, current_price, False)
 
@@ -2848,13 +3430,32 @@ class AgentScheduler:
             )
         
         # ── Scan ALL pairs, pick the best opportunity ──────────────────────
+        # Watchlisted symbols (near-miss from the previous cycle) are prepended
+        # so they get re-evaluated first; expired entries are pruned here.
+        _now = datetime.now()
+        _watch_prefix: list = []
+        for _wkey, _wentry in list(self._setup_watchlist.items()):
+            _wage, _wagent = _wkey.split(":", 1)
+            if _wage != agent_id:
+                continue
+            if (_now - _wentry["at"]).total_seconds() > self._WATCHLIST_TTL_SECS:
+                del self._setup_watchlist[_wkey]
+                continue
+            _wsym = _wkey.split(":", 1)[1]
+            if _wsym in trading_pairs:
+                _watch_prefix.append(_wsym)
+
+        _scan_order = _watch_prefix + [s for s in trading_pairs if s not in _watch_prefix]
+        if _watch_prefix:
+            logger.debug(f"Agent {agent_id}: prioritising watchlisted symbols {_watch_prefix}")
+
         best_symbol = None
         best_confidence = 0.0
         best_signal = "hold"
         best_df = None
         best_reasoning = ""
 
-        for candidate_symbol in trading_pairs:
+        for candidate_symbol in _scan_order:
             try:
                 klines = await self.phemex.get_klines(candidate_symbol, timeframe, 200)
                 data = klines.get('data', klines) if isinstance(klines, dict) else klines
@@ -3008,6 +3609,17 @@ class AgentScheduler:
                     best_signal = sig
                     best_df = df
                     best_reasoning = reas
+
+                # ── Watchlist update ──────────────────────────────────────────
+                # Near-miss: add to watchlist so next cycle prioritises this symbol.
+                # Above the upper bound: remove (setup either traded or expired strong).
+                _wk = f"{agent_id}:{candidate_symbol}"
+                if sig in ('buy', 'sell') and self._WATCHLIST_CONF_LOW <= conf <= self._WATCHLIST_CONF_HIGH:
+                    self._setup_watchlist[_wk] = {"confidence": conf, "signal": sig, "at": datetime.now()}
+                    logger.debug(f"Watchlist ADD {candidate_symbol} conf={conf:.2f} sig={sig}")
+                elif conf > self._WATCHLIST_CONF_HIGH or sig == 'hold':
+                    self._setup_watchlist.pop(_wk, None)
+
             except Exception as e:
                 logger.warning(f"Skipping {candidate_symbol} for agent {name}: {e}")
                 continue
@@ -3055,6 +3667,9 @@ class AgentScheduler:
         try:
             executed = False
             pnl = None
+            _effective_min_entry_conf = None
+            _effective_conf_floor = None
+            _min_net_tp_pct = 0.50
 
             try:
                 from app.api.routes.settings import get_trading_gates as _get_gates
@@ -3066,8 +3681,97 @@ class AgentScheduler:
             except Exception:
                 _min_entry_conf = 0.60
                 _ta_veto_conf = 0.75
-                _conf_ref = 0.65
-                _conf_floor = 0.50
+                _conf_ref = 0.78
+                _conf_floor = 0.25
+
+            _effective_min_entry_conf = _min_entry_conf
+            _effective_conf_floor = _conf_floor
+
+            if signal in ('buy', 'sell'):
+                _fee_pressure = await self._get_daily_fee_pressure()
+                _budget_used = float(_fee_pressure.get("budget_used_ratio", 0.0) or 0.0)
+
+                # ── Check whether this agent already has open positions ────────
+                # If so, skip fee-guard threshold raises: the agent is already
+                # deployed and performing — adding friction penalises good agents.
+                # Only brand-new entries (no open position on any symbol for this
+                # agent) should be gated by poor fund-wide coverage metrics.
+                _agent_has_open_pos = False
+                try:
+                    _open_pos = await paper_trading.get_positions(agent_id=agent_id)
+                    _agent_has_open_pos = len(_open_pos) > 0
+                except Exception:
+                    pass
+
+                if _budget_used >= 1.0:
+                    _reason = (
+                        f"Daily fee budget exhausted: ${_fee_pressure['daily_fees_paid']:.2f} paid today "
+                        f"({float(_fee_pressure['daily_fees_pct']):.2f}% of capital) vs "
+                        f"{float(_fee_pressure['max_daily_fees_pct']):.2f}% limit"
+                    )
+                    logger.info(f"Fee budget gate blocked {name} {signal.upper()} {symbol}: {_reason}")
+                    self._record_run(agent_id, symbol, signal, confidence, current_price, False, error="Daily fee budget exhausted")
+                    await team_chat.log_trade_blocked(
+                        trader_name=_trader_name,
+                        trader_avatar=_trader_avatar,
+                        agent_name=name,
+                        symbol=symbol,
+                        side=signal,
+                        reason=f"{_reason}. Preserving capital for higher-quality setups after the UTC reset.",
+                    )
+                    return AgentRun(
+                        agent_id=agent_id,
+                        timestamp=datetime.now(),
+                        symbol=symbol,
+                        signal="hold",
+                        confidence=0,
+                        price=current_price,
+                        executed=False,
+                        error="Daily fee budget exhausted",
+                    )
+
+                if _budget_used >= 0.5 and not _agent_has_open_pos:
+                    _pressure = min(1.0, max(0.0, (_budget_used - 0.5) / 0.5))
+                    _effective_min_entry_conf = min(0.90, _min_entry_conf + (0.10 * _pressure))
+                    _effective_conf_floor = max(0.15, _conf_floor - (0.10 * _pressure))
+                    _min_net_tp_pct = 0.50 + (0.50 * _pressure)
+
+                _fee_guard_active = bool(_fee_pressure.get("fee_coverage_guard_active", False))
+                if _fee_guard_active and not _agent_has_open_pos:
+                    _ratio = float(_fee_pressure.get("fee_coverage_ratio", 0.0) or 0.0)
+                    _target = float(_fee_pressure.get("fee_coverage_min_ratio", 2.5) or 2.5)
+                    _deficit = min(1.0, max(0.0, (_target - _ratio) / max(_target, 0.01)))
+
+                    _effective_min_entry_conf = min(0.92, _effective_min_entry_conf + (0.12 * _deficit))
+                    _effective_conf_floor = max(0.10, _effective_conf_floor - (0.10 * _deficit))
+                    _min_net_tp_pct = max(_min_net_tp_pct, 0.75 + (0.75 * _deficit))
+
+                    # If coverage has materially deteriorated, allow only top-tier setups.
+                    if _deficit >= 0.55 and confidence < 0.85:
+                        _reason = (
+                            f"Fee coverage guard: net-edge/fees ratio {_ratio:.2f}x below target {_target:.2f}x. "
+                            f"Pausing medium-quality entries until edge improves."
+                        )
+                        logger.info(f"Fee coverage guard blocked {name} {signal.upper()} {symbol}: {_reason}")
+                        self._record_run(agent_id, symbol, signal, confidence, current_price, False, error="Fee coverage guard")
+                        await team_chat.log_trade_blocked(
+                            trader_name=_trader_name,
+                            trader_avatar=_trader_avatar,
+                            agent_name=name,
+                            symbol=symbol,
+                            side=signal,
+                            reason=_reason,
+                        )
+                        return AgentRun(
+                            agent_id=agent_id,
+                            timestamp=datetime.now(),
+                            symbol=symbol,
+                            signal="hold",
+                            confidence=0,
+                            price=current_price,
+                            executed=False,
+                            error="Fee coverage guard",
+                        )
 
             # ── Direction-aware whale gate ────────────────────────────────────
             # If smart-money is overwhelmingly positioned AGAINST the proposed
@@ -3121,7 +3825,68 @@ class AgentScheduler:
                     )
                     confidence = 0.0
 
-            if signal in ['buy', 'sell'] and confidence >= _min_entry_conf:
+            # ── London open fake-out window ───────────────────────────────────────────────
+            # 08:30–09:00 UTC: London open typically produces a spike that reverses
+            # before the real intraday direction establishes. Penalise confidence
+            # to require stronger conviction; block if below minimum threshold.
+            # Only applied to intraday strategies (momentum, breakout, ema_crossover).
+            if signal in ('buy', 'sell') and confidence > 0:
+                _lo_sess = _us_gate_sess  # reuse already-fetched session info
+                _lo_intraday_strategies = ('momentum', 'breakout', 'ema_crossover', 'ai', 'default')
+                if _lo_sess.get("in_london_fakeout") and strategy_type in _lo_intraday_strategies:
+                    _lo_penalty  = _lo_sess["london_fakeout_penalty"]
+                    _lo_min_conf = _lo_sess["london_fakeout_min_conf"]
+                    _pre_penalty_conf = confidence
+                    confidence = max(confidence * (1.0 - _lo_penalty), 0.01)
+                    if confidence < _lo_min_conf:
+                        logger.info(
+                            f"LONDON FAKEOUT gate dampened {name} {signal.upper()} {symbol}: "
+                            f"{_pre_penalty_conf:.0%} → {confidence:.0%} (min {_lo_min_conf:.0%} required)"
+                        )
+                        await team_chat.log_agent_gate_block(
+                            name,
+                            f"London open fake-out window (08:30–09:00 UTC): direction not yet "
+                            f"confirmed — spike may reverse. Confidence {_pre_penalty_conf:.0%} → "
+                            f"{confidence:.0%} after -{_lo_penalty:.0%} penalty (need {_lo_min_conf:.0%}).",
+                        )
+                        confidence = 0.0
+                    else:
+                        logger.info(
+                            f"LONDON FAKEOUT penalty applied {name} {signal.upper()} {symbol}: "
+                            f"{_pre_penalty_conf:.0%} → {confidence:.0%} (-{_lo_penalty:.0%}), trade proceeds"
+                        )
+
+            # ── Overnight dead zone gate ──────────────────────────────────────────────────
+            # 20:00–00:00 UTC: NY winding down, Asia not yet active. Volume is thin,
+            # spreads widen, false signals are common. Dampen confidence for trending
+            # strategies; mean_reversion and grid are less affected.
+            if signal in ('buy', 'sell') and confidence > 0:
+                _dz_sess = _us_gate_sess  # reuse session info
+                _dz_trending_strategies = ('momentum', 'breakout', 'ema_crossover', 'ai', 'default')
+                if _dz_sess.get("in_dead_zone") and strategy_type in _dz_trending_strategies:
+                    _dz_penalty  = _dz_sess["dead_zone_penalty"]
+                    _dz_min_conf = _dz_sess["dead_zone_min_conf"]
+                    _pre_dz_conf = confidence
+                    confidence = max(confidence * (1.0 - _dz_penalty), 0.01)
+                    if confidence < _dz_min_conf:
+                        logger.info(
+                            f"DEAD ZONE gate dampened {name} {signal.upper()} {symbol}: "
+                            f"{_pre_dz_conf:.0%} → {confidence:.0%} (min {_dz_min_conf:.0%} required)"
+                        )
+                        await team_chat.log_agent_gate_block(
+                            name,
+                            f"Overnight dead zone (20:00–00:00 UTC): thin volume, unreliable signals. "
+                            f"Confidence {_pre_dz_conf:.0%} → {confidence:.0%} after -{_dz_penalty:.0%} "
+                            f"penalty (need {_dz_min_conf:.0%} to enter). Standing by for active session.",
+                        )
+                        confidence = 0.0
+                    else:
+                        logger.info(
+                            f"DEAD ZONE penalty applied {name} {signal.upper()} {symbol}: "
+                            f"{_pre_dz_conf:.0%} → {confidence:.0%} (-{_dz_penalty:.0%}), trade proceeds"
+                        )
+
+            if signal in ['buy', 'sell'] and confidence >= _effective_min_entry_conf:
                 # Announce trade intent to the team before gates run
                 await team_chat.log_trade_intent(
                     trader_name=_trader_name,
@@ -3133,6 +3898,22 @@ class AgentScheduler:
                     confidence=confidence,
                     reasoning=reasoning or f"Signal generated by {strategy_type} strategy",
                 )
+
+                # ── Fetch technical analysis early (for TP scaling & checks) ───
+                # We need confluence data for confluence-aware TP scaling.
+                # Check cache first to avoid redundant API calls.
+                _ta_cache_key = f"{symbol}:{timeframe}"
+                technical_report = None
+                if _ta_cache_key in self._ta_cache:
+                    technical_report, _cached_at = self._ta_cache[_ta_cache_key]
+                    if (datetime.now() - _cached_at).total_seconds() >= 300:  # 5-min cache TTL
+                        # Cache expired — re-fetch
+                        technical_report = await technical_analyst.analyze(symbol, timeframe=timeframe)
+                        self._ta_cache[_ta_cache_key] = (technical_report, datetime.now())
+                    # else: cache still valid, use it
+                else:
+                    technical_report = await technical_analyst.analyze(symbol, timeframe=timeframe)
+                    self._ta_cache[_ta_cache_key] = (technical_report, datetime.now())
 
                 # ── ATR-scaled TP% ─────────────────────────────────────────────
                 # Scale the base TP% by the ratio of current ATR to the 20-period
@@ -3170,17 +3951,57 @@ class AgentScheduler:
                 except Exception as _atr_err:
                     logger.debug(f"ATR scaling skipped ({_atr_err}) — using base TP {take_profit_pct:.1f}%")
 
+                # ── Confluence-aware TP scaling (post-ATR) ───────────────────
+                # Scale TP based on multi-timeframe confluence score:
+                #   Strong (≥80%)  → 1.4–1.6× (let big trends run)
+                #   Medium (40–80%) → 1.0–1.2× (ATR-scaled only, no boost)
+                #   Weak (≤40%)    → 0.75–0.9× (tighter targets, close faster)
+                #
+                # Weak trades exiting faster raises avg win size; strong trades
+                # with room to run inflates winners relative to SL-capped losers.
+                # This targets a better loss ratio (from current 3:1 toward 1.5:1).
+                _pre_conf_tp = take_profit_pct
+                if technical_report and technical_report.multi_timeframe:
+                    _conf = technical_report.multi_timeframe.confluence_score
+                    if _conf is not None:
+                        if _conf >= 0.80:
+                            # Strong: boost to 1.4–1.6× range
+                            # Linear scale from 1.4 at 80% to 1.6 at 100%
+                            _conf_mult = min(1.4 + (_conf - 0.80) * 2, 1.6)
+                        elif _conf <= 0.40:
+                            # Weak: shrink to 0.75–0.9× range
+                            # Linear scale from 0.9 at 40% down to 0.75 at 0%
+                            _conf_mult = max(0.9 - (0.40 - _conf) * 0.375, 0.75)
+                        else:
+                            # Medium: linear interpolation 1.0–1.2× between 40%–80%
+                            _conf_mult = 1.0 + (_conf - 0.40) * (0.2 / 0.40)
+                        
+                        take_profit_pct = round(take_profit_pct * _conf_mult, 2)
+                        if abs(_conf_mult - 1.0) > 0.05:  # log only if material change
+                            logger.info(
+                                f"Confluence TP scale: {name}/{symbol} "
+                                f"conf={_conf:.0%} → mult={_conf_mult:.2f}x "
+                                f"TP {_pre_conf_tp:.1f}% → {take_profit_pct:.1f}%"
+                            )
+
                 # ── Recent price range sanity check ───────────────────────────
                 # If TP% > the actual 20-candle high-low swing range and the
                 # regime is NOT trending, reduce TP to 80% of the recent range
                 # so we're targeting a realistic move rather than a phantom one.
+                #
+                # Directional strategies (momentum/trend/breakout/ai) need room to
+                # run, so we enforce a stricter 3:1 R/R floor here — the range cap
+                # can never push their TP below 3× their SL.
+                # Mean-reversion and scalping retain the original 1.5:1 floor.
+                _is_directional = strategy_type in ("momentum", "trend_following", "breakout", "ai")
+                _range_rr_floor = 3.0 if _is_directional else 1.5
                 try:
                     if df is not None and len(df) >= 20 and _current_regime not in ("trending_up", "trending_down"):
                         _recent = df.iloc[-20:]
                         _range_pct = (float(_recent['high'].max()) - float(_recent['low'].min())) / float(_recent['close'].iloc[-1]) * 100
                         if take_profit_pct > _range_pct and _range_pct > 0.5:
                             _range_capped_tp = round(_range_pct * 0.80, 2)
-                            if _range_capped_tp > stop_loss_pct * 1.5:  # preserve 1.5:1 R/R floor
+                            if _range_capped_tp > stop_loss_pct * _range_rr_floor:  # preserve R/R floor
                                 logger.info(
                                     f"Range sanity cap: {name}/{symbol} "
                                     f"TP {take_profit_pct:.1f}% > 20-candle range {_range_pct:.1f}% "
@@ -3197,16 +4018,16 @@ class AgentScheduler:
                 _taker_fee_pct = 0.10 if _is_spot else 0.06
                 round_trip_fee_pct = _taker_fee_pct * 2
                 net_tp_pct = take_profit_pct - round_trip_fee_pct
-                if net_tp_pct < 0.5:
+                if net_tp_pct < _min_net_tp_pct:
                     logger.warning(
                         f"Trade skipped: TP {take_profit_pct}% minus fees {round_trip_fee_pct}% = "
-                        f"{net_tp_pct:.2f}% net — below 0.5% minimum"
+                        f"{net_tp_pct:.2f}% net — below {_min_net_tp_pct:.2f}% minimum"
                     )
                     self._record_run(agent_id, symbol, signal, confidence, current_price, False, error="TP too low after fees")
                     await team_chat.log_trade_blocked(
                         trader_name=_trader_name, trader_avatar=_trader_avatar,
                         agent_name=name, symbol=symbol, side=signal,
-                        reason=f"TP {take_profit_pct}% minus fees = {net_tp_pct:.2f}% net — below 0.5% minimum",
+                        reason=f"TP {take_profit_pct}% minus fees = {net_tp_pct:.2f}% net — below {_min_net_tp_pct:.2f}% minimum",
                     )
                     return AgentRun(
                         agent_id=agent_id, timestamp=datetime.now(), symbol=symbol,
@@ -3239,8 +4060,17 @@ class AgentScheduler:
                             executed=False, error=f"Post-close cooldown ({_mins_left:.0f}m left)",
                         )
 
-                balances = await paper_trading.get_all_balances()
-                usdt_balance = next((b.available for b in balances if b.asset == "USDT"), 50_000.0)
+                if _is_paper_mode():
+                    balances = await paper_trading.get_all_balances()
+                    usdt_balance = next((b.available for b in balances if b.asset == "USDT"), 50_000.0)
+                else:
+                    try:
+                        from app.services.live_trading import live_trading as _lt_bal
+                        _live_bal = await _lt_bal.get_balance()
+                        usdt_balance = _live_bal.get("available", 0.0) or 50_000.0
+                    except Exception:
+                        balances = await paper_trading.get_all_balances()
+                        usdt_balance = next((b.available for b in balances if b.asset == "USDT"), 50_000.0)
 
                 # Strategy-specific position size multipliers.
                 # Scalping/mean-reversion work on small price moves — a full allocation
@@ -3280,7 +4110,12 @@ class AgentScheduler:
                 # Scale position size proportionally to signal confidence so that
                 # high-conviction signals get full size and weak signals trade small.
                 # Formula: conf_mult = clamp(confidence / ref, floor, 1.0)
-                _conf_mult = min(1.0, max(_conf_floor, confidence / _conf_ref))
+                _size_ref = max(_effective_min_entry_conf + 0.01, _conf_ref)
+                if confidence >= _size_ref:
+                    _conf_mult = 1.0
+                else:
+                    _progress = max(0.0, min(1.0, (confidence - _effective_min_entry_conf) / (_size_ref - _effective_min_entry_conf)))
+                    _conf_mult = _effective_conf_floor + ((1.0 - _effective_conf_floor) * (_progress ** 1.35))
 
                 # Size position based on total fund capital (not just available USDT).
                 # allocation_pct is a % of the total fund; using only available USDT
@@ -3290,13 +4125,26 @@ class AgentScheduler:
 
                 # Cap at 95% of available USDT to avoid overdrafts
                 position_value = min(target_position_value, usdt_balance * 0.95)
-                quantity = position_value / current_price
+                current_positions = await self._get_current_positions()
+                leverage_meta = await self._determine_leverage(
+                    side=signal,
+                    confidence=confidence,
+                    entry_price=current_price,
+                    base_position_value=position_value,
+                    total_capital=total_fund,
+                    current_positions=current_positions,
+                )
+                leverage = float(leverage_meta.get("leverage", 1.0) or 1.0)
+                margin_used = float(leverage_meta.get("margin_used", position_value) or position_value)
+                leveraged_notional = float(leverage_meta.get("leveraged_notional", position_value) or position_value)
+                liquidation_price = leverage_meta.get("liquidation_price")
+                quantity = leveraged_notional / current_price if current_price > 0 else 0.0
 
                 logger.debug(
-                    f"Sizing {name} ({strategy_type}, {_size_mult:.0%} strat, {_conf_mult:.0%} conf): "
+                    f"Sizing {name} ({strategy_type}, {_size_mult:.0%} strat, {_conf_mult:.0%} conf, {leverage:.1f}x lev): "
                     f"total_fund=${total_fund:.0f}, alloc={allocation_pct:.2f}%, "
-                    f"target=${target_position_value:.0f}, available=${usdt_balance:.0f}, "
-                    f"final=${position_value:.0f}, qty={quantity:.4f} @ ${current_price}"
+                    f"target=${target_position_value:.0f}, available=${usdt_balance:.0f}, margin=${margin_used:.0f}, "
+                    f"notional=${leveraged_notional:.0f}, qty={quantity:.4f} @ ${current_price}"
                 )
 
                 # ── Sell-to-close existing long: bypasses sizing gates ────────
@@ -3306,7 +4154,7 @@ class AgentScheduler:
                 # to new entries.
                 _closing_existing = False
                 if signal == 'sell':
-                    positions = await paper_trading.get_positions(symbol, agent_id=agent_id)
+                    positions = list(await trading_service.get_positions(symbol=symbol, agent_id=agent_id))
                     long_pos = next((p for p in positions if p.symbol == symbol and p.side == OrderSide.BUY), None)
                     if long_pos:
                         quantity = long_pos.quantity
@@ -3375,16 +4223,20 @@ class AgentScheduler:
                     take_profit_pct=take_profit_pct,
                     max_daily_loss=_limits.max_daily_loss_pct,
                     total_capital=total_fund,
-                    max_position_size=position_value if not _closing_existing else quantity * current_price,
+                    max_position_size=leveraged_notional if not _closing_existing else quantity * current_price,
                     max_open_positions=_limits.max_open_positions,
                     max_exposure=total_fund * _limits.exposure_threshold_pct / 100,
+                    leverage=leverage,
+                    max_leveraged_notional_pct=getattr(_limits, 'max_leveraged_notional_pct', 200.0),
+                    liquidation_buffer_pct=getattr(_limits, 'liquidation_buffer_pct', 12.5),
                 )
                 
                 risk_check = risk_manager.check_trade(
                     side=signal,
                     quantity=quantity,
                     entry_price=current_price,
-                    risk_config=risk_config
+                    risk_config=risk_config,
+                    current_positions=current_positions,
                 )
                 
                 if not risk_check.allowed:
@@ -3420,11 +4272,40 @@ class AgentScheduler:
                         error=risk_check.reason
                     )
 
+                # ── Technical analysis already fetched above (line ~3440) for TP scaling ───
+                # Confluence data is used for dynamic concentration limits (below)
+                # and for confluence-aware TP scaling (above).
+
+                # ── Dynamic concentration limit (based on confluence & regime) ────────────
+                # Base limit: 40%. Boost up to 65% if multi-TF confluence >= 0.70 (strong alignment).
+                # This allows capital to flow to high-conviction setups in trending markets.
+                _base_conc_pct = getattr(_limits, 'max_directional_concentration_pct', 40.0)
+                _max_conc_pct = _base_conc_pct  # start with base
+                _conc_boost_source = None
+
+                if technical_report.multi_timeframe and technical_report.multi_timeframe.confluence_score:
+                    _conf = technical_report.multi_timeframe.confluence_score
+                    # Boost formula: for every 0.10 above 0.70, add ~5% to the limit (capped at 65%)
+                    if _conf >= 0.70:
+                        _boost = min((_conf - 0.70) * 50, 25.0)  # max +25% boost
+                        _max_conc_pct = min(_base_conc_pct + _boost, 65.0)  # cap at 65%
+                        _conc_boost_source = f"MTF confluence {_conf:.0%}"
+                    elif _conf <= 0.40:
+                        # Weak alignment → tighten limit to 30%
+                        _max_conc_pct = 30.0
+                        _conc_boost_source = f"weak MTF confluence {_conf:.0%}"
+
+                if _conc_boost_source:
+                    logger.info(
+                        f"Dynamic concentration limit: {_base_conc_pct:.0f}% base → "
+                        f"{_max_conc_pct:.0f}% ({_conc_boost_source})"
+                    )
+
                 # ── Correlation / concentration limit ─────────────────────────
                 # Prevent piling into the same asset/direction across all agents.
-                # Settings: max 2 open positions same symbol, max 40% fund in one direction.
+                # Settings: max 2 open positions same symbol, max dynamic % fund in one direction.
                 if signal == 'buy':
-                    _all_open = await paper_trading.get_positions()
+                    _all_open = list(await trading_service.get_positions())
                     _same_sym_longs = [
                         p for p in _all_open
                         if p.symbol == symbol and p.side == OrderSide.BUY
@@ -3447,8 +4328,7 @@ class AgentScheduler:
                             signal="hold", confidence=0, price=current_price,
                             executed=False, error=_corr_reason,
                         )
-                    # Total directional concentration check
-                    _max_conc_pct = getattr(_limits, 'max_directional_concentration_pct', 40.0)
+                    # Total directional concentration check (now with dynamic limit)
                     _all_long_value = sum(
                         p.quantity * (p.current_price or p.entry_price or 0)
                         for p in _all_open if p.side == OrderSide.BUY
@@ -3459,6 +4339,8 @@ class AgentScheduler:
                             f"Directional concentration limit: adding this position would put "
                             f"{_new_long_pct:.0f}% of fund in LONG (max {_max_conc_pct:.0f}%)"
                         )
+                        if _conc_boost_source:
+                            _conc_reason += f" [dynamic: {_conc_boost_source}]"
                         logger.info(f"Concentration gate: {_conc_reason}")
                         self._record_run(agent_id, symbol, signal, confidence, current_price, False, error=_conc_reason)
                         await team_chat.log_trade_blocked(
@@ -3472,10 +4354,7 @@ class AgentScheduler:
                             executed=False, error=_conc_reason,
                         )
                 # ── End correlation limit ─────────────────────────────────────
-                
-                technical_report = await technical_analyst.analyze(symbol, timeframe=timeframe)
-                # Cache result so next agent cycle on same symbol+timeframe doesn't re-fetch
-                self._ta_cache[f"{symbol}:{timeframe}"] = (technical_report, datetime.now())
+                # (technical_report already fetched above for dynamic limits)
                 # Only veto if TA has OPPOSITE signal (not just different) with high confidence
                 ta_signal = technical_report.overall_signal
                 # Log Marcus's TA response for this symbol
@@ -3731,28 +4610,41 @@ class AgentScheduler:
                             stop_loss_price=adjusted_sl,
                             take_profit_price=adjusted_tp,
                             trailing_stop_pct=trailing_stop_pct,
+                            leverage=leverage,
+                            margin_used=margin_used,
+                            liquidation_price=liquidation_price,
                         )
                         executed = True
 
                         # ── Scale-out levels ──────────────────────────────────────────
-                        # Attach a 3-level scale-out schedule to the new position so the
-                        # SL/TP monitor can partially close as price moves toward TP.
-                        # Levels are % of the entry→TP distance, not absolute prices.
-                        #   Level 1 (33% of TP range): close 25% — lock early profit
-                        #   Level 2 (60% of TP range): close 35% — ride momentum
-                        #   Level 3 (100%, full TP):   close remaining 40% — max gain
-                        # Strategy-specific overrides tune the aggressiveness.
+                        # Scale-out profiles are strategy-specific.
+                        #
+                        # Directional strategies (momentum / trend_following / breakout / ai):
+                        #   NO early scale-outs — let the full move play out.
+                        #   The breakeven + profit-lock SL progression protects capital
+                        #   once 30%/50% of TP is reached.  Cutting early was capping
+                        #   winners at 0.5–1.8% while SL losses remained at full size,
+                        #   destroying effective R/R in practice.
+                        #
+                        # Mean-reversion + scalping:
+                        #   Price typically snaps back then reverses — take profit early.
+                        #   Two tranches reduce exposure before the inevitable reversal.
+                        #
+                        # Grid: symmetric partial exits on both sides of the range.
                         _SCALE_PROFILES: Dict[str, List] = {
                             # strategy: [(pct_of_tp, close_pct), ...]
-                            "momentum":       [(0.33, 0.25), (0.60, 0.35)],
-                            "trend_following":[(0.25, 0.20), (0.55, 0.30)],
-                            "breakout":       [(0.40, 0.30), (0.70, 0.35)],
-                            "mean_reversion": [(0.50, 0.40), (0.80, 0.35)],
-                            "scalping":       [(0.50, 0.50)],               # fast exit
-                            "grid":           [(0.40, 0.30), (0.70, 0.30)],
-                            "ai":             [(0.33, 0.25), (0.60, 0.35)],
+                            # Directional — no early exits; ride to full TP
+                            "momentum":        [],
+                            "trend_following": [],
+                            "breakout":        [],
+                            "ai":              [],
+                            # Reverting / fast — take partial profit, remainder trails
+                            "mean_reversion":  [(0.50, 0.40), (0.80, 0.35)],
+                            "scalping":        [(0.50, 0.60)],  # fast: 60% off at half-way, trail rest
+                            # Grid: symmetric partial exits
+                            "grid":            [(0.50, 0.40), (0.80, 0.35)],
                         }
-                        _scale_pairs = _SCALE_PROFILES.get(strategy_type, [(0.33, 0.25), (0.60, 0.35)])
+                        _scale_pairs = _SCALE_PROFILES.get(strategy_type, [])
                         _scale_levels = [
                             {"pct_of_tp": pct, "close_pct": cpct, "triggered": False}
                             for pct, cpct in _scale_pairs
@@ -3804,33 +4696,73 @@ class AgentScheduler:
                         )
                 elif not use_paper:
                     try:
-                        # Determine if this is a short — use contract API for shorts, spot for longs
-                        is_short_entry = signal.lower() == 'sell'
-                        if is_short_entry:
-                            # Use contract (perpetual futures) API for short positions
-                            result = await self.phemex.place_contract_order(
-                                symbol=symbol,
-                                side="sell",
-                                quantity=quantity,
-                                order_type="Market",
-                                stop_loss_price=adjusted_sl,
-                                take_profit_price=adjusted_tp,
-                            )
-                        else:
-                            result = await self.phemex.place_spot_order_with_sl_tp(
-                                symbol=symbol,
-                                side=signal,
-                                quantity=quantity,
-                                order_type="Market",
-                                price=current_price,
-                                stop_loss_price=adjusted_sl,
-                                take_profit_price=adjusted_tp,
-                            )
+                        from app.services.live_trading import live_trading as _live_svc
+                        _agent_cfg_live = self._enabled_agents.get(agent_id, {})
+                        _trader_id_live = _agent_cfg_live.get("trader_id")
+                        order = await _live_svc.place_order(
+                            symbol=symbol,
+                            side=signal,
+                            quantity=quantity,
+                            price=current_price,
+                            agent_id=agent_id,
+                            trader_id=_trader_id_live,
+                            stop_loss_price=adjusted_sl,
+                            take_profit_price=adjusted_tp,
+                            trailing_stop_pct=trailing_stop_pct,
+                            leverage=leverage,
+                            margin_used=margin_used,
+                            liquidation_price=liquidation_price,
+                        )
+                        if order is None:
+                            raise RuntimeError("live_trading.place_order returned None — check balance/price")
                         executed = True
+
+                        # ── Record traded symbol in agent history ──────────────────────
+                        try:
+                            from app.database import AsyncSessionLocal
+                            from app.models import Agent as _AgentHistModelLive
+                            async with AsyncSessionLocal() as _hist_db_live:
+                                _hist_ag_live = await _hist_db_live.get(_AgentHistModelLive, agent_id)
+                                if _hist_ag_live:
+                                    _hist_cfg_live = dict(_hist_ag_live.config) if isinstance(_hist_ag_live.config, dict) else {}
+                                    _hist_pairs_live = _hist_cfg_live.get("trading_pairs", [])
+                                    if symbol not in _hist_pairs_live:
+                                        _hist_pairs_live.append(symbol)
+                                        _hist_cfg_live["trading_pairs"] = _hist_pairs_live
+                                        _hist_ag_live.config = _hist_cfg_live
+                                        await _hist_db_live.commit()
+                        except Exception as _hist_err_live:
+                            logger.debug(f"Could not update traded pairs for {agent_id}: {_hist_err_live}")
+
+                        is_short_entry = signal.lower() == 'sell'
                         direction = "SHORT" if is_short_entry else "LONG"
                         sl_str = f"${adjusted_sl:.2f}" if adjusted_sl else "N/A"
                         tp_str = f"${adjusted_tp:.2f}" if adjusted_tp else "N/A"
                         logger.info(f"LIVE {direction} trade executed: {signal} {quantity} {symbol} @ {current_price} | SL: {sl_str} TP: {tp_str}")
+
+                        # Attach scale-out levels to live position (same schedule as paper)
+                        _live_scale_pairs = _SCALE_PROFILES.get(strategy_type, [])
+                        _live_scale_levels = [
+                            {"pct_of_tp": pct, "close_pct": cpct, "triggered": False}
+                            for pct, cpct in _live_scale_pairs
+                        ]
+                        try:
+                            from app.database import AsyncSessionLocal
+                            from app.models import Position as _PosLive
+                            async with AsyncSessionLocal() as _db:
+                                _live_pos = await _db.scalar(
+                                    select(_PosLive).where(
+                                        _PosLive.agent_id == agent_id,
+                                        _PosLive.symbol == symbol,
+                                        _PosLive.is_paper == False,  # noqa: E712
+                                    )
+                                )
+                                if _live_pos:
+                                    _live_pos.scale_out_levels = json.dumps(_live_scale_levels)
+                                    await _db.commit()
+                        except Exception as _sol_err:
+                            logger.debug(f"Live scale-out level write failed: {_sol_err}")
+
                         # Register with Alex's cycle buffer
                         execution_coordinator.record_cycle_trade(
                             agent_id=agent_id, agent_name=name, symbol=symbol,
@@ -3848,54 +4780,6 @@ class AgentScheduler:
                             symbol=symbol, side=signal, quantity=quantity, price=current_price,
                             sl_price=adjusted_sl, tp_price=adjusted_tp, is_paper=False,
                         )))
-
-                        # Record live trade in DB for tracking
-                        try:
-                            from app.database import get_async_session
-                            from app.models import Trade as DBTrade, OrderSide as DBOrderSide, OrderStatus as DBOrderStatus
-                            async with get_async_session() as db:
-                                db_trade = DBTrade(
-                                    user_id="default-user",
-                                    agent_id=agent_id,
-                                    symbol=symbol,
-                                    side=DBOrderSide.BUY if signal.lower() == "buy" else DBOrderSide.SELL,
-                                    quantity=quantity,
-                                    price=current_price,
-                                    total=quantity * current_price,
-                                    fee=quantity * current_price * 0.001,
-                                    status=DBOrderStatus.FILLED,
-                                    is_paper=False,
-                                    phemex_order_id=result.get("data", {}).get("orderID"),
-                                )
-                                db.add(db_trade)
-                                await db.commit()
-                        except Exception as db_err:
-                            logger.warning(f"Failed to record live trade in DB: {db_err}")
-
-                        # Place trailing stop for both longs and shorts
-                        if trailing_stop_pct and current_price:
-                            try:
-                                if is_short_entry:
-                                    # Short trailing: trigger side is Buy (cover), offset positive
-                                    offset = current_price * trailing_stop_pct / 100
-                                    await self.phemex.place_trailing_stop_order(
-                                        symbol=symbol,
-                                        side="Buy",
-                                        quantity=quantity,
-                                        trailing_offset=offset,
-                                    )
-                                else:
-                                    offset = -(current_price * trailing_stop_pct / 100)
-                                    await self.phemex.place_trailing_stop_order(
-                                        symbol=symbol,
-                                        side="Sell",
-                                        quantity=quantity,
-                                        trailing_offset=offset,
-                                    )
-                                logger.info(f"Trailing stop placed: {symbol} offset=${abs(offset):.2f} ({trailing_stop_pct}%)")
-                            except Exception as te:
-                                logger.warning(f"Trailing stop placement failed (non-fatal): {te}")
-
                     except Exception as e:
                         logger.error(f"LIVE trade failed: {e}", exc_info=True)
                         await team_chat.log_trade_blocked(
@@ -3919,7 +4803,7 @@ class AgentScheduler:
                         reason=_no_exec_reason,
                     )
             
-            self._record_run(agent_id, symbol, signal, confidence, current_price, executed, pnl)
+            self._record_run(agent_id, symbol, signal, confidence, current_price, executed, pnl, use_paper=use_paper)
             
             return AgentRun(
                 agent_id=agent_id,
@@ -4844,6 +5728,47 @@ class AgentScheduler:
     def get_trader_allocations(self) -> Dict[str, float]:
         """Return current trader allocation percentages."""
         return dict(self._trader_allocations)
+
+    def record_pnl_from_external_close(
+        self,
+        agent_id: str,
+        symbol: str,
+        side: str,
+        quantity: float,
+        entry_price: float,
+        exit_price: float,
+    ) -> None:
+        """
+        Called by position_sync when Phemex closes a live position server-side
+        (exchange SL/TP hit). Updates in-memory metrics + persists to DB so
+        P&L and win rates stay accurate without waiting for a scheduler restart.
+        """
+        is_long = str(side).lower() in ("buy", "long")
+        fee_rate = 0.0006  # Phemex perpetual taker fee
+        entry_fee = entry_price * quantity * fee_rate
+        exit_fee = exit_price * quantity * fee_rate
+        if is_long:
+            pnl = (exit_price - entry_price) * quantity - entry_fee - exit_fee
+        else:
+            pnl = (entry_price - exit_price) * quantity - entry_fee - exit_fee
+
+        agent_cfg = self._enabled_agents.get(agent_id, {})
+        strategy_type = agent_cfg.get("strategy_type")
+        self._record_run(
+            agent_id=agent_id,
+            symbol=symbol,
+            signal="sell" if is_long else "buy",
+            confidence=0,
+            price=exit_price,
+            executed=True,
+            pnl=round(pnl, 4),
+            strategy_type=strategy_type,
+            use_paper=False,
+        )
+        logger.info(
+            f"ExternalClose: recorded live P&L for agent={agent_id} "
+            f"{symbol} {'LONG' if is_long else 'SHORT'} P&L=${pnl:+.4f}"
+        )
 
 
 agent_scheduler = AgentScheduler()

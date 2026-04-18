@@ -78,6 +78,8 @@ class TraderAllocation:
     timestamp: datetime = field(default_factory=datetime.utcnow)
     allocations: Dict[str, float] = field(default_factory=dict)  # {trader_id: pct}
     reasoning: str = ""
+    consistency_flags: Dict[str, str] = field(default_factory=dict)  # {trader_id: flag}
+    sharpe_tiers: Dict[str, str] = field(default_factory=dict)       # {trader_id: tier}
 
 
 class TraderService:
@@ -179,13 +181,30 @@ class TraderService:
                 )
             marina_block = "\n".join(lines)
 
+        # Phase 9.2 — Pink Slip / succession context blocks
+        pink_slip_block = ""
+        if trader.get("drawdown_warning_level") == "warning":
+            from app.services.drawdown_monitor import get_pink_slip_text
+            _dd_pct = trader.get("lifetime_drawdown_pct") or 7.0
+            pink_slip_block = f"\n{get_pink_slip_text(_dd_pct)}\n"
+        elif trader.get("drawdown_warning_level") == "caution":
+            _dd_pct = trader.get("lifetime_drawdown_pct") or 5.0
+            pink_slip_block = (
+                f"\n⚠️ CAUTION: Your portfolio is down {_dd_pct:.1f}% from its peak. "
+                f"Exercise additional risk discipline — avoid new positions unless confidence ≥ 0.70.\n"
+            )
+
+        succession_block = ""
+        if config.get("succession_context"):
+            succession_block = f"\nEVOLUTION CONTEXT FROM PREDECESSOR:\n{config['succession_context']}\n"
+
         prompt = f"""You are Trader "{trader['name']}", a competing portfolio trader in a hedge fund.
 
 YOUR TRADING STYLE: {config.get('style', 'Balanced approach')}
 YOUR RISK TOLERANCE: {config.get('risk_tolerance', 'moderate')}
 YOUR PREFERRED STRATEGIES: {config.get('preferred_strategies', ['momentum'])}
 YOUR CAPITAL ALLOCATION: {trader.get('allocation_pct', 33.3):.1f}% of fund
-
+{pink_slip_block}{succession_block}
 MARKET CONDITIONS:
   Trend: {market_condition.get('trend', '?')}
   Volatility: {market_condition.get('volatility', '?')}
@@ -342,11 +361,19 @@ If no changes needed, return {{"actions": [], "reasoning": "All agents performin
         all_agents: List[dict],
         all_metrics: List[dict],
         total_capital: float,
+        is_paper: bool = True,
     ) -> TraderAllocation:
         """
         Fund Manager decides how to allocate capital across traders
         based on their aggregate performance.
+
+        Phase 9.1 additions:
+        - Consistency score (15% weight) replaces the flat 0.15 floor
+        - 40% Rule: INCONSISTENT traders cannot receive a capital increase
+        - Sharpe gating: multiplier applied post-allocation (0.7 / 1.0 / 1.3)
         """
+        from app.services.consistency_scorer import compute_consistency
+
         trader_perfs = []
         for t in traders:
             if not t.get("is_enabled", True):
@@ -358,15 +385,56 @@ If no changes needed, return {{"actions": [], "reasoning": "All agents performin
         if not trader_perfs:
             return TraderAllocation(reasoning="No enabled traders")
 
-        # Performance-weighted allocation with min/max bounds
+        # ── Fetch consistency scores for all traders concurrently ─────────
+        import asyncio
+        consistency_map = {}
+        tasks = [
+            compute_consistency(
+                p.trader_id,
+                [a["id"] for a in all_agents if a.get("trader_id") == p.trader_id],
+                is_paper=is_paper,
+            )
+            for p in trader_perfs
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for p, res in zip(trader_perfs, results):
+            if isinstance(res, Exception):
+                logger.warning(f"Consistency scorer failed for {p.trader_id}: {res}")
+                from app.services.consistency_scorer import ConsistencyResult
+                consistency_map[p.trader_id] = ConsistencyResult(
+                    trader_id=p.trader_id, consistency_score=0.5,
+                    consistency_flag="INSUFFICIENT_DATA",
+                    max_single_trade_pnl=0, total_pnl=0, offending_trade_pct=0,
+                    sharpe=0, sharpe_tier="medium", sharpe_multiplier=1.0, trade_count=0,
+                )
+            else:
+                consistency_map[p.trader_id] = res
+
+        # ── Performance-weighted scoring (40% WR, 40% PnL contribution, 15% consistency, 5% floor) ──
         scores = {}
+        
+        # Calculate total P&L across all traders to find contribution ratio
+        total_pnl_all = sum(max(p.total_pnl or 0, 0) for p in trader_perfs)
+        
         for p in trader_perfs:
-            pnl_score = min(max(p.total_pnl / 500 + 0.5, 0), 1.0)
             wr_score = p.win_rate
-            trade_count_bonus = min(p.total_trades / 50, 0.2)
+            
+            # P&L contribution: actual ratio of this trader's P&L to total
+            # If Otto made $268 out of $352 total gross = 76% contribution
+            trader_pnl = max(p.total_pnl or 0, 0)
+            if total_pnl_all > 0:
+                pnl_contribution = trader_pnl / total_pnl_all
+            else:
+                pnl_contribution = 0.5  # Neutral if no positive P&L yet
+            
+            cr = consistency_map[p.trader_id]
+            consistency_score = cr.consistency_score
+            
+            # Score: 40% win_rate + 40% P&L contribution + 15% consistency + 5% floor
+            # High-P&L traders like Otto get significant boost
             scores[p.trader_id] = max(
-                wr_score * 0.5 + pnl_score * 0.35 + trade_count_bonus + 0.15,
-                0.1,
+                wr_score * 0.40 + pnl_contribution * 0.40 + consistency_score * 0.15,
+                0.05,
             )
 
         total_score = sum(scores.values())
@@ -380,17 +448,48 @@ If no changes needed, return {{"actions": [], "reasoning": "All agents performin
         total_clamped = sum(clamped.values())
         allocations = {tid: pct / total_clamped * 100 for tid, pct in clamped.items()}
 
+        # ── 9.1 Hard rules ────────────────────────────────────────────────
+        prev_allocs = {t["id"]: t.get("allocation_pct", 33.3) for t in traders}
+        for tid, cr in consistency_map.items():
+            if tid not in allocations:
+                continue
+            proposed = allocations[tid]
+            prev = prev_allocs.get(tid, 33.3)
+
+            # 40% Rule: block capital increase for INCONSISTENT traders
+            if cr.consistency_flag == "INCONSISTENT":
+                allocations[tid] = min(proposed, prev)
+                logger.info(
+                    f"9.1 Consistency gate: {tid[:8]} flagged INCONSISTENT — "
+                    f"capital increase blocked (capped at {prev:.1f}%)"
+                )
+
+            # Sharpe gate: apply multiplier then re-clamp
+            allocations[tid] = max(
+                self.MIN_ALLOCATION_PCT,
+                min(self.MAX_ALLOCATION_PCT, allocations[tid] * cr.sharpe_multiplier),
+            )
+
+        # Re-normalize after hard-rule adjustments
+        total_adj = sum(allocations.values())
+        if total_adj > 0:
+            allocations = {tid: pct / total_adj * 100 for tid, pct in allocations.items()}
+
         reasoning_parts = []
         for p in trader_perfs:
+            cr = consistency_map[p.trader_id]
             reasoning_parts.append(
                 f"{p.trader_name}: P&L=${p.total_pnl:+.2f}, "
-                f"WR={p.win_rate:.0%}, trades={p.total_trades} → "
+                f"WR={p.win_rate:.0%}, trades={p.total_trades}, "
+                f"consistency={cr.consistency_flag}, sharpe={cr.sharpe:.2f} ({cr.sharpe_tier}) → "
                 f"{allocations.get(p.trader_id, 0):.1f}%"
             )
 
         return TraderAllocation(
             allocations=allocations,
-            reasoning="Performance-weighted: " + "; ".join(reasoning_parts),
+            reasoning="Performance-weighted (9.1): " + "; ".join(reasoning_parts),
+            consistency_flags={tid: cr.consistency_flag for tid, cr in consistency_map.items()},
+            sharpe_tiers={tid: cr.sharpe_tier for tid, cr in consistency_map.items()},
         )
 
     # ── Seed default traders ─────────────────────────────────────────────
@@ -432,6 +531,9 @@ If no changes needed, return {{"actions": [], "reasoning": "All agents performin
                     "is_enabled": t.is_enabled,
                     "config": t.config or {},
                     "performance_metrics": t.performance_metrics or {},
+                    "drawdown_warning_level": t.drawdown_warning_level,
+                    "lifetime_drawdown_pct": t.lifetime_drawdown_pct,
+                    "successor_of": t.successor_of,
                 }
                 for t in existing
             ]
@@ -465,6 +567,9 @@ If no changes needed, return {{"actions": [], "reasoning": "All agents performin
                 "is_enabled": t.is_enabled,
                 "config": t.config or {},
                 "performance_metrics": t.performance_metrics or {},
+                "drawdown_warning_level": t.drawdown_warning_level,
+                "lifetime_drawdown_pct": t.lifetime_drawdown_pct,
+                "successor_of": t.successor_of,
             }
             for t in created
         ]

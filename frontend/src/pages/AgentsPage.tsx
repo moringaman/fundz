@@ -88,7 +88,6 @@ export function AgentsPage() {
   const [formData, setFormData] = useState({
     name: '',
     strategy_type: 'momentum',
-    trading_pairs: [selectedSymbol],
     allocation_percentage: 10,
     max_position_size: 0.1,
     risk_limit: 2.0,
@@ -106,7 +105,6 @@ export function AgentsPage() {
         agent_id: agent.id,
         name: agent.name,
         strategy_type: agent.strategy_type,
-        trading_pairs: agent.trading_pairs,
         allocation_percentage: agent.allocation_percentage,
         max_position_size: agent.max_position_size,
         stop_loss_pct: agent.stop_loss_pct || 2.0,
@@ -131,7 +129,6 @@ export function AgentsPage() {
       setFormData({
         name: '',
         strategy_type: 'momentum',
-        trading_pairs: [selectedSymbol],
         allocation_percentage: 10,
         max_position_size: 0.1,
         risk_limit: 2.0,
@@ -196,7 +193,6 @@ export function AgentsPage() {
     setFormData({
       name: agent.name,
       strategy_type: agent.strategy_type,
-      trading_pairs: agent.trading_pairs,
       allocation_percentage: agent.allocation_percentage,
       max_position_size: agent.max_position_size,
       risk_limit: agent.risk_limit,
@@ -233,22 +229,6 @@ export function AgentsPage() {
       ];
 
   const currentStrategyDef = strategies.find((s) => s.value === formData.strategy_type);
-
-  const availablePairs = [
-    'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'ADAUSDT',
-    'DOGEUSDT', 'AVAXUSDT', 'DOTUSDT', 'MATICUSDT', 'LINKUSDT',
-    'BNBUSDT', 'LTCUSDT',
-  ];
-
-  const togglePair = (pair: string) => {
-    setFormData((prev) => {
-      const has = prev.trading_pairs.includes(pair);
-      const next = has
-        ? prev.trading_pairs.filter((p) => p !== pair)
-        : [...prev.trading_pairs, pair];
-      return { ...prev, trading_pairs: next.length > 0 ? next : prev.trading_pairs };
-    });
-  };
 
   const intervals = [
     { value: 300, label: '5 min' },
@@ -409,29 +389,6 @@ export function AgentsPage() {
                   <span className="strategy-label" style={{ fontSize: '.75rem' }}>{tf}</span>
                 </label>
               ))}
-            </div>
-          </div>
-
-          <div className="form-group">
-            <label className="form-label">Trading Pairs</label>
-            <div className="pair-pills-grid">
-              {availablePairs.map((pair) => {
-                const isSelected = formData.trading_pairs.includes(pair);
-                return (
-                  <button
-                    key={pair}
-                    type="button"
-                    className={`pair-pill ${isSelected ? 'pair-pill-selected' : ''}`}
-                    onClick={() => togglePair(pair)}
-                  >
-                    {pair.replace('USDT', '')}
-                    {isSelected && <span className="pair-pill-check">✓</span>}
-                  </button>
-                );
-              })}
-            </div>
-            <div className="pair-selection-summary">
-              {formData.trading_pairs.length} pair{formData.trading_pairs.length !== 1 ? 's' : ''} selected: {formData.trading_pairs.join(', ')}
             </div>
           </div>
 
@@ -616,29 +573,6 @@ export function AgentsPage() {
                   </div>
 
                   <div className="form-group">
-                    <label className="form-label">Trading Pairs</label>
-                    <div className="pair-pills-grid">
-                      {availablePairs.map((pair) => {
-                        const isSelected = formData.trading_pairs.includes(pair);
-                        return (
-                          <button
-                            key={pair}
-                            type="button"
-                            className={`pair-pill ${isSelected ? 'pair-pill-selected' : ''}`}
-                            onClick={() => togglePair(pair)}
-                          >
-                            {pair.replace('USDT', '')}
-                            {isSelected && <span className="pair-pill-check">✓</span>}
-                          </button>
-                        );
-                      })}
-                    </div>
-                    <div className="pair-selection-summary">
-                      {formData.trading_pairs.length} pair{formData.trading_pairs.length !== 1 ? 's' : ''} selected
-                    </div>
-                  </div>
-
-                  <div className="form-group">
                     <label className="form-label">Capital Allocation: {formData.allocation_percentage}%</label>
                     <input
                       type="range"
@@ -782,8 +716,10 @@ export function AgentsPage() {
                   </div>
                   <div className="agent-details">
                     <div className="detail-row">
-                      <span className="detail-label">Pairs</span>
-                      <span className="detail-value">{agent.trading_pairs.join(', ')}</span>
+                      <span className="detail-label">Traded Pairs</span>
+                      <span className="detail-value" style={{ color: (agent.trading_pairs ?? []).length === 0 ? 'var(--text-muted)' : undefined }}>
+                        {(agent.trading_pairs ?? []).length > 0 ? agent.trading_pairs.map((p: string) => p.replace('USDT', '')).join(', ') : 'None yet'}
+                      </span>
                     </div>
                     <div className="detail-row">
                       <span className="detail-label">Allocation</span>
@@ -1019,7 +955,7 @@ export function AgentsPage() {
                     <button
                       type="button"
                       className="backtest-btn"
-                      onClick={() => runBacktest(agent.id, agent.trading_pairs[0], agent.timeframe || '1h')}
+                      onClick={() => runBacktest(agent.id, (agent.trading_pairs ?? [])[0] || 'BTCUSDT', agent.timeframe || '1h')}
                       disabled={backtestLoading === agent.id}
                     >
                       {backtestLoading === agent.id ? 'Running...' : 'Backtest'}

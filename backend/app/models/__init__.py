@@ -72,10 +72,34 @@ class Trader(Base):
     is_enabled = Column(Boolean, default=True)
     config = Column(JSON, default=dict)
     performance_metrics = Column(JSON, default=dict)
+    # Phase 9.2 — Drawdown tracking
+    lifetime_peak_balance = Column(Float, nullable=True)         # highest cumulative PnL ever reached
+    lifetime_drawdown_pct = Column(Float, nullable=True)         # current drawdown from peak (positive = drawdown)
+    drawdown_warning_level = Column(String(20), nullable=True)   # None | "caution" | "warning" | "terminated"
+    successor_of = Column(String(36), nullable=True)             # trader_id this was spawned from
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     agents = relationship("Agent", back_populates="trader", cascade="all, delete-orphan")
+
+
+class TraderLegacy(Base):
+    """Snapshot of a terminated trader — preserved for lineage and evolutionary learning."""
+    __tablename__ = "trader_legacies"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    original_trader_id = Column(String(36), nullable=False)
+    name = Column(String(100), nullable=False)
+    llm_model = Column(String(150), nullable=False)
+    total_pnl = Column(Float, default=0.0)
+    total_trades = Column(Integer, default=0)
+    win_rate = Column(Float, default=0.0)
+    lifetime_peak_balance = Column(Float, nullable=True)
+    lifetime_drawdown_pct = Column(Float, nullable=True)
+    termination_reason = Column(Text, nullable=True)
+    worst_trades_summary = Column(Text, nullable=True)  # LLM-generated "What Not To Do" from 5 worst trades
+    config_snapshot = Column(JSON, default=dict)
+    terminated_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
 class Agent(Base):
@@ -162,6 +186,8 @@ class Trade(Base):
     price = Column(Float, nullable=False)
     total = Column(Float, nullable=False)
     fee = Column(Float, default=0.0)
+    leverage = Column(Float, default=1.0)
+    margin_used = Column(Float, default=0.0)
     status = Column(Enum(OrderStatus), default=OrderStatus.PENDING)
     phemex_order_id = Column(String(100), nullable=True)
     is_paper = Column(Boolean, default=True)
@@ -185,6 +211,9 @@ class Position(Base):
     current_price = Column(Float, nullable=True)
     unrealized_pnl = Column(Float, default=0.0)
     realized_pnl = Column(Float, default=0.0)
+    leverage = Column(Float, default=1.0)
+    margin_used = Column(Float, default=0.0)
+    liquidation_price = Column(Float, nullable=True)
     stop_loss_price = Column(Float, nullable=True)
     take_profit_price = Column(Float, nullable=True)
     highest_price = Column(Float, nullable=True)
@@ -633,6 +662,7 @@ class GridState(Base):
     regime_atr = Column(Float, nullable=True)       # ATR at creation (drift baseline)
 
     # Financial tracking
+    initial_capital = Column(Float, nullable=True)  # capital allocated at creation (for rebalance qty calc)
     total_invested = Column(Float, default=0.0)    # capital currently deployed
     realized_pnl = Column(Float, default=0.0)      # closed-level profits
     cancel_reason = Column(Text, nullable=True)    # populated when cancelled

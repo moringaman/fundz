@@ -51,6 +51,8 @@ class TradeResponse(BaseModel):
     price: float
     total: float
     fee: float
+    leverage: float = 1.0
+    margin_used: float = 0.0
     status: str
     created_at: str
     phemex_order_id: Optional[str] = None
@@ -74,6 +76,8 @@ class PositionResponse(BaseModel):
     agent_name: Optional[str] = None
     opened_at: Optional[datetime] = None
     margin_type: Optional[str] = 'cross'  # or 'isolated'
+    leverage: Optional[float] = 1.0
+    margin_used: Optional[float] = None
     liquidation_price: Optional[float] = None
     risk_level: Optional[str] = None
 
@@ -87,6 +91,8 @@ def trade_to_response(db_trade: DBTrade) -> TradeResponse:
         price=db_trade.price,
         total=db_trade.total,
         fee=db_trade.fee,
+        leverage=db_trade.leverage or 1.0,
+        margin_used=db_trade.margin_used or 0.0,
         status=db_trade.status.value,
         created_at=db_trade.created_at.isoformat() if db_trade.created_at else "",
         phemex_order_id=db_trade.phemex_order_id

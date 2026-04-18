@@ -49,6 +49,67 @@ function WinBar({ rate }: { rate: number }) {
   );
 }
 
+const CONSISTENCY_STYLES: Record<string, { bg: string; border: string; color: string; label: string }> = {
+  CONSISTENT:        { bg: 'rgba(0,230,118,.08)',  border: 'rgba(0,230,118,.3)',  color: 'var(--green)', label: '✓ CONSISTENT' },
+  INCONSISTENT:      { bg: 'rgba(255,59,48,.08)',  border: 'rgba(255,59,48,.35)', color: 'var(--red)',   label: '⚠ INCONSISTENT' },
+  INSUFFICIENT_DATA: { bg: 'var(--bg-hover)',       border: 'var(--border)',       color: 'var(--text-dim)', label: '— N/A' },
+};
+const SHARPE_STYLES: Record<string, { color: string; label: string }> = {
+  high:   { color: 'var(--green)', label: '▲ Sharpe' },
+  medium: { color: 'var(--amber)', label: '— Sharpe' },
+  low:    { color: 'var(--red)',   label: '▼ Sharpe' },
+};
+
+function ConsistencyBadge({ flag, score, sharpe, sharpeTier }: {
+  flag: string; score: number; sharpe: number; sharpeTier: string;
+}) {
+  const cs = CONSISTENCY_STYLES[flag] || CONSISTENCY_STYLES.INSUFFICIENT_DATA;
+  const ss = SHARPE_STYLES[sharpeTier] || SHARPE_STYLES.medium;
+  return (
+    <div style={{ display: 'flex', gap: '.3rem', flexWrap: 'wrap' }}>
+      <span
+        title={flag === 'INCONSISTENT' ? 'A single trade > 40% of period profit — capital increase blocked' : `Consistency score: ${(score * 100).toFixed(0)}%`}
+        style={{
+          fontSize: '.54rem', fontFamily: 'var(--mono)', padding: '.2rem .45rem',
+          background: cs.bg, border: `1px solid ${cs.border}`, color: cs.color,
+          letterSpacing: '.06em', cursor: 'default',
+        }}
+      >{cs.label}</span>
+      {sharpeTier !== undefined && (
+        <span
+          title={`Rolling Sharpe: ${sharpe.toFixed(2)}`}
+          style={{
+            fontSize: '.54rem', fontFamily: 'var(--mono)', padding: '.2rem .45rem',
+            background: 'var(--bg-hover)', border: '1px solid var(--border)',
+            color: ss.color, letterSpacing: '.06em', cursor: 'default',
+          }}
+        >{ss.label} {sharpe.toFixed(2)}</span>
+      )}
+    </div>
+  );
+}
+
+const DRAWDOWN_STYLES: Record<string, { icon: string; color: string; border: string; bg: string }> = {
+  caution:    { icon: '⚠️', color: 'var(--amber)', border: 'rgba(255,176,0,.3)',  bg: 'rgba(255,176,0,.07)' },
+  warning:    { icon: '💀', color: 'var(--red)',   border: 'rgba(255,59,48,.35)', bg: 'rgba(255,59,48,.08)' },
+  terminated: { icon: '🔴', color: 'var(--text-dim)', border: 'var(--border)',    bg: 'var(--bg-hover)' },
+};
+
+function DrawdownBadge({ level, drawdownPct }: { level: string; drawdownPct?: number }) {
+  const s = DRAWDOWN_STYLES[level];
+  if (!s) return null;
+  return (
+    <span
+      title={`Drawdown warning: ${level.toUpperCase()}${drawdownPct != null ? ` (${drawdownPct.toFixed(1)}% from peak)` : ''}`}
+      style={{
+        fontSize: '.54rem', fontFamily: 'var(--mono)', padding: '.2rem .45rem',
+        background: s.bg, border: `1px solid ${s.border}`, color: s.color,
+        letterSpacing: '.06em', cursor: 'default',
+      }}
+    >{s.icon} {level.toUpperCase()}</span>
+  );
+}
+
 export function TradersPage() {
   const { data: leaderboard = [], isPending: tradersLoading } = useTraderLeaderboard();
   const { data: tradersData = [] } = useTraders();
@@ -191,6 +252,25 @@ export function TradersPage() {
                   }}>{s}</span>
                 ))}
               </div>
+
+              {/* 9.1 Consistency & Sharpe badges */}
+              {(t.consistency_flag || t.sharpe_tier) && (
+                <div style={{ marginTop: '.4rem' }}>
+                  <ConsistencyBadge
+                    flag={t.consistency_flag || 'INSUFFICIENT_DATA'}
+                    score={t.consistency_score ?? 0.5}
+                    sharpe={t.sharpe ?? 0}
+                    sharpeTier={t.sharpe_tier || 'medium'}
+                  />
+                </div>
+              )}
+
+              {/* 9.2 Drawdown warning badge */}
+              {t.drawdown_warning_level && (
+                <div style={{ marginTop: '.3rem' }}>
+                  <DrawdownBadge level={t.drawdown_warning_level} drawdownPct={t.lifetime_drawdown_pct} />
+                </div>
+              )}
             </button>
           );
         })}
@@ -240,6 +320,20 @@ export function TradersPage() {
                     <span style={{ fontFamily: 'var(--mono)', fontSize: '.6rem', color: selectedTrader.is_enabled ? 'var(--green)' : 'var(--text-dim)', padding: '.18rem .45rem', border: `1px solid ${selectedTrader.is_enabled ? 'rgba(0,230,118,.2)' : 'var(--border)'}` }}>
                       {selectedTrader.is_enabled ? '● ACTIVE' : '○ INACTIVE'}
                     </span>
+                    {selectedTrader.consistency_flag && (
+                      <ConsistencyBadge
+                        flag={selectedTrader.consistency_flag}
+                        score={selectedTrader.consistency_score ?? 0.5}
+                        sharpe={selectedTrader.sharpe ?? 0}
+                        sharpeTier={selectedTrader.sharpe_tier || 'medium'}
+                      />
+                    )}
+                    {selectedTrader.drawdown_warning_level && (
+                      <DrawdownBadge
+                        level={selectedTrader.drawdown_warning_level}
+                        drawdownPct={selectedTrader.lifetime_drawdown_pct}
+                      />
+                    )}
                   </div>
                 </div>
               </div>
@@ -251,6 +345,17 @@ export function TradersPage() {
                   <p style={{ fontSize: '.78rem', color: 'var(--text-secondary)', lineHeight: 1.7, padding: '.65rem .75rem', background: 'var(--bg-hover)', borderLeft: '2px solid var(--accent)' }}>
                     {cfg.bio}
                   </p>
+                </div>
+              )}
+
+              {/* 9.2 Evolution lineage */}
+              {selectedTrader.successor_of && (
+                <div style={{
+                  fontSize: '.72rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)',
+                  padding: '.45rem .65rem', background: 'var(--bg-hover)',
+                  border: '1px solid var(--border)', borderLeft: '2px solid var(--amber)',
+                }}>
+                  🌱 Successor trader — replaced a terminated predecessor
                 </div>
               )}
 

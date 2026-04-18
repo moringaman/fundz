@@ -22,7 +22,9 @@ class BacktestRequest(BaseModel):
     slippage_pct: float = 0.02
     use_trailing_stop: bool = False
     trailing_stop_pct: float = 0.03
-    candle_limit: int = 500
+    # EXPANDED candle limit from 500 to 3000 for API requests (users can still request more)
+    # 3000 candles: ~125 days on 1h, ~20 days on 15m, ~500 days on 4h
+    candle_limit: int = 3000
     agent_id: Optional[str] = None
 
 

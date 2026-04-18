@@ -75,7 +75,7 @@ class PaperTradingService:
                     PaperBalance.asset == asset,
                 )
             )
-            bal = result.scalar_one_or_none()
+            bal = result.scalars().first()
             if bal is None:
                 if amount < 0:
                     raise ValueError(f"No {asset} balance exists to withdraw from")
@@ -112,6 +112,9 @@ class PaperTradingService:
         stop_loss_price: Optional[float] = None,
         take_profit_price: Optional[float] = None,
         trailing_stop_pct: Optional[float] = None,
+        leverage: float = 1.0,
+        margin_used: Optional[float] = None,
+        liquidation_price: Optional[float] = None,
     ):
         """Place a paper trading order using real market price when price is omitted."""
         if not self._enabled:
@@ -157,6 +160,8 @@ class PaperTradingService:
 
             notional = quantity * price
             fee = notional * self.fee_rate_for(symbol)
+            leverage = max(float(leverage or 1.0), 1.0)
+            effective_margin = margin_used if margin_used is not None else (notional / leverage)
 
             order = PaperOrder(
                 id=str(uuid.uuid4()),
@@ -169,6 +174,8 @@ class PaperTradingService:
                 price=price,
                 total=notional,
                 fee=fee,
+                leverage=leverage,
+                margin_used=effective_margin,
                 status=OrderStatus.FILLED,
                 is_paper=True,
                 created_at=datetime.now(),
@@ -192,16 +199,21 @@ class PaperTradingService:
                 if short_position:
                     # Closing (covering) a short position
                     close_qty = min(quantity, short_position.quantity)
-                    # Short P&L: entry(sell) - exit(buy)
-                    realized = (short_position.entry_price - price) * close_qty
-                    # Net cost is only the loss (if any) — margin from original short is returned
-                    net_cost = max(-realized, 0)  # positive when trade lost money
-                    if usdt_balance.available < net_cost:
-                        raise ValueError(
-                            f"Insufficient USDT balance to cover short loss: need {net_cost:.2f}, have {usdt_balance.available:.2f}"
-                        )
-                    # Apply net settlement: return margin + realized P&L
-                    usdt_balance.available += realized  # positive if profitable, negative if loss
+                    if (short_position.leverage or 1.0) > 1.0 or (short_position.margin_used or 0.0) > 0:
+                        close_ratio = close_qty / max(short_position.quantity, 1e-12)
+                        margin_release = (short_position.margin_used or 0.0) * close_ratio
+                        # Fee already deducted at the top of place_order — do not subtract again here
+                        realized = (short_position.entry_price - price) * close_qty
+                        usdt_balance.available += margin_release + realized
+                        short_position.margin_used = max((short_position.margin_used or 0.0) - margin_release, 0.0)
+                    else:
+                        realized = (short_position.entry_price - price) * close_qty
+                        net_cost = max(-realized, 0)
+                        if usdt_balance.available < net_cost:
+                            raise ValueError(
+                                f"Insufficient USDT balance to cover short loss: need {net_cost:.2f}, have {usdt_balance.available:.2f}"
+                            )
+                        usdt_balance.available += realized
 
                     if short_position.quantity <= close_qty + 1e-12:
                         await db.delete(short_position)
@@ -219,7 +231,7 @@ class PaperTradingService:
                     # If buy quantity exceeds short, open a long with remainder
                     remainder = quantity - close_qty
                     if remainder > 1e-12:
-                        extra_cost = remainder * price
+                        extra_cost = (remainder * price) / leverage if leverage > 1.0 else remainder * price
                         if usdt_balance.available < extra_cost:
                             # Just close the short, skip remainder
                             await db.commit()
@@ -235,6 +247,9 @@ class PaperTradingService:
                             current_price=price,
                             unrealized_pnl=0.0,
                             realized_pnl=0.0,
+                            leverage=leverage,
+                            margin_used=extra_cost,
+                            liquidation_price=liquidation_price,
                             stop_loss_price=stop_loss_price,
                             take_profit_price=take_profit_price,
                             highest_price=price,
@@ -244,7 +259,7 @@ class PaperTradingService:
                         db.add(new_pos)
                 else:
                     # Opening / adding to a LONG position
-                    cost = quantity * price
+                    cost = effective_margin if leverage > 1.0 else quantity * price
                     if usdt_balance.available < cost:
                         raise ValueError(
                             f"Insufficient USDT balance: need {cost:.2f}, have {usdt_balance.available:.2f}"
@@ -266,6 +281,9 @@ class PaperTradingService:
                         ) / total_qty
                         position.quantity = total_qty
                         position.current_price = price
+                        position.leverage = max(float(position.leverage or 1.0), leverage)
+                        position.margin_used = float(position.margin_used or 0.0) + cost
+                        position.liquidation_price = liquidation_price or position.liquidation_price
                         if position.highest_price is None or price > position.highest_price:
                             position.highest_price = price
                         if stop_loss_price is not None:
@@ -285,6 +303,9 @@ class PaperTradingService:
                             current_price=price,
                             unrealized_pnl=0.0,
                             realized_pnl=0.0,
+                            leverage=leverage,
+                            margin_used=cost,
+                            liquidation_price=liquidation_price,
                             stop_loss_price=stop_loss_price,
                             take_profit_price=take_profit_price,
                             highest_price=price,
@@ -305,8 +326,16 @@ class PaperTradingService:
                 )
                 if long_position and long_position.quantity >= quantity - 1e-12:
                     # Closing a long position
-                    realized = (price - long_position.entry_price) * quantity
-                    usdt_balance.available += quantity * price
+                    if (long_position.leverage or 1.0) > 1.0 or (long_position.margin_used or 0.0) > 0:
+                        close_ratio = quantity / max(long_position.quantity, 1e-12)
+                        margin_release = (long_position.margin_used or 0.0) * close_ratio
+                        # Fee already deducted at the top of place_order — do not subtract again here
+                        realized = (price - long_position.entry_price) * quantity
+                        usdt_balance.available += margin_release + realized
+                        long_position.margin_used = max((long_position.margin_used or 0.0) - margin_release, 0.0)
+                    else:
+                        realized = (price - long_position.entry_price) * quantity
+                        usdt_balance.available += quantity * price
 
                     if long_position.quantity <= quantity + 1e-12:
                         await db.delete(long_position)
@@ -323,7 +352,7 @@ class PaperTradingService:
                 else:
                     # Opening / adding to a SHORT position
                     # Margin requirement: lock USDT equal to position value
-                    margin = quantity * price
+                    margin = effective_margin if leverage > 1.0 else quantity * price
                     if usdt_balance.available < margin:
                         raise ValueError(
                             f"Insufficient USDT margin for short: need {margin:.2f}, have {usdt_balance.available:.2f}"
@@ -360,6 +389,9 @@ class PaperTradingService:
                             ) / total_qty
                             short_pos.quantity = total_qty
                             short_pos.current_price = price
+                            short_pos.leverage = max(float(short_pos.leverage or 1.0), leverage)
+                            short_pos.margin_used = float(short_pos.margin_used or 0.0) + margin
+                            short_pos.liquidation_price = liquidation_price or short_pos.liquidation_price
                             # For shorts, lowest_price is the watermark (stored in highest_price field)
                             if short_pos.highest_price is None or price < short_pos.highest_price:
                                 short_pos.highest_price = price
@@ -380,6 +412,9 @@ class PaperTradingService:
                                 current_price=price,
                                 unrealized_pnl=0.0,
                                 realized_pnl=0.0,
+                                leverage=leverage,
+                                margin_used=margin,
+                                liquidation_price=liquidation_price,
                                 stop_loss_price=stop_loss_price,
                                 take_profit_price=take_profit_price,
                                 highest_price=price,  # lowest price watermark for shorts
@@ -528,6 +563,9 @@ class PaperTradingService:
                 "sl_below_entry": sl_below_entry,
                 "pnl_at_sl": pnl_at_sl,
                 "sl_danger": sl_danger,
+                "leverage": getattr(pos, 'leverage', 1.0) or 1.0,
+                "margin_used": getattr(pos, 'margin_used', None),
+                "liquidation_price": getattr(pos, 'liquidation_price', None),
                 "highest_price": getattr(pos, 'highest_price', None),
                 "trailing_stop_pct": getattr(pos, 'trailing_stop_pct', None),
                 "updated_at": pos.updated_at.isoformat() if pos.updated_at else None,
@@ -642,6 +680,7 @@ class PaperTradingService:
             "entry_price": entry,
             "exit_price": current_price,
             "pnl": round(pnl, 4),
+            "leverage": getattr(pos, 'leverage', 1.0) or 1.0,
             "order": order,
         }
 
@@ -696,8 +735,14 @@ class PaperTradingService:
             net_pnl = raw_pnl - close_fee - entry_fee
 
             # Reduce position quantity and accumulate realized P&L
+            original_quantity = pos.quantity
             pos.quantity -= qty_to_close
             pos.realized_pnl = (pos.realized_pnl or 0.0) + net_pnl
+            margin_release = 0.0
+            if (pos.leverage or 1.0) > 1.0 or (pos.margin_used or 0.0) > 0:
+                close_ratio = qty_to_close / max(original_quantity, 1e-12)
+                margin_release = (pos.margin_used or 0.0) * close_ratio
+                pos.margin_used = max((pos.margin_used or 0.0) - margin_release, 0.0)
 
             # Credit USDT balance with the proceeds from closing this slice
             usdt_balance = await db.scalar(
@@ -707,7 +752,10 @@ class PaperTradingService:
                 )
             )
             if usdt_balance is not None:
-                usdt_balance.available += qty_to_close * price - close_fee
+                if (pos.leverage or 1.0) > 1.0 or margin_release > 0:
+                    usdt_balance.available += margin_release + raw_pnl - close_fee
+                else:
+                    usdt_balance.available += qty_to_close * price - close_fee
 
             # Write an audit trade record
             close_side = OrderSide.SELL if is_long else OrderSide.BUY
@@ -722,6 +770,8 @@ class PaperTradingService:
                 price=price,
                 total=qty_to_close * price,
                 fee=close_fee,
+                leverage=pos.leverage or 1.0,
+                margin_used=margin_release,
                 status=OrderStatus.FILLED,
                 is_paper=True,
                 phemex_order_id=f"{label}-{str(_uuid.uuid4())[:8]}",
@@ -1019,8 +1069,16 @@ class PaperTradingService:
             else:
                 unrealized_pnl += (current_price - entry) * qty
 
-        # Total fees paid across all filled orders
+        # Total fees paid across all filled orders (lifetime)
         total_fees = sum(o.fee or 0 for o in orders)
+
+        # UTC-day paid fees for daily budget tracking
+        utc_today = datetime.utcnow().date()
+        daily_fees_paid = sum(
+            (o.fee or 0)
+            for o in orders
+            if o.created_at and o.created_at.date() == utc_today
+        )
 
         # Estimated exit fees for open positions (not yet paid)
         open_exit_fees = 0.0
@@ -1033,6 +1091,8 @@ class PaperTradingService:
             "realized_pnl": closed_pnl,
             "unrealized_pnl": unrealized_pnl - open_exit_fees,
             "total_fees": total_fees + open_exit_fees,
+            "daily_fees_paid": daily_fees_paid,
+            "daily_fees_with_estimated_exit": daily_fees_paid + open_exit_fees,
             "buy_volume": buy_volume,
             "sell_volume": sell_volume,
             "trade_count": len(orders),

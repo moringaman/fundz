@@ -1,5 +1,6 @@
+import { useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { ArrowUpRight, ArrowDownRight, Minus, HelpCircle, RotateCcw, Wallet, Users, Shield } from 'lucide-react';
+import { ArrowUpRight, ArrowDownRight, Minus, HelpCircle, RotateCcw, Wallet, Users, Shield, Zap, ZapOff } from 'lucide-react';
 import { useAppSelector, useAppDispatch } from '../store/hooks';
 import { setSelectedSymbol } from '../store/slices/marketSlice';
 import { paperApi } from '../lib/api';
@@ -7,18 +8,23 @@ import { formatPrice } from '../utils/formatPrice';
 import {
   usePaperStatus,
   usePaperPnl,
+  usePaperOrders,
+  useClosedTrades,
   usePaperPortfolio,
+  useSettings,
   useAgents,
   useAutomationMetrics,
   useAutomationRuns,
   useFundTeamStatus,
   useTraderLeaderboard,
   useTradingPairs,
+  useGateAutopilot,
 } from '../hooks/useQueries';
 import { WsIndicator } from '../components/common/WsIndicator';
 import { MiniChart } from '../components/common/MiniChart';
 import { PerformanceCharts } from '../components/PerformanceCharts';
 import { WhaleIntelligencePanel } from '../components/WhaleIntelligencePanel';
+import PositionsTableComponent from '../components/PositionsTable';
 import { timeAgo } from '../utils/timeAgo';
 import { Skeleton, SkeletonCard, SkeletonChart, SkeletonRows, SkeletonStats } from '../components/common/Skeleton';
 
@@ -37,6 +43,9 @@ export function DashboardPage() {
 
   const { data: paperStatus, refetch: refetchStatus } = usePaperStatus();
   const { data: paperPnl, refetch: refetchPnl } = usePaperPnl();
+  const { data: paperOrdersData = [] } = usePaperOrders(undefined, 1000);
+  const { data: closedTradesData = [] } = useClosedTrades(undefined, 1000);
+  const { data: settingsData } = useSettings();
   const { data: portfolio, isPending: portfolioLoading } = usePaperPortfolio();
   const { data: agentsData = [], isPending: agentsLoading } = useAgents();
   const { data: metricsData = [] } = useAutomationMetrics();
@@ -44,9 +53,95 @@ export function DashboardPage() {
   const { data: teamStatus } = useFundTeamStatus();
   const { data: traderLeaderboard = [] } = useTraderLeaderboard();
   const { data: tradingPairsData = [] } = useTradingPairs();
+  const { data: autopilot } = useGateAutopilot();
   const SYMBOLS = (tradingPairsData.length > 0 ? tradingPairsData : FALLBACK_SYMBOLS) as string[];
 
   const paperEnabled = paperStatus?.enabled ?? false;
+  const maxDailyFeesPct = settingsData?.gates?.max_daily_fees_pct ?? 0.5;
+  const feeCoverageGuardEnabled = settingsData?.gates?.fee_coverage_guard_enabled ?? true;
+  const feeCoverageMinRatio = settingsData?.gates?.fee_coverage_min_ratio ?? 2.5;
+  const feeCoverageMinFeesUsd = settingsData?.gates?.fee_coverage_min_fees_usd ?? 25;
+  const feeBudgetUsd = (50000 * maxDailyFeesPct) / 100;
+  const dailyFeesForBudget =
+    (paperPnl?.daily_fees_with_estimated_exit ?? paperPnl?.daily_fees_paid ?? paperPnl?.total_fees ?? 0);
+  const feeBudgetUsedRatio = feeBudgetUsd > 0 ? dailyFeesForBudget / feeBudgetUsd : 0;
+  const feeBudgetRemainingUsd = Math.max(feeBudgetUsd - dailyFeesForBudget, 0);
+  const feeCoverageRealizedPnl = paperPnl?.realized_pnl ?? 0;
+  const feeCoverageFees = paperPnl?.total_fees ?? 0;
+  const feeCoverageRatio = feeCoverageFees > 0 ? (feeCoverageRealizedPnl / feeCoverageFees) : null;
+  const feeCoverageProgress = feeCoverageRatio != null && feeCoverageMinRatio > 0
+    ? Math.min(Math.max(feeCoverageRatio / feeCoverageMinRatio, 0), 1.2)
+    : 0;
+  const feeCoverageGuardActive = Boolean(
+    feeCoverageGuardEnabled
+    && feeCoverageFees >= feeCoverageMinFeesUsd
+    && feeCoverageRatio != null
+    && feeCoverageRatio < feeCoverageMinRatio
+  );
+  const feeCoverageTrend = useMemo(() => {
+    const now = Date.now();
+    const hourMs = 60 * 60 * 1000;
+    const start = now - (23 * hourMs);
+
+    const orders = Array.isArray(paperOrdersData) ? paperOrdersData : [];
+    const closedTrades = Array.isArray(closedTradesData) ? closedTradesData : [];
+
+    const feesByHour = new Array<number>(24).fill(0);
+    const pnlByHour = new Array<number>(24).fill(0);
+
+    for (const order of orders) {
+      if (!order || String(order.status || '').toLowerCase() !== 'filled') continue;
+      const fee = Number(order.fee ?? 0);
+      if (!Number.isFinite(fee) || fee <= 0) continue;
+      const ts = Date.parse(order.created_at || '');
+      if (!Number.isFinite(ts) || ts < start || ts > now) continue;
+      const idx = Math.max(0, Math.min(23, Math.floor((ts - start) / hourMs)));
+      feesByHour[idx] += fee;
+    }
+
+    for (const trade of closedTrades) {
+      if (!trade) continue;
+      const pnl = Number(trade.net_pnl ?? 0);
+      if (!Number.isFinite(pnl)) continue;
+      const ts = Date.parse(trade.exit_time || '');
+      if (!Number.isFinite(ts) || ts < start || ts > now) continue;
+      const idx = Math.max(0, Math.min(23, Math.floor((ts - start) / hourMs)));
+      pnlByHour[idx] += pnl;
+    }
+
+    const ratioSeries: number[] = [];
+    let cumFees = 0;
+    let cumPnl = 0;
+    for (let i = 0; i < 24; i += 1) {
+      cumFees += feesByHour[i];
+      cumPnl += pnlByHour[i];
+      if (cumFees > 0.001) {
+        ratioSeries.push(cumPnl / cumFees);
+      } else {
+        ratioSeries.push(0);
+      }
+    }
+
+    const maxAbs = ratioSeries.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
+    const safeMax = Math.max(maxAbs, feeCoverageMinRatio, 0.5);
+    const width = 300;
+    const height = 64;
+    const points = ratioSeries.map((v, i) => {
+      const x = (i / 23) * width;
+      const y = height - ((Math.max(-safeMax, Math.min(safeMax, v)) + safeMax) / (2 * safeMax)) * height;
+      return `${x},${y}`;
+    });
+
+    return {
+      ratioSeries,
+      polyline: points.join(' '),
+      lastRatio: ratioSeries[ratioSeries.length - 1] ?? 0,
+      firstRatio: ratioSeries[0] ?? 0,
+      safeMax,
+      width,
+      height,
+    };
+  }, [paperOrdersData, closedTradesData, feeCoverageMinRatio]);
   const agents: any[] = Array.isArray(agentsData) ? agentsData : [];
   const metrics: any[] = Array.isArray(metricsData) ? metricsData : [];
   const runs: any[] = Array.isArray(runsData) ? runsData : [];
@@ -569,13 +664,31 @@ export function DashboardPage() {
               {paperEnabled && paperPnl ? (
                 <>
                   <div className="pnl-display">
-                    <div className="pnl-label">Total P&L</div>
+                    <div className="pnl-label">Net Total P&L (After Fees)</div>
                     <div className={`pnl-value ${paperPnl.total_pnl > 0 ? 'positive' : paperPnl.total_pnl < 0 ? 'negative' : 'neutral'}`}>
                       {paperPnl.total_pnl >= 0 ? '+' : ''}${paperPnl.total_pnl?.toFixed(2) ?? '0.00'}
                     </div>
-                    <div className="pnl-subtext">{paperPnl.trade_count ?? 0} trades executed</div>
+                    <div className="pnl-subtext">
+                      Gross Realized: {(paperPnl.realized_pnl ?? 0) >= 0 ? '+' : ''}${(paperPnl.realized_pnl ?? 0).toFixed(2)} · {paperPnl.trade_count ?? 0} orders filled
+                    </div>
                   </div>
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '.5rem', marginTop: '.5rem' }}>
+                    <div className="stat-card">
+                      <div className="stat-label">Gross Realized</div>
+                      <div className={`stat-value ${(paperPnl.realized_pnl ?? 0) >= 0 ? 'positive' : 'negative'}`} style={{ fontSize: '.88rem' }}>
+                        {(paperPnl.realized_pnl ?? 0) >= 0 ? '+' : ''}${(paperPnl.realized_pnl ?? 0).toFixed(2)}
+                      </div>
+                    </div>
+                    <div className="stat-card">
+                      <div className="stat-label">Unrealized (Net Exit Fees)</div>
+                      <div className={`stat-value ${(paperPnl.unrealized_pnl ?? 0) >= 0 ? 'positive' : 'negative'}`} style={{ fontSize: '.88rem' }}>
+                        {(paperPnl.unrealized_pnl ?? 0) >= 0 ? '+' : ''}${(paperPnl.unrealized_pnl ?? 0).toFixed(2)}
+                      </div>
+                    </div>
+                    <div className="stat-card">
+                      <div className="stat-label">Total Fees</div>
+                      <div className="stat-value" style={{ fontSize: '.88rem' }}>${paperPnl.total_fees?.toFixed(2) ?? '0.00'}</div>
+                    </div>
                     <div className="stat-card">
                       <div className="stat-label">Buy Vol</div>
                       <div className="stat-value" style={{ fontSize: '.88rem' }}>${paperPnl.buy_volume?.toFixed(0) ?? '0'}</div>
@@ -589,6 +702,216 @@ export function DashboardPage() {
               ) : (
                 <p style={{ fontSize: '.78rem', color: 'var(--text-dim)', textAlign: 'center', padding: '1rem 0' }}>
                   {paperEnabled ? 'Loading P&L...' : 'Enable to practice without real money'}
+                </p>
+              )}
+            </div>
+          </div>
+
+          {/* Daily Fee Budget Status */}
+          <div className="panel">
+            <div className="panel-header">
+              <span className="panel-title">Daily Fee Budget</span>
+            </div>
+            <div className="panel-body">
+              {paperEnabled && paperPnl ? (
+                <>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '.5rem' }}>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '.5rem' }}>
+                      <div className="stat-card">
+                        <div className="stat-label" style={{ fontSize: '.7rem' }}>Fees Today</div>
+                        <div className="stat-value" style={{ fontSize: '.95rem', fontFamily: 'var(--mono)' }}>
+                          ${dailyFeesForBudget.toFixed(2)}
+                        </div>
+                      </div>
+                      <div className="stat-card">
+                        <div className="stat-label" style={{ fontSize: '.7rem' }}>Budget Left</div>
+                        <div className="stat-value" style={{ fontSize: '.95rem', fontFamily: 'var(--mono)' }}>
+                          ${feeBudgetRemainingUsd.toFixed(2)}
+                        </div>
+                      </div>
+                    </div>
+                    <div>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '.25rem' }}>
+                        <span style={{ fontSize: '.75rem', color: 'var(--text-secondary)' }}>Daily Fees</span>
+                        <span style={{ fontSize: '.75rem', fontFamily: 'var(--mono)', fontWeight: 600 }}>
+                          ${dailyFeesForBudget.toFixed(2)} / ${feeBudgetUsd.toFixed(2)} (50k @ {maxDailyFeesPct.toFixed(2)}%)
+                        </span>
+                      </div>
+                      <div style={{ width: '100%', height: '8px', background: 'var(--bg-elevated)', borderRadius: 4, overflow: 'hidden' }}>
+                        <div style={{
+                          width: `${Math.min(feeBudgetUsedRatio * 100, 100)}%`,
+                          height: '100%',
+                          background: feeBudgetUsedRatio > 1 ? 'var(--red)' : feeBudgetUsedRatio > 0.75 ? 'var(--amber)' : 'var(--green)',
+                          transition: 'width 0.3s ease',
+                        }} />
+                      </div>
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '.5rem', marginTop: '.25rem' }}>
+                      <div className="stat-card">
+                        <div className="stat-label" style={{ fontSize: '.7rem' }}>Budget Used</div>
+                        <div className="stat-value" style={{ fontSize: '.8rem', fontFamily: 'var(--mono)' }}>
+                          {(feeBudgetUsedRatio * 100).toFixed(1)}%
+                        </div>
+                      </div>
+                      <div className="stat-card">
+                        <div className="stat-label" style={{ fontSize: '.7rem' }}>Entries Status</div>
+                        <div className="stat-value" style={{
+                          fontSize: '.8rem',
+                          color: feeBudgetUsedRatio > 1 ? 'var(--red)' : 'var(--green)',
+                          fontWeight: 600,
+                        }}>
+                          {feeBudgetUsedRatio > 1 ? 'BLOCKED' : 'ACTIVE'}
+                        </div>
+                      </div>
+                    </div>
+                    <p style={{ fontSize: '.7rem', color: 'var(--text-dim)', marginTop: '.25rem', lineHeight: 1.4 }}>
+                      {feeBudgetUsedRatio > 1
+                        ? '🚫 Daily fee budget exceeded. New entries blocked until midnight UTC.'
+                        : `✓ $${dailyFeesForBudget.toFixed(2)} paid today. $${feeBudgetRemainingUsd.toFixed(2)} remaining before the UTC reset.`}
+                    </p>
+                  </div>
+                </>
+              ) : (
+                <p style={{ fontSize: '.78rem', color: 'var(--text-dim)', textAlign: 'center', padding: '1rem 0' }}>
+                  Enable paper trading to see fee budget status
+                </p>
+              )}
+            </div>
+          </div>
+
+          {/* Fee Coverage Efficiency */}
+          <div className="panel">
+            <div className="panel-header">
+              <span className="panel-title">Fee Coverage</span>
+            </div>
+            <div className="panel-body">
+              {paperEnabled && paperPnl ? (
+                <>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '.5rem' }}>
+                    <div className="stat-card">
+                      <div className="stat-label" style={{ fontSize: '.7rem' }}>Realized / Fees</div>
+                      <div
+                        className="stat-value"
+                        style={{
+                          fontSize: '1rem',
+                          fontFamily: 'var(--mono)',
+                          color: feeCoverageRatio == null
+                            ? 'var(--text-secondary)'
+                            : feeCoverageRatio >= feeCoverageMinRatio
+                              ? 'var(--green)'
+                              : 'var(--red)',
+                        }}
+                      >
+                        {feeCoverageRatio == null ? 'N/A' : `${feeCoverageRatio.toFixed(2)}x`}
+                      </div>
+                    </div>
+                    <div className="stat-card">
+                      <div className="stat-label" style={{ fontSize: '.7rem' }}>Target</div>
+                      <div className="stat-value" style={{ fontSize: '1rem', fontFamily: 'var(--mono)' }}>
+                        {feeCoverageMinRatio.toFixed(2)}x
+                      </div>
+                    </div>
+                  </div>
+                  <div style={{ marginTop: '.5rem' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '.25rem' }}>
+                      <span style={{ fontSize: '.75rem', color: 'var(--text-secondary)' }}>Coverage Progress</span>
+                      <span style={{ fontSize: '.75rem', fontFamily: 'var(--mono)', fontWeight: 600 }}>
+                        ${feeCoverageRealizedPnl.toFixed(2)} / ${feeCoverageFees.toFixed(2)}
+                      </span>
+                    </div>
+                    <div style={{ width: '100%', height: '8px', background: 'var(--bg-elevated)', borderRadius: 4, overflow: 'hidden' }}>
+                      <div style={{
+                        width: `${Math.min(feeCoverageProgress * 100, 100)}%`,
+                        height: '100%',
+                        background: feeCoverageRatio == null
+                          ? 'var(--text-dim)'
+                          : feeCoverageRatio >= feeCoverageMinRatio
+                            ? 'var(--green)'
+                            : 'var(--red)',
+                        transition: 'width 0.3s ease',
+                      }} />
+                    </div>
+                  </div>
+                  <div style={{ marginTop: '.6rem', padding: '.45rem .5rem', border: '1px solid var(--border)', background: 'var(--bg-elevated)' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '.28rem' }}>
+                      <span style={{ fontSize: '.68rem', color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '.08em' }}>24h Fee Coverage Trend</span>
+                      <span
+                        style={{
+                          fontSize: '.68rem',
+                          fontFamily: 'var(--mono)',
+                          color: (feeCoverageTrend.lastRatio - feeCoverageTrend.firstRatio) >= 0 ? 'var(--green)' : 'var(--red)',
+                        }}
+                      >
+                        {(feeCoverageTrend.lastRatio - feeCoverageTrend.firstRatio) >= 0 ? '+' : ''}
+                        {(feeCoverageTrend.lastRatio - feeCoverageTrend.firstRatio).toFixed(2)}x
+                      </span>
+                    </div>
+                    <svg
+                      viewBox={`0 0 ${feeCoverageTrend.width} ${feeCoverageTrend.height}`}
+                      style={{ width: '100%', height: '56px', display: 'block' }}
+                      preserveAspectRatio="none"
+                    >
+                      <line
+                        x1="0"
+                        y1={feeCoverageTrend.height / 2}
+                        x2={feeCoverageTrend.width}
+                        y2={feeCoverageTrend.height / 2}
+                        stroke="var(--border)"
+                        strokeWidth="1"
+                        opacity="0.8"
+                      />
+                      <polyline
+                        fill="none"
+                        stroke={feeCoverageTrend.lastRatio >= feeCoverageMinRatio ? 'var(--green)' : 'var(--accent)'}
+                        strokeWidth="2"
+                        points={feeCoverageTrend.polyline}
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      />
+                    </svg>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '.2rem' }}>
+                      <span style={{ fontSize: '.64rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)' }}>-24h</span>
+                      <span style={{ fontSize: '.64rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)' }}>Now</span>
+                    </div>
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '.5rem', marginTop: '.5rem' }}>
+                    <div className="stat-card">
+                      <div className="stat-label" style={{ fontSize: '.7rem' }}>Guard</div>
+                      <div
+                        className="stat-value"
+                        style={{
+                          fontSize: '.82rem',
+                          color: !feeCoverageGuardEnabled
+                            ? 'var(--text-dim)'
+                            : feeCoverageGuardActive
+                              ? 'var(--red)'
+                              : 'var(--green)',
+                          fontWeight: 700,
+                        }}
+                      >
+                        {!feeCoverageGuardEnabled ? 'OFF' : feeCoverageGuardActive ? 'ACTIVE' : 'STANDBY'}
+                      </div>
+                    </div>
+                    <div className="stat-card">
+                      <div className="stat-label" style={{ fontSize: '.7rem' }}>Activation Fees</div>
+                      <div className="stat-value" style={{ fontSize: '.82rem', fontFamily: 'var(--mono)' }}>
+                        ${feeCoverageMinFeesUsd.toFixed(0)}
+                      </div>
+                    </div>
+                  </div>
+                  <p style={{ fontSize: '.7rem', color: 'var(--text-dim)', marginTop: '.35rem', lineHeight: 1.4 }}>
+                    {!feeCoverageGuardEnabled
+                      ? 'Fee coverage guard is disabled in Trade Gates.'
+                      : feeCoverageFees < feeCoverageMinFeesUsd
+                        ? `Tracking phase: guard activates after $${feeCoverageMinFeesUsd.toFixed(0)} fees.`
+                        : feeCoverageGuardActive
+                          ? `Guard active: ratio ${feeCoverageRatio?.toFixed(2)}x below target ${feeCoverageMinRatio.toFixed(2)}x. New entries are being tightened.`
+                          : `Healthy edge: ratio ${feeCoverageRatio?.toFixed(2)}x is meeting target ${feeCoverageMinRatio.toFixed(2)}x.`}
+                  </p>
+                </>
+              ) : (
+                <p style={{ fontSize: '.78rem', color: 'var(--text-dim)', textAlign: 'center', padding: '1rem 0' }}>
+                  Enable paper trading to see fee coverage status
                 </p>
               )}
             </div>
@@ -656,10 +979,81 @@ export function DashboardPage() {
             </div>
           </div>
 
+          {/* Gate Autopilot status */}
+          <div className="panel">
+            <div className="panel-header">
+              <div style={{ display: 'flex', alignItems: 'center', gap: '.4rem' }}>
+                {autopilot?.enabled
+                  ? <Zap size={13} style={{ color: 'var(--accent)' }} />
+                  : <ZapOff size={13} style={{ color: 'var(--text-dim)' }} />}
+                <span className="panel-title">Gate Autopilot</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => navigate('/settings')}
+                style={{ fontSize: '.65rem', color: 'var(--accent)', background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'var(--mono)' }}
+              >
+                CONFIG →
+              </button>
+            </div>
+            <div className="panel-body">
+              {!autopilot ? (
+                <p style={{ fontSize: '.75rem', color: 'var(--text-dim)', textAlign: 'center', padding: '.5rem 0' }}>Loading…</p>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '.5rem' }}>
+                  {/* Status row */}
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <span style={{
+                      fontSize: '.7rem', fontWeight: 700, padding: '.2rem .6rem', borderRadius: '20px',
+                      background: autopilot.enabled ? 'var(--accent-dim)' : 'var(--bg-hover)',
+                      color: autopilot.enabled ? 'var(--accent)' : 'var(--text-dim)',
+                      border: `1px solid ${autopilot.enabled ? 'rgba(99,179,237,.25)' : 'var(--border)'}`,
+                    }}>
+                      {autopilot.enabled ? 'ACTIVE' : 'OFF'}
+                    </span>
+                    {autopilot.enabled && (
+                      <span style={{
+                        fontSize: '.7rem', fontWeight: 700, letterSpacing: '.05em',
+                        padding: '.2rem .6rem', borderRadius: '20px',
+                        textTransform: 'uppercase',
+                        background: `var(--${autopilot.color}-dim, var(--bg-elevated))`,
+                        color: `var(--${autopilot.color}, var(--text-secondary))`,
+                        border: `1px solid var(--${autopilot.color}, var(--border))`,
+                      }}>
+                        {autopilot.regime}
+                      </span>
+                    )}
+                  </div>
+                  {/* Reason */}
+                  {autopilot.enabled && autopilot.reason && (
+                    <p style={{ fontSize: '.7rem', color: 'var(--text-secondary)', lineHeight: 1.45, margin: 0 }}>
+                      {autopilot.reason.length > 110
+                        ? autopilot.reason.slice(0, 110) + '…'
+                        : autopilot.reason}
+                    </p>
+                  )}
+                  {!autopilot.enabled && (
+                    <p style={{ fontSize: '.7rem', color: 'var(--text-dim)', lineHeight: 1.45, margin: 0 }}>
+                      Auto-adjusts gate thresholds from win rate, P&L and session timing.
+                    </p>
+                  )}
+                  {/* Last run */}
+                  {autopilot.last_run && (
+                    <div style={{ fontSize: '.65rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)', textAlign: 'right' }}>
+                      evaluated {new Date(autopilot.last_run).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
 
         </div>
 
       </div>{/* end dash-grid */}
+
+      {/* Open positions with leverage diagnostics */}
+      <PositionsTableComponent />
     </div>
   );
 }

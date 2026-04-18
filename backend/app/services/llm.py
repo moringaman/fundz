@@ -549,6 +549,16 @@ IMPORTANT: Weight your decision using team intelligence:
 - Look for CONFLUENCE across team signals — 3+ team members agreeing = high conviction
 """
 
+            # Market session warning (US open blackout/confirmation)
+            _ms = team_context.get("market_session") if team_context else None
+            if _ms and _ms.get("note"):
+                team_section += f"\n{_ms['note']}\n"
+
+            # Phase 9.2 — Trader drawdown / Pink Slip pressure
+            _trs = team_context.get("trader_risk_status") if team_context else None
+            if _trs and _trs.get("note"):
+                team_section += f"\n{_trs['note']}\n"
+
             # Re-entry context — inject AFTER team_section is built so it always surfaces
             recent_stopout = team_context.get("recent_stopout") if team_context else None
             if recent_stopout:

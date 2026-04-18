@@ -95,6 +95,7 @@ class GridEngine:
                 grid_spacing_pct=round(spacing_pct, 4),
                 current_price_at_creation=current_price,
                 regime_atr=atr,
+                initial_capital=capital,
                 total_invested=0.0,
                 realized_pnl=0.0,
             )
@@ -167,12 +168,16 @@ class GridEngine:
         return result
 
     async def get_open_levels(self, grid: GridState) -> List[GridLevel]:
-        """Return levels with open positions (filled, awaiting counter-exit)."""
+        """Return levels with an active position: open (entry placed), filled, or counter_placed."""
         async with get_async_session() as db:
             return (await db.scalars(
                 select(GridLevel).where(
                     GridLevel.grid_id == grid.id,
-                    GridLevel.status.in_([GridLevelStatus.open, GridLevelStatus.filled]),
+                    GridLevel.status.in_([
+                        GridLevelStatus.open,
+                        GridLevelStatus.filled,
+                        GridLevelStatus.counter_placed,
+                    ]),
                 )
             )).all()
 
@@ -450,7 +455,8 @@ class GridEngine:
             )).all()}
 
             added = 0
-            capital_per_level = (grid.grid_high - grid.grid_low) * grid.grid_levels * 0.01  # rough
+            # Use stored initial capital for consistent quantity sizing
+            capital_per_level = (grid.initial_capital or grid.total_invested or 0) / max(grid.grid_levels, 1)
             for i in range(grid.grid_levels):
                 lp = new_low + i * spacing
                 if any(abs(lp - ep) < spacing * 0.3 for ep in existing_prices):

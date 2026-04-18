@@ -87,7 +87,7 @@ class ResearchAnalystAgent:
     async def analyze_markets(
         self,
         symbols: List[str] = None,
-        lookback_candles: int = 200
+        lookback_candles: int = 500  # EXPANDED from 200 for better trend confirmation
     ) -> ResearchReport:
         """
         Comprehensive multi-symbol market analysis
@@ -104,8 +104,8 @@ class ResearchAnalystAgent:
                     klines = await self.phemex.get_klines(symbol, "1h", lookback_candles)
                     data = klines if isinstance(klines, list) else klines.get('data', [])
 
-                    if not data or len(data) < 50:
-                        logger.warning(f"Insufficient data for {symbol}, skipping")
+                    if not data or len(data) < 200:
+                        logger.warning(f"Insufficient data for {symbol} (need 200+ candles), skipping")
                         continue
 
                     df_data = []
@@ -181,6 +181,13 @@ class ResearchAnalystAgent:
         """Identify trading opportunities across symbols"""
         opportunities = []
 
+        sr_block_pct = 0.005  # fallback: 0.5%
+        try:
+            from app.api.routes.settings import get_trading_gates
+            sr_block_pct = float(get_trading_gates().sr_proximity_block_pct)
+        except Exception:
+            pass
+
         for symbol, data in market_data.items():
             df = data['df']
             indicators = data['indicators']
@@ -195,57 +202,96 @@ class ResearchAnalystAgent:
                 macd = indicators.get('macd')
                 macd_signal = indicators.get('macd_signal')
 
+                sr = self.indicator_service.calculate_support_resistance(
+                    df['high'],
+                    df['low'],
+                    df['close'],
+                    lookback=min(80, len(df)),
+                    proximity_pct=sr_block_pct,
+                )
+                nearest_support = sr.get('nearest_support')
+                nearest_resistance = sr.get('nearest_resistance')
+                at_support = bool(sr.get('at_support', False))
+                at_resistance = bool(sr.get('at_resistance', False))
+
+                support_dist_pct = (
+                    abs(current_price - nearest_support) / max(nearest_support, 1e-10)
+                    if nearest_support is not None
+                    else None
+                )
+                resistance_dist_pct = (
+                    abs(nearest_resistance - current_price) / max(nearest_resistance, 1e-10)
+                    if nearest_resistance is not None
+                    else None
+                )
+
                 # Detect oversold bounce
-                if rsi < 30 and current_price > (bb_lower or 0):
+                if rsi < 30 and current_price > (bb_lower or 0) and not at_resistance:
                     opportunities.append(MarketOpportunity(
                         symbol=symbol,
                         opportunity_type="oversold_bounce",
                         confidence=min((30 - rsi) / 30 * 0.8 + 0.2, 1.0),
                         recommended_action="buy",
                         entry_level=current_price,
-                        target_level=sma_20,
-                        stop_level=bb_lower,
-                        reasoning=f"RSI deeply oversold at {rsi:.1f}, price near lower Bollinger Band"
+                        target_level=nearest_resistance or sma_20,
+                        stop_level=nearest_support or bb_lower,
+                        reasoning=(
+                            f"RSI deeply oversold at {rsi:.1f}, price near lower Bollinger Band; "
+                            f"nearest resistance {(resistance_dist_pct * 100):.2f}% away"
+                            if resistance_dist_pct is not None
+                            else f"RSI deeply oversold at {rsi:.1f}, price near lower Bollinger Band"
+                        )
                     ))
 
                 # Detect overbought reversal
-                if rsi > 70 and current_price < (bb_upper or float('inf')):
+                if rsi > 70 and current_price < (bb_upper or float('inf')) and not at_support:
                     opportunities.append(MarketOpportunity(
                         symbol=symbol,
                         opportunity_type="trend_reversal",
                         confidence=min((rsi - 70) / 30 * 0.7 + 0.2, 1.0),
                         recommended_action="sell",
                         entry_level=current_price,
-                        target_level=sma_20,
-                        stop_level=bb_upper,
-                        reasoning=f"RSI overbought at {rsi:.1f}, price near upper Bollinger Band"
+                        target_level=nearest_support or sma_20,
+                        stop_level=nearest_resistance or bb_upper,
+                        reasoning=(
+                            f"RSI overbought at {rsi:.1f}, price near upper Bollinger Band; "
+                            f"nearest support {(support_dist_pct * 100):.2f}% away"
+                            if support_dist_pct is not None
+                            else f"RSI overbought at {rsi:.1f}, price near upper Bollinger Band"
+                        )
                     ))
 
                 # Detect bullish crossover
                 if sma_20 and sma_50 and macd and macd_signal:
-                    if current_price > sma_20 > sma_50 and macd > macd_signal:
+                    if current_price > sma_20 > sma_50 and macd > macd_signal and not at_resistance:
                         opportunities.append(MarketOpportunity(
                             symbol=symbol,
                             opportunity_type="breakout",
                             confidence=0.65,
                             recommended_action="buy",
                             entry_level=current_price,
-                            target_level=current_price * 1.05,
-                            stop_level=sma_50,
-                            reasoning=f"Bullish alignment: Price > SMA20 > SMA50, MACD bullish crossover"
+                            target_level=nearest_resistance or (current_price * 1.05),
+                            stop_level=nearest_support or sma_50,
+                            reasoning=(
+                                "Bullish alignment: Price > SMA20 > SMA50, MACD bullish crossover, "
+                                "and not pressing resistance"
+                            )
                         ))
 
                     # Detect bearish crossover
-                    if current_price < sma_20 < sma_50 and macd < macd_signal:
+                    if current_price < sma_20 < sma_50 and macd < macd_signal and not at_support:
                         opportunities.append(MarketOpportunity(
                             symbol=symbol,
                             opportunity_type="breakout",
                             confidence=0.65,
                             recommended_action="sell",
                             entry_level=current_price,
-                            target_level=current_price * 0.95,
-                            stop_level=sma_50,
-                            reasoning=f"Bearish alignment: Price < SMA20 < SMA50, MACD bearish crossover"
+                            target_level=nearest_support or (current_price * 0.95),
+                            stop_level=nearest_resistance or sma_50,
+                            reasoning=(
+                                "Bearish alignment: Price < SMA20 < SMA50, MACD bearish crossover, "
+                                "and not pressing support"
+                            )
                         ))
 
             except Exception as e:
@@ -388,9 +434,30 @@ Return JSON: {{"regime": "...", "regime_confidence": 0.0-1.0, "sentiment": "..."
         """Build text context of market data for LLM analysis"""
         context_lines = []
 
+        sr_block_pct = 0.005  # fallback: 0.5%
+        try:
+            from app.api.routes.settings import get_trading_gates
+            sr_block_pct = float(get_trading_gates().sr_proximity_block_pct)
+        except Exception:
+            pass
+
         for symbol, data in market_data.items():
             indicators = data['indicators']
             price_change = data.get('price_change_24h', 0)
+            df = data.get('df')
+
+            nearest_support = None
+            nearest_resistance = None
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                sr = self.indicator_service.calculate_support_resistance(
+                    df['high'],
+                    df['low'],
+                    df['close'],
+                    lookback=min(80, len(df)),
+                    proximity_pct=sr_block_pct,
+                )
+                nearest_support = sr.get('nearest_support')
+                nearest_resistance = sr.get('nearest_resistance')
 
             context_lines.append(f"\n{symbol}:")
             context_lines.append(f"  Price: ${(data.get('current_price', 0) or 0):.2f}")
@@ -398,6 +465,12 @@ Return JSON: {{"regime": "...", "regime_confidence": 0.0-1.0, "sentiment": "..."
             context_lines.append(f"  RSI(14): {(indicators.get('rsi', 50) or 50):.1f}")
             context_lines.append(f"  SMA20: ${(indicators.get('sma_20', 0) or 0):.2f}")
             context_lines.append(f"  SMA50: ${(indicators.get('sma_50', 0) or 0):.2f}")
+            context_lines.append(
+                f"  Nearest Support: ${(nearest_support or 0):.2f}" if nearest_support is not None else "  Nearest Support: N/A"
+            )
+            context_lines.append(
+                f"  Nearest Resistance: ${(nearest_resistance or 0):.2f}" if nearest_resistance is not None else "  Nearest Resistance: N/A"
+            )
 
         return "\n".join(context_lines)
 

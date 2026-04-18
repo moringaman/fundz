@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Key, Brain, Save, Eye, EyeOff, Check, RefreshCw, Info, AlertTriangle, TrendingUp, Shield, Mail, Send, Bell, Wallet, Plus, Minus, MessageCircle, Volume2, SlidersHorizontal } from 'lucide-react';
+import { Key, Brain, Save, Eye, EyeOff, Check, RefreshCw, Info, AlertTriangle, TrendingUp, Shield, Mail, Send, Bell, Wallet, Plus, Minus, MessageCircle, Volume2, SlidersHorizontal, Zap, ZapOff, Activity, PlayCircle } from 'lucide-react';
 import { useSettings } from '../hooks/useQueries';
 import { settingsApi, paperApi } from '../lib/api';
 import { notificationService, type NotificationPreferences } from '../lib/notifications';
@@ -30,6 +30,8 @@ export function SettingsPage() {
     default_stop_loss_pct: 2,
     default_take_profit_pct: 4,
     max_leverage: 1,
+    max_leveraged_notional_pct: 200,
+    liquidation_buffer_pct: 12.5,
     exposure_threshold_pct: 80,
   });
 
@@ -40,7 +42,11 @@ export function SettingsPage() {
     paper_trading_default: true,
     auto_confirm_orders: false,
     default_order_type: 'limit',
-    trading_pairs: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'ADAUSDT'] as string[],
+    trading_pairs: [
+      'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'ADAUSDT',
+      'DOGEUSDT', 'BNBUSDT', 'AVAXUSDT', 'LINKUSDT', 'DOTUSDT',
+      'MATICUSDT', 'LTCUSDT', 'UNIUSDT', 'ATOMUSDT', 'NEARUSDT',
+    ] as string[],
   });
   const [newPairInput, setNewPairInput] = useState('');
 
@@ -54,6 +60,58 @@ export function SettingsPage() {
     anthropic_api_key: '',
     openrouter_api_key: '',
   });
+
+  // ── Gate Autopilot state ──
+  type AutopilotStatus = {
+    enabled: boolean;
+    regime: string;
+    reason: string;
+    last_run: string | null;
+    changes: Record<string, { from: number; to: number }>;
+    color: string;
+  };
+  const [autopilot, setAutopilot] = useState<AutopilotStatus | null>(null);
+  const [autopilotLoading, setAutopilotLoading] = useState(false);
+
+  const loadAutopilot = useCallback(async () => {
+    try {
+      const data = await settingsApi.getGateAutopilot() as AutopilotStatus;
+      setAutopilot(data);
+    } catch { /* non-fatal */ }
+  }, []);
+
+  useEffect(() => {
+    if (activeTab === 'gates') loadAutopilot();
+  }, [activeTab, loadAutopilot]);
+
+  const handleToggleAutopilot = async () => {
+    if (!autopilot) return;
+    setAutopilotLoading(true);
+    try {
+      const updated = await settingsApi.setGateAutopilot(!autopilot.enabled) as AutopilotStatus;
+      setAutopilot(updated);
+      showToast(updated.enabled ? 'Autopilot enabled' : 'Autopilot disabled', 'success');
+      if (updated.enabled) refetchSettings();
+    } catch {
+      showToast('Failed to toggle autopilot', 'error');
+    } finally {
+      setAutopilotLoading(false);
+    }
+  };
+
+  const handleRunAutopilotNow = async () => {
+    setAutopilotLoading(true);
+    try {
+      const updated = await settingsApi.runGateAutopilotNow() as AutopilotStatus;
+      setAutopilot(updated);
+      showToast('Autopilot evaluated — gates updated', 'success');
+      refetchSettings();
+    } catch {
+      showToast('Autopilot evaluation failed', 'error');
+    } finally {
+      setAutopilotLoading(false);
+    }
+  };
 
   const [gatesForm, setGatesForm] = useState({
     min_entry_confidence: 0.60,
@@ -70,14 +128,34 @@ export function SettingsPage() {
     whale_bull_threshold: 0.30,
     whale_entry_gate_enabled: true,
     min_runs_before_disable: 15,
-    circuit_breaker_max_trades: 30,
+    circuit_breaker_max_trades: 20,
     max_same_asset_positions: 2,
     max_directional_concentration_pct: 40.0,
-    confidence_size_reference: 0.65,
-    confidence_size_floor: 0.50,
+    confidence_size_reference: 0.78,
+    confidence_size_floor: 0.25,
     ta_boost_multiplier: 0.20,
     ta_penalty_multiplier: 0.40,
     ta_min_confidence: 0.60,
+    sr_proximity_block_pct: 0.005,
+    max_daily_fees_pct: 0.5,
+    fee_coverage_guard_enabled: true,
+    fee_coverage_min_ratio: 2.5,
+    fee_coverage_min_fees_usd: 25,
+    fee_coverage_window_trades: 60,
+    fee_coverage_min_closed_trades: 8,
+    fee_coverage_include_slippage: true,
+    fee_coverage_slippage_bps: 2.0,
+    fee_coverage_include_funding: true,
+    leverage_enabled: true,
+    leverage_confidence_threshold: 0.75,
+    leverage_tier_1_min_confidence: 0.75,
+    leverage_tier_1_max_confidence: 0.85,
+    leverage_tier_1_multiplier: 2.0,
+    leverage_tier_2_min_confidence: 0.85,
+    leverage_tier_2_max_confidence: 0.95,
+    leverage_tier_2_multiplier: 3.0,
+    leverage_tier_3_min_confidence: 0.95,
+    leverage_tier_3_multiplier: 5.0,
     us_open_blackout_enabled: true,
     us_open_blackout_start_utc: 1245,
     us_open_blackout_end_utc: 1330,
@@ -563,12 +641,34 @@ export function SettingsPage() {
             <div className="form-group">
               <label className="form-label">Max Leverage: {riskForm.max_leverage}x</label>
               <input
-                type="range" min="1" max="50" step="1"
+                type="range" min="1" max="10" step="1"
                 className="slider"
                 value={riskForm.max_leverage}
                 onChange={e => setRiskForm({ ...riskForm, max_leverage: parseFloat(e.target.value) })}
               />
-              <div className="slider-labels"><span>1x</span><span>50x</span></div>
+              <div className="slider-labels"><span>1x</span><span>10x</span></div>
+            </div>
+
+            <div className="form-group">
+              <label className="form-label">Leveraged Notional Cap: {riskForm.max_leveraged_notional_pct}%</label>
+              <input
+                type="range" min="50" max="400" step="10"
+                className="slider"
+                value={riskForm.max_leveraged_notional_pct}
+                onChange={e => setRiskForm({ ...riskForm, max_leveraged_notional_pct: parseFloat(e.target.value) })}
+              />
+              <div className="slider-labels"><span>50%</span><span>400%</span></div>
+            </div>
+
+            <div className="form-group">
+              <label className="form-label">Liquidation Buffer: {riskForm.liquidation_buffer_pct}%</label>
+              <input
+                type="range" min="5" max="25" step="0.5"
+                className="slider"
+                value={riskForm.liquidation_buffer_pct}
+                onChange={e => setRiskForm({ ...riskForm, liquidation_buffer_pct: parseFloat(e.target.value) })}
+              />
+              <div className="slider-labels"><span>5%</span><span>25%</span></div>
             </div>
           </div>
 
@@ -1086,6 +1186,129 @@ export function SettingsPage() {
             All values that govern when trades are allowed, blocked, boosted, or penalised. Changes take effect immediately — no restart required.
           </p>
 
+          {/* ── Gate Autopilot Panel ── */}
+          <div style={{
+            border: `1px solid ${autopilot?.enabled ? 'rgba(99,179,237,.35)' : 'var(--border)'}`,
+            borderRadius: '10px',
+            background: autopilot?.enabled ? 'rgba(99,179,237,.06)' : 'var(--bg-elevated)',
+            padding: '1rem 1.1rem',
+            marginBottom: '.25rem',
+          }}>
+            {/* Header row */}
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '.6rem' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '.55rem' }}>
+                {autopilot?.enabled
+                  ? <Zap size={15} style={{ color: 'var(--accent)' }} />
+                  : <ZapOff size={15} style={{ color: 'var(--text-secondary)' }} />}
+                <span style={{ fontSize: '.85rem', fontWeight: 700, color: autopilot?.enabled ? 'var(--accent)' : 'var(--text-primary)' }}>
+                  Autopilot
+                </span>
+                {autopilot?.enabled && (
+                  <span style={{
+                    fontSize: '.68rem', fontWeight: 700, letterSpacing: '.05em',
+                    padding: '.15rem .5rem', borderRadius: '20px',
+                    background: `var(--${autopilot.color}-dim, var(--accent-dim))`,
+                    color: `var(--${autopilot.color}, var(--accent))`,
+                    textTransform: 'uppercase',
+                  }}>
+                    {autopilot.regime}
+                  </span>
+                )}
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '.5rem' }}>
+                {autopilot?.enabled && (
+                  <button
+                    type="button"
+                    onClick={handleRunAutopilotNow}
+                    disabled={autopilotLoading}
+                    title="Evaluate now"
+                    style={{
+                      display: 'flex', alignItems: 'center', gap: '.3rem',
+                      padding: '.3rem .65rem', borderRadius: '6px',
+                      border: '1px solid var(--border)', background: 'var(--bg-panel)',
+                      color: 'var(--text-secondary)', fontSize: '.72rem', cursor: 'pointer',
+                      opacity: autopilotLoading ? 0.5 : 1,
+                    }}
+                  >
+                    <PlayCircle size={11} /> Run now
+                  </button>
+                )}
+                <label style={{ display: 'flex', alignItems: 'center', gap: '.5rem', cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={autopilot?.enabled ?? false}
+                    onChange={handleToggleAutopilot}
+                    disabled={autopilotLoading || !autopilot}
+                    style={{ display: 'none' }}
+                  />
+                  <span style={{
+                    display: 'inline-flex', width: '36px', height: '20px', borderRadius: '10px',
+                    background: autopilot?.enabled ? 'var(--accent)' : 'var(--bg-hover)',
+                    border: '1px solid var(--border)', position: 'relative',
+                    transition: 'background .2s', cursor: autopilotLoading ? 'wait' : 'pointer',
+                  }}>
+                    <span style={{
+                      position: 'absolute', top: '2px',
+                      left: autopilot?.enabled ? '18px' : '2px',
+                      width: '14px', height: '14px', borderRadius: '50%',
+                      background: 'white', transition: 'left .2s',
+                      boxShadow: '0 1px 3px rgba(0,0,0,.3)',
+                    }} />
+                  </span>
+                  <span style={{ fontSize: '.78rem', color: 'var(--text-secondary)' }}>
+                    {autopilot?.enabled ? 'ON' : 'OFF'}
+                  </span>
+                </label>
+              </div>
+            </div>
+
+            {/* Description */}
+            <p style={{ fontSize: '.75rem', color: 'var(--text-secondary)', lineHeight: 1.5, marginBottom: autopilot?.enabled ? '.75rem' : 0 }}>
+              When active, risk automatically adjusts gate thresholds every 30 min based on rolling win rate,
+              daily P&L, and session timing.  Manual saves are preserved as a baseline but may be overridden at the next cycle.
+            </p>
+
+            {/* Status detail — only shown when enabled */}
+            {autopilot?.enabled && (
+              <>
+                {/* Reason */}
+                <div style={{
+                  display: 'flex', alignItems: 'flex-start', gap: '.5rem',
+                  padding: '.55rem .7rem', borderRadius: '7px',
+                  background: 'var(--bg-panel)', border: '1px solid var(--border)',
+                  marginBottom: '.6rem',
+                }}>
+                  <Activity size={12} style={{ color: 'var(--text-dim)', marginTop: '.15rem', flexShrink: 0 }} />
+                  <span style={{ fontSize: '.73rem', color: 'var(--text-secondary)', lineHeight: 1.5 }}>
+                    {autopilot.reason}
+                  </span>
+                </div>
+
+                {/* Last run + changes */}
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '.4rem' }}>
+                  <span style={{ fontSize: '.68rem', color: 'var(--text-dim)' }}>
+                    {autopilot.last_run
+                      ? `Last evaluated ${new Date(autopilot.last_run).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} · ${new Date(autopilot.last_run).toLocaleDateString()}`
+                      : 'Not yet evaluated'}
+                  </span>
+                  {Object.keys(autopilot.changes).length > 0 && (
+                    <div style={{ display: 'flex', gap: '.35rem', flexWrap: 'wrap' }}>
+                      {Object.entries(autopilot.changes).map(([k, v]) => (
+                        <span key={k} style={{
+                          fontSize: '.65rem', padding: '.1rem .45rem', borderRadius: '4px',
+                          background: 'var(--bg-hover)', color: 'var(--text-secondary)',
+                          fontFamily: 'var(--mono)',
+                        }}>
+                          {k.replace(/_/g, ' ')} {v.from} → {v.to}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+
           {/* Entry & TA Veto */}
           <div style={{ borderBottom: '1px solid var(--border)', paddingBottom: '1.25rem', marginBottom: '1.25rem' }}>
             <p style={{ fontSize: '.75rem', fontWeight: 700, color: 'var(--accent)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: '.75rem' }}>
@@ -1126,6 +1349,167 @@ export function SettingsPage() {
                 <input type="number" step="0.01" min="0.1" max="1.0" className="settings-input"
                   value={gatesForm.ta_min_confidence}
                   onChange={e => setGatesForm(p => ({ ...p, ta_min_confidence: parseFloat(e.target.value) }))} />
+              </div>
+              <div>
+                <label className="settings-label">S/R Proximity Block (%)</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>
+                  Block new entries when price is this close to opposing support/resistance
+                </p>
+                <input type="number" step="0.0005" min="0.001" max="0.03" className="settings-input"
+                  value={gatesForm.sr_proximity_block_pct}
+                  onChange={e => setGatesForm(p => ({ ...p, sr_proximity_block_pct: parseFloat(e.target.value) }))} />
+                <p style={{ fontSize: '.68rem', color: 'var(--text-dim)', marginTop: '.25rem' }}>
+                  Current: {(gatesForm.sr_proximity_block_pct * 100).toFixed(2)}%
+                </p>
+              </div>
+              <div>
+                <label className="settings-label">Max Daily Fees (% of Capital)</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>
+                  Hard circuit breaker: block all new entries when daily fees exceed this % of starting capital. Prevents profit bleed.
+                </p>
+                <input type="number" step="0.1" min="0.1" max="2.0" className="settings-input"
+                  value={gatesForm.max_daily_fees_pct}
+                  onChange={e => setGatesForm(p => ({ ...p, max_daily_fees_pct: parseFloat(e.target.value) }))} />
+                <p style={{ fontSize: '.68rem', color: 'var(--text-dim)', marginTop: '.25rem' }}>
+                  Current: {gatesForm.max_daily_fees_pct.toFixed(2)}% = ${((gatesForm.max_daily_fees_pct / 100) * 50000).toFixed(0)} on $50k
+                </p>
+              </div>
+              <div>
+                <label className="settings-label">Fee Coverage Guard</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>
+                  Tighten entry quality when realized PnL is not covering fees by target multiple.
+                </p>
+                <label style={{ display: 'inline-flex', alignItems: 'center', gap: '.45rem', fontSize: '.75rem', color: 'var(--text-secondary)' }}>
+                  <input
+                    type="checkbox"
+                    checked={gatesForm.fee_coverage_guard_enabled}
+                    onChange={e => setGatesForm(p => ({ ...p, fee_coverage_guard_enabled: e.target.checked }))}
+                  />
+                  {gatesForm.fee_coverage_guard_enabled ? 'Enabled' : 'Disabled'}
+                </label>
+              </div>
+              <div>
+                <label className="settings-label">Min Fee Coverage Ratio (PnL / Fees)</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>
+                  Target multiple before entries are considered efficient (higher = stricter, fewer trades).
+                </p>
+                <input type="number" step="0.1" min="0.5" max="10.0" className="settings-input"
+                  value={gatesForm.fee_coverage_min_ratio}
+                  onChange={e => setGatesForm(p => ({ ...p, fee_coverage_min_ratio: parseFloat(e.target.value) }))} />
+              </div>
+              <div>
+                <label className="settings-label">Guard Activation Fees (USD)</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>
+                  Ignore fee-coverage checks until at least this much fees are accrued.
+                </p>
+                <input type="number" step="5" min="0" max="5000" className="settings-input"
+                  value={gatesForm.fee_coverage_min_fees_usd}
+                  onChange={e => setGatesForm(p => ({ ...p, fee_coverage_min_fees_usd: parseFloat(e.target.value) }))} />
+              </div>
+              <div>
+                <label className="settings-label">Fee Coverage Window (Closed Trades)</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>
+                  Number of most recent closed trades used for net-edge/fees calculation.
+                </p>
+                <input type="number" step="1" min="5" max="500" className="settings-input"
+                  value={gatesForm.fee_coverage_window_trades}
+                  onChange={e => setGatesForm(p => ({ ...p, fee_coverage_window_trades: parseInt(e.target.value || '60', 10) }))} />
+              </div>
+              <div>
+                <label className="settings-label">Min Closed Trades Before Guard</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>
+                  Prevents early-session noise from triggering the guard before sample size is meaningful.
+                </p>
+                <input type="number" step="1" min="1" max="200" className="settings-input"
+                  value={gatesForm.fee_coverage_min_closed_trades}
+                  onChange={e => setGatesForm(p => ({ ...p, fee_coverage_min_closed_trades: parseInt(e.target.value || '8', 10) }))} />
+              </div>
+              <div>
+                <label className="settings-label">Include Slippage In Coverage</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>
+                  Subtract estimated round-trip slippage from net edge before coverage ratio is computed.
+                </p>
+                <label style={{ display: 'inline-flex', alignItems: 'center', gap: '.45rem', fontSize: '.75rem', color: 'var(--text-secondary)' }}>
+                  <input
+                    type="checkbox"
+                    checked={gatesForm.fee_coverage_include_slippage}
+                    onChange={e => setGatesForm(p => ({ ...p, fee_coverage_include_slippage: e.target.checked }))}
+                  />
+                  {gatesForm.fee_coverage_include_slippage ? 'Enabled' : 'Disabled'}
+                </label>
+              </div>
+              <div>
+                <label className="settings-label">Estimated Slippage (bps per leg)</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>
+                  Applied to entry and exit notional in the rolling coverage window (2.0 = 0.02% per leg).
+                </p>
+                <input type="number" step="0.1" min="0" max="50" className="settings-input"
+                  value={gatesForm.fee_coverage_slippage_bps}
+                  onChange={e => setGatesForm(p => ({ ...p, fee_coverage_slippage_bps: parseFloat(e.target.value) }))} />
+              </div>
+              <div>
+                <label className="settings-label">Include Funding In Coverage</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>
+                  Funding is currently reserved for exchange integration and defaults to zero until funding data is wired in.
+                </p>
+                <label style={{ display: 'inline-flex', alignItems: 'center', gap: '.45rem', fontSize: '.75rem', color: 'var(--text-secondary)' }}>
+                  <input
+                    type="checkbox"
+                    checked={gatesForm.fee_coverage_include_funding}
+                    onChange={e => setGatesForm(p => ({ ...p, fee_coverage_include_funding: e.target.checked }))}
+                  />
+                  {gatesForm.fee_coverage_include_funding ? 'Enabled' : 'Disabled'}
+                </label>
+              </div>
+              <div>
+                <label className="settings-label">Leverage Gate</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>
+                  Only allow leverage on high-confidence trades that clear the leverage threshold.
+                </p>
+                <label style={{ display: 'inline-flex', alignItems: 'center', gap: '.45rem', fontSize: '.75rem', color: 'var(--text-secondary)' }}>
+                  <input
+                    type="checkbox"
+                    checked={gatesForm.leverage_enabled}
+                    onChange={e => setGatesForm(p => ({ ...p, leverage_enabled: e.target.checked }))}
+                  />
+                  {gatesForm.leverage_enabled ? 'Enabled' : 'Disabled'}
+                </label>
+              </div>
+              <div>
+                <label className="settings-label">Leverage Eligibility Confidence</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>
+                  Trades below this confidence stay at 1x regardless of the position-size signal.
+                </p>
+                <input type="number" step="0.01" min="0.5" max="1.0" className="settings-input"
+                  value={gatesForm.leverage_confidence_threshold}
+                  onChange={e => setGatesForm(p => ({ ...p, leverage_confidence_threshold: parseFloat(e.target.value) }))} />
+              </div>
+              <div>
+                <label className="settings-label">Tier 1 Leverage</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>
+                  Confidence {gatesForm.leverage_tier_1_min_confidence.toFixed(2)} to {gatesForm.leverage_tier_1_max_confidence.toFixed(2)} uses this multiplier.
+                </p>
+                <input type="number" step="0.1" min="1.0" max="5.0" className="settings-input"
+                  value={gatesForm.leverage_tier_1_multiplier}
+                  onChange={e => setGatesForm(p => ({ ...p, leverage_tier_1_multiplier: parseFloat(e.target.value) }))} />
+              </div>
+              <div>
+                <label className="settings-label">Tier 2 Leverage</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>
+                  Confidence {gatesForm.leverage_tier_2_min_confidence.toFixed(2)} to {gatesForm.leverage_tier_2_max_confidence.toFixed(2)} uses this multiplier.
+                </p>
+                <input type="number" step="0.1" min="1.0" max="5.0" className="settings-input"
+                  value={gatesForm.leverage_tier_2_multiplier}
+                  onChange={e => setGatesForm(p => ({ ...p, leverage_tier_2_multiplier: parseFloat(e.target.value) }))} />
+              </div>
+              <div>
+                <label className="settings-label">Tier 3 Leverage</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>
+                  Confidence at or above {gatesForm.leverage_tier_3_min_confidence.toFixed(2)} uses the highest leverage tier.
+                </p>
+                <input type="number" step="0.1" min="1.0" max="5.0" className="settings-input"
+                  value={gatesForm.leverage_tier_3_multiplier}
+                  onChange={e => setGatesForm(p => ({ ...p, leverage_tier_3_multiplier: parseFloat(e.target.value) }))} />
               </div>
             </div>
           </div>

@@ -17,7 +17,6 @@ class RunAgentRequest(BaseModel):
     agent_id: str
     name: str
     strategy_type: str
-    trading_pairs: List[str]
     allocation_percentage: float
     max_position_size: float
     stop_loss_pct: float = 2.0
@@ -97,12 +96,13 @@ async def stop_automation():
 @router.post("/run-agent", response_model=RunAgentResponse)
 async def run_agent(request: RunAgentRequest, use_paper: Optional[bool] = None):
     use_paper_mode = use_paper if use_paper is not None else _use_paper_trading
-    
+    from app.api.routes.settings import get_trading_prefs as _gtp
+    _scan_pairs = _gtp().trading_pairs or ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT"]
     result = await agent_scheduler.run_agent(
         agent_id=request.agent_id,
         name=request.name,
         strategy_type=request.strategy_type,
-        trading_pairs=request.trading_pairs,
+        trading_pairs=_scan_pairs,
         allocation_pct=request.allocation_percentage,
         max_position=request.max_position_size,
         stop_loss_pct=request.stop_loss_pct,

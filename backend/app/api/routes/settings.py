@@ -31,6 +31,8 @@ class RiskLimits(BaseModel):
     default_stop_loss_pct: float = Field(default=3.5, ge=0.1, le=50)
     default_take_profit_pct: float = Field(default=7.0, ge=0.1, le=100)
     max_leverage: float = Field(default=1.0, ge=1.0, le=125)
+    max_leveraged_notional_pct: float = Field(default=200.0, ge=10.0, le=1000.0)
+    liquidation_buffer_pct: float = Field(default=12.5, ge=1.0, le=50.0)
     exposure_threshold_pct: float = Field(default=80.0, ge=10.0, le=100.0)
 
 
@@ -41,7 +43,11 @@ class TradingPreferences(BaseModel):
     auto_confirm_orders: bool = False
     default_order_type: str = "limit"
     trading_pairs: list[str] = Field(
-        default=["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT"]
+        default=[
+            "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT",
+            "DOGEUSDT", "BNBUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT",
+            "MATICUSDT", "LTCUSDT", "UNIUSDT", "ATOMUSDT", "NEARUSDT",
+        ]
     )
 
 
@@ -59,7 +65,7 @@ class LlmConfig(BaseModel):
 class TradingGates(BaseModel):
     """Configurable thresholds for all trading gates and filters."""
     # Entry confidence
-    min_entry_confidence: float = Field(default=0.50, ge=0.1, le=1.0,
+    min_entry_confidence: float = Field(default=0.60, ge=0.1, le=1.0,
         description="Minimum signal confidence to enter a trade (0.0–1.0)")
     ta_veto_confidence: float = Field(default=0.75, ge=0.1, le=1.0,
         description="TA analyst must exceed this confidence to veto a signal")
@@ -77,8 +83,8 @@ class TradingGates(BaseModel):
     # HTF adjustments
     htf_aligned_boost: float = Field(default=0.15, ge=0.0, le=0.5,
         description="Confidence bonus when higher-TF trend aligns with signal (+fraction)")
-    htf_opposed_penalty: float = Field(default=0.50, ge=0.0, le=0.9,
-        description="Confidence penalty when higher-TF trend opposes signal (fraction removed)")
+    htf_opposed_penalty: float = Field(default=0.30, ge=0.0, le=0.9,
+        description="Confidence penalty when higher-TF trend opposes signal (fraction removed). Lower values allow valid counter-trend setups to pass.")
     # Whale sentiment
     whale_entry_gate_enabled: bool = Field(default=True,
         description="When enabled, 70%+ opposing whale notional hard-blocks new entries. Disable to ignore whale positioning for trade entry decisions.")
@@ -92,7 +98,7 @@ class TradingGates(BaseModel):
     min_runs_before_disable: int = Field(default=15, ge=5, le=100,
         description="Minimum trade runs required before CIO or traders can disable an agent")
     # Circuit breaker
-    circuit_breaker_max_trades: int = Field(default=30, ge=5, le=200,
+    circuit_breaker_max_trades: int = Field(default=20, ge=5, le=200,
         description="Maximum trades per day before halting all trading")
     # Correlation limits
     max_same_asset_positions: int = Field(default=2, ge=1, le=10,
@@ -100,9 +106,9 @@ class TradingGates(BaseModel):
     max_directional_concentration_pct: float = Field(default=40.0, ge=10.0, le=100.0,
         description="Maximum % of capital in all-long or all-short positions")
     # Position sizing
-    confidence_size_reference: float = Field(default=0.65, ge=0.3, le=1.0,
+    confidence_size_reference: float = Field(default=0.78, ge=0.3, le=1.0,
         description="Confidence level at which full position size is used (sizing reference)")
-    confidence_size_floor: float = Field(default=0.50, ge=0.1, le=1.0,
+    confidence_size_floor: float = Field(default=0.25, ge=0.1, le=1.0,
         description="Minimum position size multiplier regardless of low confidence")
     # TA confidence boost/penalty
     ta_boost_multiplier: float = Field(default=0.20, ge=0.0, le=0.5,
@@ -111,6 +117,9 @@ class TradingGates(BaseModel):
         description="Confidence penalty when TA opposes signal (fraction removed)")
     ta_min_confidence: float = Field(default=0.60, ge=0.1, le=1.0,
         description="Minimum TA confidence required to apply boost or penalty")
+    # Structural-level proximity gate (support/resistance)
+    sr_proximity_block_pct: float = Field(default=0.005, ge=0.001, le=0.03,
+        description="Block entries when price is within this fraction of opposing support/resistance (0.005 = 0.5%)")
     # ── US Market Open Management ─────────────────────────────────────────────
     # The 09:00 ET (13:00–13:30 UTC) open is the highest-volatility window of the
     # day. Institutional order flow, delta-hedging, and stop-hunting routinely
@@ -133,8 +142,82 @@ class TradingGates(BaseModel):
         description="End of elevated-confidence confirmation window in UTC HHMM (default 14:15)")
     us_open_confirmation_confidence: float = Field(default=0.80, ge=0.5, le=1.0,
         description="Minimum confidence required to enter during the US open confirmation window")
-
-
+    # ── London Open Fake-out Window ───────────────────────────────────────────
+    # The London open (08:00 UTC) typically produces a sharp spike that reverses
+    # before the real trend establishes (~09:00 UTC). Entering during 08:30–09:00
+    # UTC risks getting caught in the fake-out. We apply a confidence penalty
+    # rather than a full block (unlike US open) since crypto is less affected.
+    london_open_fakeout_enabled: bool = Field(default=True,
+        description="Apply confidence penalty during London open fake-out window (08:30–09:00 UTC)")
+    london_open_fakeout_start_utc: int = Field(default=830, ge=0, le=2359,
+        description="London fake-out penalty window start in UTC HHMM (default 08:30)")
+    london_open_fakeout_end_utc: int = Field(default=900, ge=0, le=2359,
+        description="London fake-out penalty window end in UTC HHMM (default 09:00)")
+    london_open_fakeout_penalty: float = Field(default=0.15, ge=0.0, le=0.5,
+        description="Confidence penalty (fraction) applied during London fake-out window")
+    london_open_fakeout_min_confidence: float = Field(default=0.75, ge=0.5, le=1.0,
+        description="Minimum confidence required to enter during London fake-out window (after penalty)")
+    # ── Overnight Dead Zone ───────────────────────────────────────────────────
+    # 20:00–00:00 UTC: NY session winding down, Asian session not yet active.
+    # Volume is thin, spreads widen, signals are noise-heavy. Momentum and
+    # breakout strategies are most vulnerable. Apply a confidence dampener.
+    dead_zone_enabled: bool = Field(default=True,
+        description="Apply confidence penalty during low-volume overnight window (20:00–00:00 UTC)")
+    dead_zone_start_utc: int = Field(default=2000, ge=0, le=2359,
+        description="Overnight dead zone start in UTC HHMM (default 20:00)")
+    dead_zone_end_utc: int = Field(default=2359, ge=0, le=2359,
+        description="Overnight dead zone end in UTC HHMM (default 23:59 — midnight threshold)")
+    dead_zone_penalty: float = Field(default=0.15, ge=0.0, le=0.5,
+        description="Confidence penalty (fraction) applied during overnight dead zone")
+    dead_zone_min_confidence: float = Field(default=0.70, ge=0.5, le=1.0,
+        description="Minimum confidence required to enter during dead zone (after penalty)")
+    dead_zone_noop_enabled: bool = Field(default=True,
+        description="When enabled, scheduler performs no-op during dead zone to conserve LLM/API tokens; only position monitoring continues")
+    # ── Daily Fee Budget Circuit Breaker ──────────────────────────────────────
+    # Hard stop that prevents new entries when cumulative daily fees exceed this
+    # percentage of starting capital. Prevents fee bleed from consuming profits.
+    max_daily_fees_pct: float = Field(default=0.5, ge=0.1, le=2.0,
+        description="Hard circuit breaker: block all new entries when daily fees exceed this % of starting capital (0.5 = 50 bps). Prevents profit-eroding fee churn.")
+    # ── Fee Coverage Guard ─────────────────────────────────────────────────────
+    # Encourages selective trading by requiring realized edge to cover fees by a
+    # minimum multiple. When below target, entry quality thresholds tighten.
+    fee_coverage_guard_enabled: bool = Field(default=True,
+        description="When enabled, tighten entry quality when realized PnL is not covering fees by the target multiple.")
+    fee_coverage_min_ratio: float = Field(default=2.5, ge=0.5, le=10.0,
+        description="Minimum realized PnL-to-fees coverage ratio target (2.5 = realized PnL should be 2.5x fees).")
+    fee_coverage_min_fees_usd: float = Field(default=25.0, ge=0.0, le=5000.0,
+        description="Minimum total fees before fee-coverage guard activates to avoid early-session noise.")
+    fee_coverage_window_trades: int = Field(default=60, ge=5, le=500,
+        description="Number of most recent closed trades used to compute fee coverage quality.")
+    fee_coverage_min_closed_trades: int = Field(default=8, ge=1, le=200,
+        description="Minimum closed trades required before fee-coverage guard can activate.")
+    fee_coverage_include_slippage: bool = Field(default=True,
+        description="Include estimated slippage costs in fee-coverage net-edge calculation.")
+    fee_coverage_slippage_bps: float = Field(default=2.0, ge=0.0, le=50.0,
+        description="Estimated slippage per execution leg in basis points (2.0 = 2 bps per entry and exit leg).")
+    fee_coverage_include_funding: bool = Field(default=True,
+        description="Include funding costs in fee-coverage net-edge calculation when available.")
+    # ── Confidence-Gated Leverage ────────────────────────────────────────────
+    leverage_enabled: bool = Field(default=True,
+        description="Allow leverage only on high-confidence trades.")
+    leverage_confidence_threshold: float = Field(default=0.75, ge=0.5, le=1.0,
+        description="Minimum confidence required before any leverage above 1x is allowed.")
+    leverage_tier_1_min_confidence: float = Field(default=0.75, ge=0.5, le=1.0,
+        description="Minimum confidence for tier 1 leverage.")
+    leverage_tier_1_max_confidence: float = Field(default=0.85, ge=0.5, le=1.0,
+        description="Upper bound for tier 1 leverage confidence band.")
+    leverage_tier_1_multiplier: float = Field(default=2.0, ge=1.0, le=5.0,
+        description="Leverage multiplier for confidence tier 1.")
+    leverage_tier_2_min_confidence: float = Field(default=0.85, ge=0.5, le=1.0,
+        description="Minimum confidence for tier 2 leverage.")
+    leverage_tier_2_max_confidence: float = Field(default=0.95, ge=0.5, le=1.0,
+        description="Upper bound for tier 2 leverage confidence band.")
+    leverage_tier_2_multiplier: float = Field(default=3.0, ge=1.0, le=5.0,
+        description="Leverage multiplier for confidence tier 2.")
+    leverage_tier_3_min_confidence: float = Field(default=0.95, ge=0.5, le=1.0,
+        description="Minimum confidence for tier 3 leverage.")
+    leverage_tier_3_multiplier: float = Field(default=5.0, ge=1.0, le=5.0,
+        description="Leverage multiplier for highest-confidence trades.")
 
 
 
@@ -413,6 +496,33 @@ async def update_trading_gates(req: TradingGatesUpdateRequest):
     _runtime_trading_gates = TradingGates(**req.model_dump())
     await _save_setting("trading_gates", req.model_dump())
     return _runtime_trading_gates
+
+
+# ── Gate Autopilot ────────────────────────────────────────────────────────────
+
+class AutopilotToggleRequest(BaseModel):
+    enabled: bool
+
+
+@router.get("/gates/autopilot")
+async def get_gate_autopilot_status():
+    """Return the current state of the gate autopilot (enabled, regime, last run)."""
+    from app.services.gate_autopilot import gate_autopilot
+    return gate_autopilot.status()
+
+
+@router.post("/gates/autopilot")
+async def set_gate_autopilot(req: AutopilotToggleRequest):
+    """Enable or disable the gate autopilot.  Returns the updated status."""
+    from app.services.gate_autopilot import gate_autopilot
+    return await gate_autopilot.set_enabled(req.enabled)
+
+
+@router.post("/gates/autopilot/run")
+async def run_gate_autopilot_now():
+    """Trigger an immediate autopilot evaluation (for manual testing)."""
+    from app.services.gate_autopilot import gate_autopilot
+    return await gate_autopilot.run_once()
 
 
 @router.put("/llm")

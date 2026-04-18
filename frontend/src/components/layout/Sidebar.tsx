@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react';
 import { Activity, Bot, Wallet, Settings, X, TrendingUp, History, Zap, Users, MessageCircle, BarChart2, GitBranch } from 'lucide-react';
 import { useAppSelector, useAppDispatch } from '../../store/hooks';
 import { setSidebarOpen } from '../../store/slices/uiSlice';
@@ -11,11 +12,37 @@ interface SidebarProps {
   onNavigate: (page: string) => void;
 }
 
+const MARKET_CLOCKS = [
+  { label: 'London', timeZone: 'Europe/London' },
+  { label: 'New York', timeZone: 'America/New_York' },
+  { label: 'Tokyo', timeZone: 'Asia/Tokyo' },
+];
+
+function formatMarketTime(now: Date, timeZone: string) {
+  return new Intl.DateTimeFormat([], {
+    weekday: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+    timeZone,
+  }).format(now);
+}
+
 export function Sidebar({ activePage, onNavigate }: SidebarProps) {
+  const [clockNow, setClockNow] = useState(() => new Date());
   const dispatch = useAppDispatch();
   const sidebarOpen = useAppSelector((s) => s.ui.sidebarOpen);
   const signal = useAppSelector((s) => s.market.signal);
   const selectedSymbol = useAppSelector((s) => s.market.selectedSymbol);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setClockNow(new Date());
+    }, 1000);
+
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, []);
 
   // Data for sidebar badges
   const { data: automationStatus } = useAutomationStatus();
@@ -64,6 +91,15 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
           <button type="button" onClick={closeSidebar} className="header-btn">
             <X size={16} />
           </button>
+        </div>
+
+        <div className="sidebar-market-clocks">
+          {MARKET_CLOCKS.map((market) => (
+            <div key={market.label} className="sidebar-market-clock">
+              <div className="sidebar-market-clock-label">{market.label}</div>
+              <div className="sidebar-market-clock-time">{formatMarketTime(clockNow, market.timeZone)}</div>
+            </div>
+          ))}
         </div>
 
         <nav className="sidebar-nav">

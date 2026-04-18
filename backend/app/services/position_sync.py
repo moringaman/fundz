@@ -121,17 +121,38 @@ class PositionSyncService:
             live_keys = set(live_symbols_by_side.keys())
             for (sym, side), db_pos in existing_map.items():
                 if (sym, side) not in live_keys and db_pos.quantity > 0:
-                    logger.info(f"PositionSync: external close detected {sym} {side.value}")
+                    exit_price = db_pos.current_price or db_pos.entry_price or 0.0
+                    entry_price = db_pos.entry_price or 0.0
+                    logger.info(
+                        f"PositionSync: external close detected {sym} {side.value} "
+                        f"qty={db_pos.quantity:.6f} entry={entry_price:.4f} exit={exit_price:.4f}"
+                    )
                     trade = Trade(
                         id=_gen_id(), user_id=_DEFAULT_USER, agent_id=db_pos.agent_id,
                         symbol=sym, side=OrderSide.SELL if side == OrderSide.BUY else OrderSide.BUY,
-                        quantity=db_pos.quantity, price=db_pos.current_price or 0,
-                        total=(db_pos.quantity * (db_pos.current_price or 0)),
+                        quantity=db_pos.quantity, price=exit_price,
+                        total=(db_pos.quantity * exit_price),
                         fee=0.0, status=OrderStatus.FILLED,
                         phemex_order_id="external-close", is_paper=False,
                         filled_at=datetime.utcnow(),
                     )
                     db.add(trade)
+
+                    # Record P&L in scheduler so metrics + win rate stay accurate
+                    if db_pos.agent_id and entry_price:
+                        try:
+                            from app.services.agent_scheduler import agent_scheduler as _sched
+                            _sched.record_pnl_from_external_close(
+                                agent_id=db_pos.agent_id,
+                                symbol=sym,
+                                side=side.value,
+                                quantity=db_pos.quantity,
+                                entry_price=entry_price,
+                                exit_price=exit_price,
+                            )
+                        except Exception as _pnl_err:
+                            logger.warning(f"PositionSync: P&L recording failed: {_pnl_err}")
+
                     await db.delete(db_pos)
                     summary["externally_closed"] += 1
 

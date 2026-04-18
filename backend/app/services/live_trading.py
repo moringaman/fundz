@@ -88,6 +88,9 @@ class LiveTradingService:
         stop_loss_price: Optional[float] = None,
         take_profit_price: Optional[float] = None,
         trailing_stop_pct: Optional[float] = None,
+        leverage: float = 1.0,
+        margin_used: Optional[float] = None,
+        liquidation_price: Optional[float] = None,
     ) -> Optional[dict]:
         """
         Place a real Phemex contract order with SL/TP.
@@ -120,6 +123,8 @@ class LiveTradingService:
 
         # ── Place Phemex order ─────────────────────────────────────────────
         try:
+            if leverage > 1.0:
+                await phemex.set_leverage(symbol, max(1, int(round(leverage))))
             resp = await phemex.place_contract_order(
                 symbol=symbol,
                 side=side_str,
@@ -151,6 +156,8 @@ class LiveTradingService:
                 price=price,
                 total=quantity * price,
                 fee=fee,
+                leverage=leverage,
+                margin_used=margin_used or ((quantity * price) / max(leverage, 1.0)),
                 status=OrderStatus.FILLED,
                 phemex_order_id=phemex_order_id,
                 is_paper=False,
@@ -176,6 +183,9 @@ class LiveTradingService:
                     quantity=quantity,
                     entry_price=price,
                     current_price=price,
+                    leverage=leverage,
+                    margin_used=margin_used or ((quantity * price) / max(leverage, 1.0)),
+                    liquidation_price=liquidation_price,
                     stop_loss_price=stop_loss_price,
                     take_profit_price=take_profit_price,
                     trailing_stop_pct=trailing_stop_pct,
@@ -190,6 +200,9 @@ class LiveTradingService:
                 pos.entry_price = (pos.entry_price * pos.quantity + price * quantity) / total_qty
                 pos.quantity = total_qty
                 pos.current_price = price
+                pos.leverage = max(float(pos.leverage or 1.0), leverage)
+                pos.margin_used = float(pos.margin_used or 0.0) + (margin_used or ((quantity * price) / max(leverage, 1.0)))
+                pos.liquidation_price = liquidation_price or pos.liquidation_price
                 if stop_loss_price:
                     pos.stop_loss_price = stop_loss_price
                 if take_profit_price:
@@ -210,6 +223,9 @@ class LiveTradingService:
             "side": side_str,
             "quantity": quantity,
             "price": price,
+            "leverage": leverage,
+            "margin_used": margin_used or ((quantity * price) / max(leverage, 1.0)),
+            "liquidation_price": liquidation_price,
             "phemex_order_id": phemex_order_id,
             "is_paper": False,
         }
@@ -278,6 +294,7 @@ class LiveTradingService:
                 "entry_price": pos.entry_price,
                 "exit_price": current_price,
                 "pnl": round(final_pnl, 4),
+                "leverage": pos.leverage or 1.0,
                 "phemex_order_id": close_order_id,
                 "is_paper": False,
             }
@@ -366,6 +383,7 @@ class LiveTradingService:
             "quantity_closed": qty_to_close,
             "remaining_quantity": max(remaining_qty, 0),
             "close_price": price,
+            "leverage": pos.leverage or 1.0,
             "phemex_order_id": close_order_id,
             "is_paper": False,
         }
@@ -485,6 +503,8 @@ class LiveTradingService:
                 "price": t.price,
                 "total": t.total,
                 "fee": t.fee,
+                "leverage": t.leverage or 1.0,
+                "margin_used": t.margin_used or 0.0,
                 "phemex_order_id": t.phemex_order_id,
                 "filled_at": t.filled_at.isoformat() if t.filled_at else None,
             }

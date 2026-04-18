@@ -19,6 +19,9 @@ class RiskConfig:
     trailing_stop_pct: Optional[float] = None
     max_open_positions: int = 3
     max_exposure: Optional[float] = None  # absolute $ cap; if None, falls back to max_position_size * 10
+    leverage: float = 1.0
+    max_leveraged_notional_pct: float = 200.0
+    liquidation_buffer_pct: float = 12.5
 
 
 @dataclass
@@ -64,17 +67,24 @@ class RiskManager:
         quantity: float,
         entry_price: float,
         risk_config: RiskConfig,
-        current_positions: List[Dict[str, Any]] = []
+        current_positions: Optional[List[Dict[str, Any]]] = None
     ) -> RiskCheckResult:
         self._check_daily_reset()
+        current_positions = current_positions or []
         
         total_exposure = sum(
             pos.get('quantity', 0) * pos.get('entry_price', 0)
             for pos in current_positions
         )
+
+        total_leveraged_notional = sum(
+            pos.get('notional', pos.get('quantity', 0) * pos.get('entry_price', 0))
+            for pos in current_positions
+        )
         
         trade_value = quantity * entry_price
         potential_exposure = total_exposure + trade_value
+        potential_leveraged_notional = total_leveraged_notional + trade_value
         
         if potential_exposure > (risk_config.max_exposure or risk_config.max_position_size * 10):
             exposure_limit = risk_config.max_exposure or risk_config.max_position_size * 10
@@ -82,6 +92,19 @@ class RiskManager:
                 allowed=False,
                 action="reject",
                 reason=f"Max exposure exceeded: ${exposure_limit:.0f}"
+            )
+
+        leveraged_notional_limit = 0.0
+        if risk_config.total_capital > 0:
+            leveraged_notional_limit = risk_config.total_capital * (risk_config.max_leveraged_notional_pct / 100)
+        if leveraged_notional_limit > 0 and potential_leveraged_notional > leveraged_notional_limit:
+            return RiskCheckResult(
+                allowed=False,
+                action="reject",
+                reason=(
+                    f"Leveraged notional cap exceeded: ${potential_leveraged_notional:,.0f} "
+                    f"> ${leveraged_notional_limit:,.0f}"
+                )
             )
         
         if len(current_positions) >= risk_config.max_open_positions:
@@ -120,6 +143,69 @@ class RiskManager:
             stop_loss_price=stop_loss,
             take_profit_price=take_profit
         )
+
+    def calculate_liquidation_price(
+        self,
+        entry_price: float,
+        side: str,
+        leverage: float,
+        maintenance_margin_pct: float = 0.5,
+    ) -> Optional[float]:
+        """Approximate liquidation price for a leveraged position on cross margin.
+
+        This intentionally uses a conservative approximation. We are not trying to
+        mirror exchange liquidation math perfectly; we are establishing a danger zone
+        early enough to preserve capital.
+        """
+        if entry_price <= 0 or leverage <= 1.0:
+            return None
+
+        leverage = max(leverage, 1.0)
+        mmr = max(maintenance_margin_pct / 100, 0.0)
+        side_l = str(side).lower()
+
+        if side_l in ('buy', 'long'):
+            return entry_price * (1.0 - (1.0 / leverage) + mmr)
+        return entry_price * (1.0 + (1.0 / leverage) - mmr)
+
+    def check_liquidation_risk(
+        self,
+        side: str,
+        current_price: float,
+        liquidation_price: Optional[float],
+        liquidation_buffer_pct: float,
+    ) -> Optional[Dict[str, Any]]:
+        if not liquidation_price or liquidation_price <= 0 or current_price <= 0:
+            return None
+
+        distance_pct = abs((current_price - liquidation_price) / liquidation_price) * 100
+        side_l = str(side).lower()
+        breached = (
+            current_price <= liquidation_price
+            if side_l in ('buy', 'long')
+            else current_price >= liquidation_price
+        )
+
+        if breached or distance_pct <= liquidation_buffer_pct:
+            return {
+                'risk_level': 'CRITICAL',
+                'action': 'FORCE_CLOSE',
+                'distance_pct': round(distance_pct, 2),
+                'liquidation_price': liquidation_price,
+            }
+        if distance_pct <= liquidation_buffer_pct * 1.5:
+            return {
+                'risk_level': 'HIGH_ALERT',
+                'action': 'WARN',
+                'distance_pct': round(distance_pct, 2),
+                'liquidation_price': liquidation_price,
+            }
+        return {
+            'risk_level': 'SAFE',
+            'action': 'HOLD',
+            'distance_pct': round(distance_pct, 2),
+            'liquidation_price': liquidation_price,
+        }
     
     def check_exit(
         self,

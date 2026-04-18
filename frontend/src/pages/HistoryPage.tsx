@@ -174,9 +174,10 @@ export function HistoryPage() {
             </div>
           ) : (
           <div className="trades-table">
-            <div className="trades-header" style={{ gridTemplateColumns: '1fr 0.5fr 0.7fr 0.9fr 0.9fr 1fr 1fr 0.9fr 0.7fr 0.7fr 0.7fr 0.6fr' }}>
+            <div className="trades-header" style={{ gridTemplateColumns: '1fr 0.5fr 0.7fr 0.9fr 0.9fr 0.7fr 0.9fr 0.9fr 1fr 1fr 0.9fr 0.7fr 0.7fr 0.7fr 0.6fr' }}>
               <span>Symbol</span><span>Side</span><span>Qty</span>
               <span>Entry Price</span><span>Current Price</span>
+              <span>Lev</span><span>Margin</span><span>Liq Price</span>
               <span>Stop Loss</span><span>Take Profit</span>
               <span>Unrealized P&L</span><span>P&L %</span><span>Trader</span><span>Strategy</span><span></span>
             </div>
@@ -195,7 +196,7 @@ export function HistoryPage() {
                 ? '1px solid rgba(243,156,18,0.3)'
                 : undefined;
               return (
-              <div key={pos.id || pos.symbol} className="trades-row" style={{ gridTemplateColumns: '1fr 0.5fr 0.7fr 0.9fr 0.9fr 1fr 1fr 0.9fr 0.7fr 0.7fr 0.7fr 0.6fr', background: rowBg, borderRadius: rowBorder ? 6 : undefined, outline: rowBorder }}>
+              <div key={pos.id || pos.symbol} className="trades-row" style={{ gridTemplateColumns: '1fr 0.5fr 0.7fr 0.9fr 0.9fr 0.7fr 0.9fr 0.9fr 1fr 1fr 0.9fr 0.7fr 0.7fr 0.7fr 0.6fr', background: rowBg, borderRadius: rowBorder ? 6 : undefined, outline: rowBorder }}>
                 <span style={{ fontWeight: 600, display: 'flex', alignItems: 'center', gap: '.3rem' }}>
                   {isCritical && (
                     <span title="Stop-out imminent — within 1% of stop loss" style={{
@@ -211,6 +212,26 @@ export function HistoryPage() {
                 <span>{pos.quantity?.toFixed(6)}</span>
                 <span>${formatPrice(pos.entry_price)}</span>
                 <span>${formatPrice(pos.current_price)}</span>
+                <span style={{
+                  fontFamily: 'var(--mono)',
+                  fontSize: '.74rem',
+                  color: (pos.leverage ?? 1) > 1 ? 'var(--amber, #f39c12)' : 'var(--text-muted)'
+                }}>
+                  {(pos.leverage ?? 1).toFixed(1)}x
+                </span>
+                <span style={{ fontFamily: 'var(--mono)', fontSize: '.74rem' }}>
+                  {pos.margin_used != null ? `$${Number(pos.margin_used).toFixed(2)}` : '—'}
+                </span>
+                <span style={{
+                  fontFamily: 'var(--mono)',
+                  fontSize: '.74rem',
+                  color: pos.liquidation_price != null
+                    && Math.abs((pos.current_price ?? 0) - pos.liquidation_price) / Math.max(pos.current_price ?? 1, 1) < 0.12
+                    ? 'var(--red, #e74c3c)'
+                    : 'var(--text-primary)'
+                }}>
+                  {pos.liquidation_price != null ? `$${formatPrice(pos.liquidation_price)}` : '—'}
+                </span>
 
                 {/* ── Stop Loss (editable) ── */}
                 <span style={{ display: 'flex', flexDirection: 'column', gap: '.1rem' }}>
@@ -359,7 +380,7 @@ export function HistoryPage() {
         </div>
       )}
 
-      {/* Sub-tabs: Closed Trades vs Order Log */}
+      {/* Sub-tabs: Closed Trades vs Order Book */}
       {tab === 'paper' && (
         <div className="card">
           <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', marginBottom: '1rem' }}>
@@ -393,7 +414,7 @@ export function HistoryPage() {
                 color: view === 'orders' ? '#fff' : 'var(--text-secondary, #aaa)',
               }}
             >
-              Order Log ({activeTrades.length})
+              Order Book ({activeTrades.length})
             </button>
             {view === 'closed' && closed.length > 0 && (
               <span style={{ marginLeft: 'auto', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
@@ -457,24 +478,30 @@ export function HistoryPage() {
               </>
             )
           ) : (
-            /* Order Log (existing trades table) */
+            /* Order Book (fills/orders) */
             activeTrades.length === 0 ? (
               <p className="text-gray-400">No {tab} orders yet.</p>
             ) : (
               <div className="trades-table">
-                <div className="trades-header" style={{ gridTemplateColumns: 'repeat(11, 1fr)' }}>
+                <div className="trades-header" style={{ gridTemplateColumns: '1fr 0.9fr 0.6fr 0.7fr 0.8fr 0.8fr 0.8fr 0.8fr 0.7fr 0.9fr 0.9fr 0.9fr 0.8fr' }}>
                   <span>Time</span><span>Symbol</span><span>Side</span><span>Qty</span>
-                  <span>Price</span><span>Total</span><span>Fee</span>
+                  <span>Price</span><span>Total</span><span>Leverage</span><span>Margin</span><span>Fee</span>
                   <span>Trader</span><span>Strategy</span><span>Type</span><span>Status</span>
                 </div>
                 {ordersPager.pageItems.map((trade: any) => (
-                  <div key={trade.id} className="trades-row" style={{ gridTemplateColumns: 'repeat(11, 1fr)' }}>
+                  <div key={trade.id} className="trades-row" style={{ gridTemplateColumns: '1fr 0.9fr 0.6fr 0.7fr 0.8fr 0.8fr 0.8fr 0.8fr 0.7fr 0.9fr 0.9fr 0.9fr 0.8fr' }}>
                     <span title={new Date(trade.created_at).toLocaleString()}>{timeAgo(trade.created_at)}</span>
                     <span>{trade.symbol}</span>
                     <span className={trade.side === 'buy' ? 'positive' : 'negative'}>{trade.side?.toUpperCase()}</span>
                     <span>{trade.quantity}</span>
                     <span>${formatPrice(trade.price)}</span>
                     <span>${trade.total?.toFixed(2)}</span>
+                    <span style={{ color: (trade.leverage ?? 1) > 1 ? 'var(--amber, #f39c12)' : 'var(--text-muted)', fontFamily: 'var(--mono)' }}>
+                      {(trade.leverage ?? 1).toFixed(1)}x
+                    </span>
+                    <span className="text-gray-400" style={{ fontSize: '.72rem', fontFamily: 'var(--mono)' }}>
+                      {trade.margin_used != null ? `$${Number(trade.margin_used).toFixed(2)}` : '—'}
+                    </span>
                     <span className="text-gray-400">${trade.fee?.toFixed(4) || '0.0000'}</span>
                     <span style={{ fontSize: '.68rem', color: 'var(--accent)' }}>{traderName(trade.agent_id)}</span>
                     <span className="text-gray-300">{agentName(trade.agent_id)}</span>
@@ -500,19 +527,25 @@ export function HistoryPage() {
           ) : (
             <>
               <div className="trades-table">
-                <div className="trades-header" style={{ gridTemplateColumns: 'repeat(10, 1fr)' }}>
+                <div className="trades-header" style={{ gridTemplateColumns: '1fr 0.9fr 0.6fr 0.7fr 0.8fr 0.8fr 0.8fr 0.8fr 0.9fr 0.9fr 0.8fr 0.8fr' }}>
                   <span>Time</span><span>Symbol</span><span>Side</span><span>Qty</span>
-                  <span>Price</span><span>Total</span><span>Fee</span>
+                  <span>Price</span><span>Total</span><span>Leverage</span><span>Margin</span><span>Fee</span>
                   <span>Strategy</span><span>Type</span><span>Status</span>
                 </div>
                 {ordersPager.pageItems.map((trade: any) => (
-                  <div key={trade.id} className="trades-row" style={{ gridTemplateColumns: 'repeat(10, 1fr)' }}>
+                  <div key={trade.id} className="trades-row" style={{ gridTemplateColumns: '1fr 0.9fr 0.6fr 0.7fr 0.8fr 0.8fr 0.8fr 0.8fr 0.9fr 0.9fr 0.8fr 0.8fr' }}>
                     <span title={new Date(trade.created_at).toLocaleString()}>{timeAgo(trade.created_at)}</span>
                     <span>{trade.symbol}</span>
                     <span className={trade.side === 'buy' ? 'positive' : 'negative'}>{trade.side?.toUpperCase()}</span>
                     <span>{trade.quantity}</span>
                     <span>${formatPrice(trade.price)}</span>
                     <span>${trade.total?.toFixed(2)}</span>
+                    <span style={{ color: (trade.leverage ?? 1) > 1 ? 'var(--amber, #f39c12)' : 'var(--text-muted)', fontFamily: 'var(--mono)' }}>
+                      {(trade.leverage ?? 1).toFixed(1)}x
+                    </span>
+                    <span className="text-gray-400" style={{ fontSize: '.72rem', fontFamily: 'var(--mono)' }}>
+                      {trade.margin_used != null ? `$${Number(trade.margin_used).toFixed(2)}` : '—'}
+                    </span>
                     <span className="text-gray-400">${trade.fee?.toFixed(4) || '0.0000'}</span>
                     <span className="text-gray-300">{agentName(trade.agent_id)}</span>
                     <span className="strategy-tag" style={{ fontSize: '0.7rem' }}>{agentStrategy(trade.agent_id)}</span>
