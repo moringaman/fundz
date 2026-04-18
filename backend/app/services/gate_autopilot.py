@@ -270,33 +270,44 @@ class GateAutopilot:
             logger.debug(f"Failed to gather UTC-day fees: {exc}")
 
         # ── Lifetime fee drag metrics (gross PnL vs total fees ever paid) ──────
-        # A strategy can show an acceptable win rate while fees silently consume
-        # the majority of gross returns (high-frequency, small-profit pattern).
+        # Trade model has no pnl column; net PnL lives in AgentRunRecord.pnl.
+        # gross_pnl = net_pnl + total_fees  (fees paid are part of gross returns).
         try:
             async with get_async_session() as db:
-                fee_drag_row = await db.execute(
+                # Total fees from all filled paper orders
+                fees_row = await db.execute(
                     select(
                         sqlfunc.coalesce(sqlfunc.sum(Trade.fee), 0.0).label("total_fees"),
-                        sqlfunc.coalesce(sqlfunc.sum(Trade.pnl), 0.0).label("gross_pnl"),
-                        sqlfunc.count(Trade.id).label("trade_count"),
                     ).where(
                         Trade.user_id == "default-user",
                         Trade.is_paper.is_(True),
                         Trade.status == OrderStatus.FILLED,
-                        Trade.pnl.isnot(None),
                     )
                 )
-                drag_row = fee_drag_row.one_or_none()
-                if drag_row:
-                    _total_fees  = float(drag_row.total_fees or 0.0)
-                    _gross_pnl   = float(drag_row.gross_pnl or 0.0)
-                    _trade_count = int(drag_row.trade_count or 0)
-                    metrics["total_fees_lifetime"]  = _total_fees
-                    metrics["gross_realized_pnl"]   = _gross_pnl
-                    metrics["fee_coverage_ratio"]   = (_gross_pnl / _total_fees) if _total_fees > 0 else None
-                    metrics["avg_trade_gross_pnl"]  = (_gross_pnl / _trade_count) if _trade_count > 0 else 0.0
-                    metrics["avg_fee_per_trade"]    = (_total_fees / _trade_count) if _trade_count > 0 else 0.0
-                    metrics["lifetime_trade_count"] = _trade_count
+                _total_fees = float((fees_row.one_or_none() or (0.0,))[0] or 0.0)
+
+                # Net PnL and closed trade count from AgentRunRecord
+                pnl_row = await db.execute(
+                    select(
+                        sqlfunc.coalesce(sqlfunc.sum(AgentRunRecord.pnl), 0.0).label("net_pnl"),
+                        sqlfunc.count(AgentRunRecord.id).label("closed_count"),
+                    ).where(
+                        AgentRunRecord.pnl.isnot(None),
+                        AgentRunRecord.use_paper.is_(True),
+                    )
+                )
+                pnl_data = pnl_row.one_or_none()
+                _net_pnl     = float((pnl_data.net_pnl    if pnl_data else 0.0) or 0.0)
+                _trade_count = int((pnl_data.closed_count  if pnl_data else 0)   or 0)
+
+            # gross = price-movement earnings before fees were deducted
+            _gross_pnl = _net_pnl + _total_fees
+            metrics["total_fees_lifetime"]  = _total_fees
+            metrics["gross_realized_pnl"]   = _gross_pnl
+            metrics["fee_coverage_ratio"]   = (_gross_pnl / _total_fees) if _total_fees > 0 else None
+            metrics["avg_trade_gross_pnl"]  = (_gross_pnl / _trade_count) if _trade_count > 0 else 0.0
+            metrics["avg_fee_per_trade"]    = (_total_fees / _trade_count) if _trade_count > 0 else 0.0
+            metrics["lifetime_trade_count"] = _trade_count
         except Exception as exc:
             logger.debug(f"Failed to gather fee drag metrics: {exc}")
 

@@ -2631,6 +2631,29 @@ class AgentScheduler:
             # 2.1 Trader Layer: James allocates to traders, each trader sub-allocates to their strategies
             try:
                 if self._traders:
+                    # ── Pre-fetch fees per agent so allocation scores use gross P&L ──
+                    # gross_pnl = net_pnl (AgentMetricRecord) + total_fees_paid (Trade)
+                    # Allocation should reward price-movement ability, not penalise a
+                    # trader twice for fee drag (the autopilot already handles fee drag).
+                    _all_agent_ids = [a["id"] for a in agents_list if a.get("trader_id") and a.get("id")]
+                    _fees_by_agent: dict = {}
+                    if _all_agent_ids:
+                        try:
+                            async with get_async_session() as _fdb:
+                                from sqlalchemy import func as _sqlfunc
+                                _fee_rows = await _fdb.execute(
+                                    select(Trade.agent_id, _sqlfunc.coalesce(_sqlfunc.sum(Trade.fee), 0.0).label("f"))
+                                    .where(
+                                        Trade.agent_id.in_(_all_agent_ids),
+                                        Trade.status == OrderStatus.FILLED,
+                                        Trade.is_paper.is_(_is_paper_mode()),
+                                    )
+                                    .group_by(Trade.agent_id)
+                                )
+                                _fees_by_agent = {r.agent_id: float(r.f) for r in _fee_rows.fetchall()}
+                        except Exception as _fe:
+                            logger.debug(f"Fees-by-agent pre-fetch failed: {_fe}")
+
                     # Build trader performance summary for James
                     trader_perf_list = []
                     for t in self._traders:
@@ -2638,11 +2661,15 @@ class AgentScheduler:
                         t_metrics = [m for m in agent_metrics
                                      if m.get("agent_id") in {a["id"] for a in t_agents}]
                         perf = trader_service.get_trader_performance(t, t_agents, t_metrics)
+                        _t_fees = sum(_fees_by_agent.get(a["id"], 0.0) for a in t_agents)
+                        _gross_pnl = (perf.total_pnl or 0.0) + _t_fees
                         trader_perf_list.append({
                             "trader_id": perf.trader_id,
                             "trader_name": perf.trader_name,
                             "agent_count": perf.agent_count,
-                            "total_pnl": perf.total_pnl,
+                            "total_pnl": perf.total_pnl,       # net (after fees)
+                            "gross_pnl": _gross_pnl,           # before fees — used for allocation scoring
+                            "total_fees": _t_fees,
                             "win_rate": perf.win_rate,
                             "total_trades": perf.total_trades,
                             "sharpe_ratio": getattr(perf, "sharpe_ratio", None),

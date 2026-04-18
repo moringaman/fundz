@@ -439,7 +439,13 @@ Determine optimal capital allocation. Return JSON:
                 context_lines.append(f"\n{t.get('name', t['id'])} ({t.get('llm_provider','?')} / {t.get('llm_model','?')}):")
                 context_lines.append(f"  Current Allocation: {t.get('allocation_pct', 33.3):.1f}%")
                 context_lines.append(f"  Strategies Managed: {perf.get('agent_count', 0)}")
-                context_lines.append(f"  Total P&L: ${perf.get('total_pnl', 0):+.2f}")
+                _gross = perf.get("gross_pnl") if perf.get("gross_pnl") is not None else perf.get("total_pnl", 0)
+                _net   = perf.get("total_pnl", 0)
+                _fees  = perf.get("total_fees", 0)
+                context_lines.append(f"  Gross P&L (before fees): ${_gross:+.2f}")
+                context_lines.append(f"  Net P&L  (after fees):   ${_net:+.2f}")
+                if _fees:
+                    context_lines.append(f"  Fees Paid: ${_fees:.2f}")
                 context_lines.append(f"  Win Rate: {perf.get('win_rate', 0):.1%}")
                 context_lines.append(f"  Total Trades: {perf.get('total_trades', 0)}")
                 sharpe = perf.get("sharpe_ratio", None)
@@ -530,7 +536,10 @@ Return JSON only:
                 alloc_values = list(alloc_pct.values())
                 allocation_spread = max(alloc_values) - min(alloc_values)
                 max_pnl_diff = max(
-                    abs(a.get("total_pnl", 0) - b.get("total_pnl", 0))
+                    abs(
+                        (a.get("gross_pnl") if a.get("gross_pnl") is not None else a.get("total_pnl", 0))
+                        - (b.get("gross_pnl") if b.get("gross_pnl") is not None else b.get("total_pnl", 0))
+                    )
                     for a in trader_performance
                     for b in trader_performance
                 ) if len(trader_performance) > 1 else 0
@@ -584,7 +593,9 @@ Return JSON only:
             tid = t["id"]
             p = perf_map.get(tid, {})
             wr          = float(p.get("win_rate", 0.5) or 0.5)
-            pnl         = float(p.get("total_pnl", 0) or 0)
+            # Use gross P&L (before fees) for scoring — rewards price-movement skill.
+            # Falls back to total_pnl (net) if gross_pnl is not yet provided.
+            pnl         = float(p.get("gross_pnl") if p.get("gross_pnl") is not None else p.get("total_pnl", 0) or 0)
             n_trades    = int(p.get("total_trades", 0) or 0)
             pnl_score   = min(max(pnl / 500 + 0.5, 0.0), 1.0)
             trade_bonus = min(n_trades / 50, 1.0)
@@ -598,7 +609,7 @@ Return JSON only:
         result  = {tid: pct / total_c * 100 for tid, pct in clamped.items()}
 
         parts = [f"{perf_map.get(tid,{}).get('trader_name', tid)}: "
-                 f"P&L=${perf_map.get(tid,{}).get('total_pnl',0):+.0f} → {result[tid]:.1f}%"
+                 f"gross=${perf_map.get(tid,{}).get('gross_pnl', perf_map.get(tid,{}).get('total_pnl',0)):+.0f} → {result[tid]:.1f}%"
                  for tid in result]
         logger.info("Deterministic trader allocation: " + ", ".join(parts))
         return result
