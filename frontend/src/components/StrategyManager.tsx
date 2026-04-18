@@ -122,12 +122,12 @@ function StrategyCard({ strategy }: { strategy: Strategy }) {
 
       {/* Condition pills */}
       <div className="strategy-card__pills">
-        {strategy.market_conditions.map((c) => (
+        {(strategy.market_conditions ?? []).map((c) => (
           <span key={c} className={`strategy-card__pill ${CONDITION_STYLE[c] ?? 'bg-slate-700 text-slate-300'}`}>
             ✓ {c.replace('_', ' ')}
           </span>
         ))}
-        {strategy.avoid_conditions.map((c) => (
+        {(strategy.avoid_conditions ?? []).map((c) => (
           <span key={c} className={`strategy-card__pill strategy-card__pill--avoid`}>
             ✗ {c.replace('_', ' ')}
           </span>
@@ -211,11 +211,11 @@ function StrategyCard({ strategy }: { strategy: Strategy }) {
               value={form.default_timeframe}
               onChange={(e) => setForm((f) => ({ ...f, default_timeframe: e.target.value }))}
             >
-              {strategy.timeframes.map((tf) => (
+              {(strategy.timeframes ?? []).map((tf) => (
                 <option key={tf} value={tf}>{tf}</option>
               ))}
               {/* include all timeframes as fallback */}
-              {TIMEFRAME_OPTIONS.filter((tf) => !strategy.timeframes.includes(tf)).map((tf) => (
+              {TIMEFRAME_OPTIONS.filter((tf) => !(strategy.timeframes ?? []).includes(tf)).map((tf) => (
                 <option key={tf} value={tf} disabled>{tf} (not in allowed list)</option>
               ))}
             </select>
