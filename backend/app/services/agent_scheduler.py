@@ -888,9 +888,11 @@ class AgentScheduler:
                         ))
                     self._dead_zone_noop_notified = False
 
-                # TEAM DECISION TIER (NEW): Run every 5 minutes (300 seconds)
+                # TEAM DECISION TIER: Run every 15 minutes (900 seconds)
+                # Market regime and allocation decisions don't change meaningfully in 5 min.
+                # Cutting from 5→15 min saves ~24 LLM calls/hour from this tier alone.
                 if self._last_team_analysis is None or \
-                   (datetime.now() - self._last_team_analysis).total_seconds() >= 300:
+                   (datetime.now() - self._last_team_analysis).total_seconds() >= 900:
                     logger.info("Running team analysis tier")
                     await self._run_team_analysis()
                     self._last_team_analysis = datetime.now()
@@ -3566,32 +3568,56 @@ class AgentScheduler:
                         'volume':     float(_ai_close.index[-1]) if len(df) > 0 else None,
                         'volume_sma': float(_ai_vol_sma.iloc[-1])        if _ai_vol_sma is not None else None,
                     }
-                    team_context = await self._build_team_context(agent_id, candidate_symbol, timeframe)
 
-                    # Build trader persona for system prompt
-                    _agent_cfg = self._enabled_agents.get(agent_id, {})
-                    _trader_id = _agent_cfg.get("trader_id")
-                    _trader_obj = next((t for t in self._traders if t.get("id") == _trader_id), None) if _trader_id else None
-                    _trader_cfg = (_trader_obj or {}).get("config", {})
-                    agent_context = {
-                        "trader_name":         (_trader_obj or {}).get("name", "Portfolio Manager"),
-                        "trader_bio":          _trader_cfg.get("bio", ""),
-                        "trader_style":        _trader_cfg.get("style", "Balanced and disciplined."),
-                        "risk_tolerance":      _trader_cfg.get("risk_tolerance", "moderate"),
-                        "preferred_strategies": _trader_cfg.get("preferred_strategies", [strategy_type]),
-                        "agent_name":          name,
-                        "strategy_type":       strategy_type,
+                    # ── LLM pre-filter: skip the LLM when indicators say hold ──
+                    # Run the deterministic indicator engine first (already have the df,
+                    # cost is near-zero). Only invoke the LLM when indicators show a
+                    # directional signal with >= 50% conviction — roughly 60-80% of
+                    # cycles will be skipped, cutting AI-agent LLM calls dramatically.
+                    _pre_config = {
+                        'strategy': 'momentum',
+                        'indicators_config': self._enabled_agents.get(agent_id, {}).get('indicators_config', {}),
                     }
+                    _pre_result = self.indicator_service.generate_signal(df, _pre_config, market_context=market_context)
+                    _pre_sig = _pre_result.signal.value if _pre_result.signal else 'hold'
+                    _pre_conf = _pre_result.confidence
 
-                    llm_result = await llm_service.generate_signal(
-                        indicators_dict,
-                        {'current': float(df['close'].iloc[-1])},
-                        team_context=team_context,
-                        agent_context=agent_context,
-                    )
-                    sig = llm_result.action
-                    conf = llm_result.confidence
-                    reas = llm_result.reasoning
+                    if _pre_sig == 'hold' or _pre_conf < 0.50:
+                        logger.debug(
+                            f"AI agent {name} on {candidate_symbol}: "
+                            f"indicator pre-filter skipped LLM (sig={_pre_sig}, conf={_pre_conf:.2f})"
+                        )
+                        sig = 'hold'
+                        conf = _pre_conf
+                        reas = 'Indicator pre-filter: no directional signal — LLM skipped'
+                    else:
+                        # Indicators show conviction — call LLM for final confirmation
+                        team_context = await self._build_team_context(agent_id, candidate_symbol, timeframe)
+
+                        # Build trader persona for system prompt
+                        _agent_cfg = self._enabled_agents.get(agent_id, {})
+                        _trader_id = _agent_cfg.get("trader_id")
+                        _trader_obj = next((t for t in self._traders if t.get("id") == _trader_id), None) if _trader_id else None
+                        _trader_cfg = (_trader_obj or {}).get("config", {})
+                        agent_context = {
+                            "trader_name":         (_trader_obj or {}).get("name", "Portfolio Manager"),
+                            "trader_bio":          _trader_cfg.get("bio", ""),
+                            "trader_style":        _trader_cfg.get("style", "Balanced and disciplined."),
+                            "risk_tolerance":      _trader_cfg.get("risk_tolerance", "moderate"),
+                            "preferred_strategies": _trader_cfg.get("preferred_strategies", [strategy_type]),
+                            "agent_name":          name,
+                            "strategy_type":       strategy_type,
+                        }
+
+                        llm_result = await llm_service.generate_signal(
+                            indicators_dict,
+                            {'current': float(df['close'].iloc[-1])},
+                            team_context=team_context,
+                            agent_context=agent_context,
+                        )
+                        sig = llm_result.action
+                        conf = llm_result.confidence
+                        reas = llm_result.reasoning
                 else:
                     _agent_cfg_ind = self._enabled_agents.get(agent_id, {})
                     _ind_config = {

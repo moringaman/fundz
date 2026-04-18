@@ -1,5 +1,43 @@
 # Phemex AI Trader — Future Roadmap
 
+## LLM Cost Reduction — Phase 2: Tiered Team Analysis
+
+**Priority:** Medium  
+**Status:** Enhancement (Phase 1 already implemented)  
+**Complexity:** Small — `agent_scheduler.py` only
+
+Phase 1 (implemented) cut team analysis from every 5 min to every 15 min, saving ~24 LLM calls/hour. Phase 2 skips individual LLM calls within `_run_team_analysis()` when nothing meaningful has changed.
+
+### What needs to happen
+
+1. **New state vars** — add `_last_research_at: Optional[datetime]`, `_last_allocation_at: Optional[datetime]`, `_last_position_count: int` to `__init__`
+2. **Research Analyst gate** — inside `_run_team_analysis()`, only call `research_analyst.analyze_markets()` if >30 min elapsed OR the TA confluence signal distribution shifted >15% since the last run (compare dominant signal counts). Otherwise re-use `self._current_analyst_report`.
+3. **Allocation gate** — only call `fund_manager.make_trader_allocation_decision()` if >30 min elapsed OR `_last_position_count` changed (a trade opened or closed). TA confluence scores still refresh every 15-min cycle (no LLM, just math).
+4. **Estimated saving** — ~16 additional LLM calls/hour on top of Phase 1 (down to ~4/hour for the team tier on quiet sessions).
+
+---
+
+## LLM Cost Reduction — Phase 4: SL/TP Trader Consultation Auto-Approve Gate
+
+**Priority:** Medium  
+**Status:** Enhancement  
+**Complexity:** Small — `_run_sl_tp_review()` in `agent_scheduler.py`
+
+Currently every SL/TP review propsal invokes the responsible trader's LLM to approve or reject. Most routine tightenings (SL moves slightly away from price, TP stays the same) don't need an opinion — the math is obvious.
+
+### What needs to happen
+
+1. **Rule-based auto-approve gate** — before calling `trader_llm._call_llm_text()` (around line 2371), check:
+   - SL shift is < 1.5% of current price, AND
+   - TP shift is < 5% of current price, AND
+   - Direction is sensible (SL is moving away from current price, TP is moving toward profit side)
+   - If all three are true → auto-approve, log it, skip LLM
+2. **Only consult LLM for unusual adjustments** — large moves, directional flips, or proposals that fail the safety checks above.
+3. **Team chat transparency** — when auto-approving, post a brief note: `"Auto-approved: routine SL tighten — no trader consultation needed."`
+4. **Estimated saving** — depends on open position count; typically 3–10 LLM calls/review cycle eliminated.
+
+---
+
 ## Leverage Trading Support
 
 **Priority:** High  
