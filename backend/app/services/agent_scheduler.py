@@ -2708,6 +2708,54 @@ class AgentScheduler:
                             proposed = trader_alloc_pct.get(_t["id"], 33.3)
                             prev = _t.get("allocation_pct", 33.3)
 
+                            # ── Probation rule: negative P&L + win rate < 40% ──────────
+                            # A trader who is actively losing money should be capped at the
+                            # minimum allocation immediately — do not wait for the LLM or
+                            # Sharpe gate to act.  This prevents a -$200 trader from holding
+                            # 33% of the fund just because the LLM returned equal allocations.
+                            _t_perf = next(
+                                (p for p in trader_perf_list if p.get("trader_id") == _t["id"]),
+                                {},
+                            )
+                            _t_net_pnl  = float(_t_perf.get("total_pnl") or 0)
+                            _t_win_rate = float(_t_perf.get("win_rate") or 0)
+                            _t_trades   = int(_t_perf.get("total_trades") or 0)
+                            _on_probation = (
+                                _t_net_pnl < 0
+                                and _t_win_rate < 0.40
+                                and _t_trades >= 10          # need a real sample first
+                            )
+                            if _on_probation:
+                                trader_alloc_pct[_t["id"]] = trader_service.MIN_ALLOCATION_PCT
+                                prev_flag_prob = self._consistency_flags.get(_t["id"])
+                                if prev_flag_prob != "PROBATION":
+                                    _prob_name = _t.get("name", _t["id"])
+                                    asyncio.create_task(team_chat.add_message(
+                                        agent_role="risk_manager",
+                                        content=(
+                                            f"🔴 **Allocation Probation — {_prob_name}:** "
+                                            f"Net P&L ${_t_net_pnl:+.2f} with {_t_win_rate:.0%} win rate "
+                                            f"after {_t_trades} trades. Capital capped at "
+                                            f"{trader_service.MIN_ALLOCATION_PCT:.0f}% (minimum floor) "
+                                            f"until performance recovers above 40% win rate and positive P&L."
+                                        ),
+                                        message_type="alert",
+                                    ))
+                                self._consistency_flags[_t["id"]] = "PROBATION"
+                                continue  # skip Sharpe gating — already at floor
+                            elif self._consistency_flags.get(_t["id"]) == "PROBATION":
+                                # Coming off probation — announce recovery
+                                _prob_name = _t.get("name", _t["id"])
+                                asyncio.create_task(team_chat.add_message(
+                                    agent_role="risk_manager",
+                                    content=(
+                                        f"✅ **Probation lifted — {_prob_name}:** "
+                                        f"Performance has recovered (WR {_t_win_rate:.0%}, "
+                                        f"P&L ${_t_net_pnl:+.2f}). Normal allocation rules resume."
+                                    ),
+                                    message_type="alert",
+                                ))
+
                             # 40% Rule: block capital increase
                             if _cr.consistency_flag == "INCONSISTENT":
                                 trader_alloc_pct[_t["id"]] = min(proposed, prev)
