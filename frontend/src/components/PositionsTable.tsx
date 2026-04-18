@@ -65,7 +65,7 @@ const StyledTable = styled.table`
   }
 `;
 
-const SideBadge = styled.span<{ side: 'buy' | 'sell' }>`
+const SideBadge = styled.span<{ $side: 'buy' | 'sell' }>`
   display: inline-block;
   padding: 0.2rem 0.55rem;
   border-radius: 4px;
@@ -73,36 +73,36 @@ const SideBadge = styled.span<{ side: 'buy' | 'sell' }>`
   font-weight: 700;
   letter-spacing: 0.05em;
   text-transform: uppercase;
-  background: ${({ side }) => side === 'buy'
+  background: ${({ $side }) => $side === 'buy'
     ? 'rgba(0,230,118,.14)'
     : 'rgba(255,83,112,.14)'};
-  color: ${({ side }) => side === 'buy'
+  color: ${({ $side }) => $side === 'buy'
     ? 'var(--green, #00e676)'
     : 'var(--red, #ff5370)'};
 `;
 
-const PnlCell = styled.td<{ profit: number }>`
+const PnlCell = styled.td<{ $profit: number }>`
   font-weight: 700 !important;
-  color: ${({ profit }) => profit >= 0
+  color: ${({ $profit }) => $profit >= 0
     ? 'var(--green, #00e676) !important'
     : 'var(--red, #ff5370) !important'};
 `;
 
-const LeverageBadge = styled.span<{ lev: number }>`
+const LeverageBadge = styled.span<{ $lev: number }>`
   display: inline-block;
   padding: 0.15rem 0.45rem;
   border-radius: 4px;
   font-size: 0.68rem;
   font-weight: 700;
   letter-spacing: 0.04em;
-  background: ${({ lev }) => lev >= 4
+  background: ${({ $lev }) => $lev >= 4
     ? 'rgba(255,83,112,.18)'
-    : lev >= 2
+    : $lev >= 2
       ? 'rgba(255,180,0,.15)'
       : 'rgba(100,180,255,.10)'};
-  color: ${({ lev }) => lev >= 4
+  color: ${({ $lev }) => $lev >= 4
     ? 'var(--red, #ff5370)'
-    : lev >= 2
+    : $lev >= 2
       ? '#ffb400'
       : 'var(--text-secondary, #8ba3c7)'};
 `;
@@ -133,8 +133,6 @@ export const PositionsTableComponent: React.FC = () => {
 
   const fetchPositions = useCallback(async () => {
     try {
-      setLoading(true);
-      // Paper mode → /api/paper/positions, Live mode → /api/trading/positions
       const url = isPaper ? '/api/paper/positions' : '/api/trading/positions';
       const response = await axios.get(url);
       const data = response.data;
@@ -184,13 +182,13 @@ export const PositionsTableComponent: React.FC = () => {
             </tr>
           </thead>
           <tbody>
-            {positions.map((position) => {
+            {positions.map((position, idx) => {
               const lev = position.leverage ?? 1;
               const isLeveraged = lev > 1;
               return (
-                <tr key={`${position.symbol}-${position.side}-${position.is_paper}`}>
+                <tr key={`${position.symbol}-${position.side}-${position.is_paper}-${idx}`}>
                   <td>{position.symbol}</td>
-                  <td><SideBadge side={position.side}>{position.side}</SideBadge></td>
+                  <td><SideBadge $side={position.side}>{position.side}</SideBadge></td>
                   <td>
                     {position.is_paper === false ? (
                       <span style={{ fontSize: '0.68rem', fontWeight: 700, color: '#ff4444', letterSpacing: '0.08em' }}>LIVE</span>
@@ -203,7 +201,7 @@ export const PositionsTableComponent: React.FC = () => {
                   <td>${position.current_price.toFixed(2)}</td>
                   <td>
                     {isLeveraged ? (
-                      <LeverageBadge lev={lev}>{lev.toFixed(1)}x</LeverageBadge>
+                      <LeverageBadge $lev={lev}>{lev.toFixed(1)}x</LeverageBadge>
                     ) : (
                       <span style={{ fontSize: '0.72rem', color: 'var(--text-secondary, #8ba3c7)' }}>1x</span>
                     )}
@@ -227,7 +225,7 @@ export const PositionsTableComponent: React.FC = () => {
                       <span style={{ color: 'var(--border-mid, #243650)' }}>—</span>
                     )}
                   </td>
-                  <PnlCell profit={position.unrealized_pnl}>
+                  <PnlCell $profit={position.unrealized_pnl}>
                     {position.unrealized_pnl >= 0 ? '+' : ''}${position.unrealized_pnl.toFixed(2)}
                   </PnlCell>
                 </tr>
