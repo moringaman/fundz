@@ -227,6 +227,8 @@ async def get_paper_orders(symbol: Optional[str] = None, limit: int = 50):
             "price": o.price,
             "total": o.total,
             "fee": o.fee or 0,
+            "leverage": o.leverage or 1.0,
+            "margin_used": o.margin_used or 0.0,
             "status": o.status.value,
             "created_at": o.created_at.isoformat(),
             "agent_id": o.agent_id,
