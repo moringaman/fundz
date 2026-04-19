@@ -4618,7 +4618,7 @@ class AgentScheduler:
                 # The gate always applies — re-entry after a stop-out is no exception;
                 # a losing thesis should not be re-entered just because SL was tight.
                 _bt_cache_key = f"{agent_id}:{symbol}"
-                _bt_cache_ttl = 1  # hours — shorter TTL ensures stale backtest results don't gate live trades
+                _bt_cache_ttl = 0.25  # hours (15 min) — keeps backtest signal fresh on short timeframes
                 _cached = self._backtest_cache.get(_bt_cache_key)
                 _bt_result = None
                 _bt_stale = True
