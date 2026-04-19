@@ -140,6 +140,7 @@ class AgentScheduler:
         self._traders: List[dict] = []
         self._trader_allocations: Dict[str, float] = {}  # {trader_id: pct}
         self._trader_agent_allocations: Dict[str, Dict[str, float]] = {}  # {trader_id: {agent_id: pct}}
+        self._current_trader_perf: Dict[str, dict] = {}  # {trader_id: perf dict} — refreshed every team analysis cycle
         self._total_capital: float = 0.0  # Total fund capital — set from live or paper holdings
 
         # US Open session management
@@ -2683,6 +2684,9 @@ class AgentScheduler:
                             "sharpe_ratio": getattr(perf, "sharpe_ratio", None),
                         })
 
+                    # Store for per-agent performance gating in run_agent
+                    self._current_trader_perf = {p["trader_id"]: p for p in trader_perf_list}
+
                     # James (PM) decides trader allocations via LLM
                     trader_alloc_pct = await fund_manager.make_trader_allocation_decision(
                         traders=self._traders,
@@ -2840,17 +2844,18 @@ class AgentScheduler:
                         )
                         self._trader_agent_allocations[t["id"]] = sub_alloc
 
-                        # Compute each strategy's fund-level allocation %:
-                        # trader_pct is % of total fund (0-100)
-                        # agent_pct is % of trader's capital (0-100)
-                        # fund-level = trader_pct × agent_pct / 100
+                        # Full-pool model: agent's sub-allocation % within its trader is used
+                        # directly as its fund-level %. The old trader_pct × agent_pct / 100
+                        # cascade compressed 3×3 agents to ~11% each, making every position
+                        # financially negligible. Now each agent sizes against the full fund.
+                        # Overdraft is impossible — position_value is hard-capped at 95% of
+                        # available USDT in run_agent. Performance differentiation is applied
+                        # via _perf_mult and per-trader confidence floor elevation instead.
                         for aid, agent_pct in sub_alloc.items():
-                            fund_level_pct = trader_alloc_pct.get(t["id"], 33.3) * agent_pct / 100
-                            self._current_allocation[aid] = fund_level_pct
+                            self._current_allocation[aid] = agent_pct
                             logger.debug(
-                                f"Allocation cascade: {t.get('name','?')} ({trader_alloc_pct.get(t['id'],33.3):.1f}%) "
-                                f"→ agent {aid[:8]} ({agent_pct:.1f}% of trader) "
-                                f"= {fund_level_pct:.2f}% of fund"
+                                f"Full-pool allocation: {t.get('name','?')} "
+                                f"→ agent {aid[:8]} = {agent_pct:.1f}% of fund (direct sub-alloc, no cascade)"
                             )
 
                     logger.info(
@@ -3831,6 +3836,50 @@ class AgentScheduler:
             _effective_min_entry_conf = _min_entry_conf
             _effective_conf_floor = _conf_floor
 
+            # ── Trader performance-based confidence floor + size multiplier ──────────
+            # Applied once, before fee-pressure gating. Two outputs:
+            #
+            # _perf_mult  — position size multiplier [0.60, 1.30]:
+            #   Derived from a blended score of win rate (60%) + P&L score (40%).
+            #   A top trader gets 1.30×; a consistently losing trader gets 0.60×.
+            #   Neutral (1.0×) until the trader has ≥5 closed trades.
+            #
+            # _effective_min_entry_conf elevation — confidence floor tiers:
+            #   Tier 1 (strong):   WR ≥ 60% AND gross P&L ≥ 0  → no change
+            #   Tier 2 (moderate): WR ≥ 50%                     → +7%
+            #   Tier 3 (weak):     WR ≥ 40%                     → +12%
+            #   Tier 4 (poor):     WR < 40%                     → +20%
+            #   Effect: underperforming traders must wait for higher-conviction setups,
+            #   directly reducing their trade frequency and fee consumption.
+            _perf_mult = 1.0
+            if _trader_id_pre:
+                _tp = self._current_trader_perf.get(_trader_id_pre, {})
+                _tp_wr     = float(_tp.get("win_rate", 0.5) or 0.5)
+                _tp_pnl    = float(
+                    _tp.get("gross_pnl") if _tp.get("gross_pnl") is not None
+                    else (_tp.get("total_pnl", 0) or 0)
+                )
+                _tp_trades = int(_tp.get("total_trades", 0) or 0)
+                if _tp_trades >= 5:
+                    _pnl_score = min(max(_tp_pnl / 500.0 + 0.5, 0.0), 1.0)
+                    _raw_score = _tp_wr * 0.60 + _pnl_score * 0.40
+                    _perf_mult = round(0.60 + _raw_score * 0.70, 3)  # [0.60, 1.30]
+                    if _tp_wr >= 0.60 and _tp_pnl >= 0:
+                        _trader_conf_boost = 0.00   # Tier 1 — strong
+                    elif _tp_wr >= 0.50:
+                        _trader_conf_boost = 0.07   # Tier 2 — moderate
+                    elif _tp_wr >= 0.40:
+                        _trader_conf_boost = 0.12   # Tier 3 — weak
+                    else:
+                        _trader_conf_boost = 0.20   # Tier 4 — poor
+                    _effective_min_entry_conf = min(0.92, _effective_min_entry_conf + _trader_conf_boost)
+                    if _trader_conf_boost > 0 or _perf_mult != 1.0:
+                        logger.debug(
+                            f"Trader perf gate: {_trader_name} WR={_tp_wr:.0%} gross=${_tp_pnl:+.0f} "
+                            f"({_tp_trades} trades) → conf floor +{_trader_conf_boost:.0%}, "
+                            f"size mult {_perf_mult:.3f}×"
+                        )
+
             if signal in ('buy', 'sell'):
                 _fee_pressure = await self._get_daily_fee_pressure()
                 _budget_used = float(_fee_pressure.get("budget_used_ratio", 0.0) or 0.0)
@@ -4307,7 +4356,7 @@ class AgentScheduler:
                 # allocation_pct is a % of the total fund; using only available USDT
                 # would produce shrinking positions as capital gets deployed.
                 total_fund = self._total_capital or usdt_balance
-                target_position_value = total_fund * allocation_pct / 100 * _size_mult * _conf_mult
+                target_position_value = total_fund * allocation_pct / 100 * _size_mult * _conf_mult * _perf_mult
 
                 # Cap at 95% of available USDT to avoid overdrafts
                 position_value = min(target_position_value, usdt_balance * 0.95)
@@ -4327,7 +4376,7 @@ class AgentScheduler:
                 quantity = leveraged_notional / current_price if current_price > 0 else 0.0
 
                 logger.debug(
-                    f"Sizing {name} ({strategy_type}, {_size_mult:.0%} strat, {_conf_mult:.0%} conf, {leverage:.1f}x lev): "
+                    f"Sizing {name} ({strategy_type}, {_size_mult:.0%} strat, {_conf_mult:.0%} conf, {_perf_mult:.2f}× perf, {leverage:.1f}x lev): "
                     f"total_fund=${total_fund:.0f}, alloc={allocation_pct:.2f}%, "
                     f"target=${target_position_value:.0f}, available=${usdt_balance:.0f}, margin=${margin_used:.0f}, "
                     f"notional=${leveraged_notional:.0f}, qty={quantity:.4f} @ ${current_price}"
@@ -5714,7 +5763,7 @@ class AgentScheduler:
                                         "description": profile["description"],
                                     },
                                     is_enabled=True,
-                                    allocation_percentage=10.0,
+                                    allocation_percentage=20.0,
                                     max_position_size=risk.max_position_size_pct / 100 * self._total_capital,
                                 )
                                 db.add(new_agent)
@@ -5728,7 +5777,7 @@ class AgentScheduler:
                                     'strategy_type': new_agent.strategy_type,
                                     'trading_pairs': trading_pairs,
                                     'is_enabled': True,
-                                    'allocation_percentage': 10.0,
+                                    'allocation_percentage': 20.0,
                                     'max_position_size': new_agent.max_position_size,
                                     'risk_limit': 100.0,
                                     'stop_loss_pct': profile["stop_loss_pct"],
@@ -5880,7 +5929,7 @@ class AgentScheduler:
                                 "trailing_stop_pct": action.get("trailing_stop_pct", 3.0),
                             },
                             is_enabled=True,
-                            allocation_percentage=10.0,
+                            allocation_percentage=20.0,
                             max_position_size=risk.max_position_size_pct / 100 * self._total_capital,
                         )
                         db.add(new_agent)
@@ -5893,7 +5942,7 @@ class AgentScheduler:
                             "strategy_type": strategy,
                             "trading_pairs": trading_pairs,
                             "is_enabled": True,
-                            "allocation_percentage": 10.0,
+                            "allocation_percentage": 20.0,
                             "max_position_size": new_agent.max_position_size,
                             "trader_id": trader["id"],
                             "stop_loss_pct": action.get("stop_loss_pct", risk.default_stop_loss_pct),
