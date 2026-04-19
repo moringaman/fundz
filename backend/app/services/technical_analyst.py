@@ -529,6 +529,116 @@ class TechnicalAnalyst:
                     reasoning="MACD bearish crossover below zero line. Targets at structural levels."
                 ))
 
+        # ── EMA 8/21 crossover (leading — fires ~4 candles before MACD) ─────
+        # The 8/21 EMA cross is a well-established early-entry signal that fires
+        # significantly before the MACD (12/26/9) confirms the same move. Base
+        # confidence 0.55 boosted to 0.70 when MACD direction already agrees.
+        try:
+            ema8  = self.indicator_service.calculate_ema(closes, 8)
+            ema21 = self.indicator_service.calculate_ema(closes, 21)
+            _ema8_now,  _ema21_now  = ema8.iloc[-1],  ema21.iloc[-1]
+            _ema8_prev, _ema21_prev = ema8.iloc[-2],  ema21.iloc[-2]
+            _ema_bull_cross = (_ema8_prev <= _ema21_prev) and (_ema8_now > _ema21_now)
+            _ema_bear_cross = (_ema8_prev >= _ema21_prev) and (_ema8_now < _ema21_now)
+            _ema_conf = 0.55
+            if _ema_bull_cross and macd > macd_signal: _ema_conf = 0.70
+            if _ema_bear_cross and macd < macd_signal: _ema_conf = 0.70
+            if _ema_bull_cross and not _is_near_resistance(current_price, price_levels, proximity_pct=_sr_block_pct):
+                _sl  = _levels_below[0] * 0.998 if _levels_below else current_price * 0.97
+                _tp1 = _levels_above[0] * 0.9985 if _levels_above else current_price * 1.04
+                _tp2 = _levels_above[1] * 0.9985 if len(_levels_above) > 1 else current_price * 1.07
+                _risk = abs(current_price - _sl)
+                patterns.append(PatternSignal(
+                    pattern_type="ema8_21_bull_cross", direction="bullish", confidence=_ema_conf,
+                    entry_price=current_price, stop_loss=_sl, take_profit_1=_tp1, take_profit_2=_tp2,
+                    risk_reward=round(abs(_tp1 - current_price) / _risk if _risk > 0 else 2.0, 2),
+                    reasoning=f"EMA 8 crossed above EMA 21 (early signal). MACD {'confirms' if _ema_conf > 0.55 else 'pending'}.",
+                ))
+            elif _ema_bear_cross and not _is_near_support(current_price, price_levels, proximity_pct=_sr_block_pct):
+                _sl  = _levels_above[0] * 1.002 if _levels_above else current_price * 1.03
+                _tp1 = _levels_below[0] * 1.0015 if _levels_below else current_price * 0.96
+                _tp2 = _levels_below[1] * 1.0015 if len(_levels_below) > 1 else current_price * 0.93
+                _risk = abs(_sl - current_price)
+                patterns.append(PatternSignal(
+                    pattern_type="ema8_21_bear_cross", direction="bearish", confidence=_ema_conf,
+                    entry_price=current_price, stop_loss=_sl, take_profit_1=_tp1, take_profit_2=_tp2,
+                    risk_reward=round(abs(current_price - _tp1) / _risk if _risk > 0 else 2.0, 2),
+                    reasoning=f"EMA 8 crossed below EMA 21 (early signal). MACD {'confirms' if _ema_conf > 0.55 else 'pending'}.",
+                ))
+        except Exception:
+            pass
+
+        # ── RSI divergence (leading — fires BEFORE price reverses) ───────────
+        # Bullish: price lower-low but RSI higher-low = selling pressure exhausting.
+        # Bearish: price higher-high but RSI lower-high = buying pressure exhausting.
+        # Both fire before lagging confirmation, giving pre-emptive entry.
+        try:
+            _div = self.indicator_service.detect_divergence(closes, lookback=20)
+            if _div["bullish_divergence"] and not _is_near_resistance(current_price, price_levels, proximity_pct=_sr_block_pct):
+                _sl  = _levels_below[0] * 0.997 if _levels_below else current_price * 0.97
+                _tp1 = _levels_above[0] * 0.9985 if _levels_above else bb_middle
+                _tp2 = _levels_above[1] * 0.9985 if len(_levels_above) > 1 else bb_upper
+                _risk = abs(current_price - _sl)
+                patterns.append(PatternSignal(
+                    pattern_type="rsi_bullish_divergence", direction="bullish", confidence=0.65,
+                    entry_price=current_price, stop_loss=_sl, take_profit_1=_tp1, take_profit_2=_tp2,
+                    risk_reward=round(abs(_tp1 - current_price) / _risk if _risk > 0 else 2.5, 2),
+                    reasoning=_div["divergence_reason"] + " — reversal likely imminent.",
+                ))
+            elif _div["bearish_divergence"] and not _is_near_support(current_price, price_levels, proximity_pct=_sr_block_pct):
+                _sl  = _levels_above[0] * 1.003 if _levels_above else current_price * 1.03
+                _tp1 = _levels_below[0] * 1.0015 if _levels_below else bb_middle
+                _tp2 = _levels_below[1] * 1.0015 if len(_levels_below) > 1 else bb_lower
+                _risk = abs(_sl - current_price)
+                patterns.append(PatternSignal(
+                    pattern_type="rsi_bearish_divergence", direction="bearish", confidence=0.65,
+                    entry_price=current_price, stop_loss=_sl, take_profit_1=_tp1, take_profit_2=_tp2,
+                    risk_reward=round(abs(current_price - _tp1) / _risk if _risk > 0 else 2.5, 2),
+                    reasoning=_div["divergence_reason"] + " — rollover likely imminent.",
+                ))
+        except Exception:
+            pass
+
+        # ── Candlestick reversal patterns (first-bar entry) ───────────────────
+        # Engulfing / morning_star / hammer fire on the first candle of a reversal,
+        # well before RSI or MACD confirm the same move.
+        try:
+            _cp = self.indicator_service.calculate_candle_patterns(df['open'], highs, lows, closes)
+            _strong_bull = {"bullish_engulfing", "morning_star"}
+            _strong_bear = {"bearish_engulfing", "evening_star"}
+            if _cp.get("pattern_signal") == "buy" and abs(_cp.get("pattern_weight", 0)) >= 0.08:
+                _cp_names = _cp.get("bullish_patterns", [])
+                _cp_conf  = 0.68 if any(p in _strong_bull for p in _cp_names) else 0.62
+                if not _is_near_resistance(current_price, price_levels, proximity_pct=_sr_block_pct):
+                    _sl  = _levels_below[0] * 0.998 if _levels_below else current_price * 0.97
+                    _tp1 = _levels_above[0] * 0.9985 if _levels_above else bb_middle
+                    _tp2 = _levels_above[1] * 0.9985 if len(_levels_above) > 1 else bb_upper
+                    _risk = abs(current_price - _sl)
+                    patterns.append(PatternSignal(
+                        pattern_type="candle_" + "_".join(_cp_names[:2]), direction="bullish",
+                        confidence=_cp_conf, entry_price=current_price,
+                        stop_loss=_sl, take_profit_1=_tp1, take_profit_2=_tp2,
+                        risk_reward=round(abs(_tp1 - current_price) / _risk if _risk > 0 else 2.0, 2),
+                        reasoning=f"Bullish candle reversal: {', '.join(_cp_names)}. First-bar entry before lagging indicators confirm.",
+                    ))
+            elif _cp.get("pattern_signal") == "sell" and abs(_cp.get("pattern_weight", 0)) >= 0.08:
+                _cp_names = _cp.get("bearish_patterns", [])
+                _cp_conf  = 0.68 if any(p in _strong_bear for p in _cp_names) else 0.62
+                if not _is_near_support(current_price, price_levels, proximity_pct=_sr_block_pct):
+                    _sl  = _levels_above[0] * 1.002 if _levels_above else current_price * 1.03
+                    _tp1 = _levels_below[0] * 1.0015 if _levels_below else bb_middle
+                    _tp2 = _levels_below[1] * 1.0015 if len(_levels_below) > 1 else bb_lower
+                    _risk = abs(_sl - current_price)
+                    patterns.append(PatternSignal(
+                        pattern_type="candle_" + "_".join(_cp_names[:2]), direction="bearish",
+                        confidence=_cp_conf, entry_price=current_price,
+                        stop_loss=_sl, take_profit_1=_tp1, take_profit_2=_tp2,
+                        risk_reward=round(abs(current_price - _tp1) / _risk if _risk > 0 else 2.0, 2),
+                        reasoning=f"Bearish candle reversal: {', '.join(_cp_names)}. First-bar entry before lagging indicators confirm.",
+                    ))
+        except Exception:
+            pass
+
         # ── Late-entry / exhaustion penalty ──────────────────────────────────
         # Reduce confidence of patterns whose direction matches an extended move.
         # Problem: agents enter shorts after 8 consecutive bearish candles — the move
@@ -590,8 +700,8 @@ class TechnicalAnalyst:
                 for pat in patterns:
                     _streak = _bearish_streak if pat.direction == "bearish" else _bullish_streak
                     _penalty = 0.0
-                    if _streak > 5:
-                        _penalty += min((_streak - 5) * 0.05, 0.20)  # cap streak penalty at −0.20
+                    if _streak > 3:
+                        _penalty += min((_streak - 3) * 0.05, 0.20)  # cap −0.20; threshold 5→3 (altcoins complete moves in 3-4 candles)
                     if _decelerating:
                         # Only penalise if the deceleration matches the pattern direction
                         _bearish_decel = _bearish_streak >= 3 and _decelerating

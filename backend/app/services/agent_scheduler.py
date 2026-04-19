@@ -4559,7 +4559,10 @@ class AgentScheduler:
                     resistance_levels=technical_report.price_levels.resistance if technical_report.price_levels else [],
                     trade_signal=signal,
                 )
-                is_opposite = (signal == 'buy' and ta_signal == 'sell') or (signal == 'sell' and ta_signal == 'buy')
+                # Normalise TA vocabulary: TA returns 'bullish'/'bearish', agent signals
+                # are 'buy'/'sell'. Without this mapping the veto was a permanent no-op.
+                _ta_norm = "buy" if ta_signal == "bullish" else ("sell" if ta_signal == "bearish" else ta_signal)
+                is_opposite = (signal == 'buy' and _ta_norm == 'sell') or (signal == 'sell' and _ta_norm == 'buy')
                 if is_opposite and technical_report.confidence > _ta_veto_conf:
                     logger.warning(f"Trade rejected by technical analyst: signal {signal} conflicts with TA {ta_signal} (conf: {technical_report.confidence})")
                     self._record_run(agent_id, symbol, signal, confidence, current_price, False, error=f"Technical analyst disagrees: {ta_signal}")
