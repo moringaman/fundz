@@ -532,9 +532,7 @@ export function AgentsPage() {
                         <span style={{ color: groupPnl >= 0 ? 'var(--green)' : 'var(--red)' }}>
                           {groupPnl >= 0 ? '+' : ''}{groupPnl.toFixed(2)} USDT
                         </span>
-                        {trader.allocation_pct != null && (
-                          <span>{trader.allocation_pct.toFixed(1)}% allocation</span>
-                        )}
+
                       </div>
                     </div>
                   </div>

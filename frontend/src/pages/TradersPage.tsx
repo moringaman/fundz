@@ -279,12 +279,7 @@ export function TradersPage() {
                     {modelLabel(t.llm_model)}
                   </div>
                 </div>
-                <div style={{ marginLeft: 'auto', textAlign: 'right' }}>
-                  <div style={{ fontSize: '.65rem', fontWeight: 700, letterSpacing: '.1em', textTransform: 'uppercase', color: 'var(--text-dim)', marginBottom: '.2rem' }}>Allocation</div>
-                  <div style={{ fontFamily: 'var(--mono)', fontSize: '1rem', fontWeight: 700, color: 'var(--accent)' }}>
-                    {t.allocation_pct?.toFixed(1)}%
-                  </div>
-                </div>
+
               </div>
 
               {/* P&L */}
@@ -451,13 +446,7 @@ export function TradersPage() {
               </div>
 
               {/* Stats grid */}
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '.5rem' }}>
-                <div className="stat-card">
-                  <div className="stat-label">Allocation</div>
-                  <div className="stat-value" style={{ fontFamily: 'var(--mono)', fontSize: '.9rem' }}>
-                    {selectedTrader.allocation_pct?.toFixed(1)}%
-                  </div>
-                </div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '.5rem' }}>
                 <div className="stat-card">
                   <div className="stat-label">Strategies</div>
                   <div className="stat-value" style={{ fontFamily: 'var(--mono)', fontSize: '.9rem' }}>

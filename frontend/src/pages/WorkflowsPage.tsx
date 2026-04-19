@@ -37,16 +37,7 @@ const LANES: FlowLane[] = [
       { id: 't1-start', kind: 'trigger', label: '5-min Tick', sub: 'Main loop fires every 60s\n5-min gate opens', icon: '⏱' },
       { id: 't1-marina', kind: 'process', label: 'Marina — Research', sub: 'Analyse all trading pairs\nDetect market regime & sentiment\nEmit StrategyRecommendations', icon: '🔬' },
       { id: 't1-market', kind: 'process', label: 'Market Condition', sub: 'Compute trend / volatility / RSI\nBuild confluence scores (TA)', icon: '📊' },
-      {
-        id: 't1-traders-check', kind: 'decision', label: 'Traders present?',
-        branches: [
-          { label: 'No traders', to: 't1-direct-alloc', pass: false },
-          { label: 'Traders exist', to: 't1-trader-alloc', pass: true },
-        ],
-      },
-      { id: 't1-direct-alloc', kind: 'action', label: 'James → Agents', sub: 'Direct agent allocation\n5% floor · 40% cap\nLog to team chat', icon: '💰' },
-      { id: 't1-trader-alloc', kind: 'action', label: 'James → Traders', sub: 'LLM allocates to each trader\n15% floor · 50% cap\nBased on P&L + win rate', icon: '💼' },
-      { id: 't1-sub-alloc', kind: 'action', label: 'Trader → Agents', sub: 'Each trader sub-allocates\nPerformance-weighted scoring\nCascade to fund-level %', icon: '⚖️' },
+      { id: 't1-perf-gate', kind: 'action', label: 'Perf Gate Refresh', sub: 'DB trade data → _perf_mult [0.60–1.30]\nConf floor tiers per trader\nProbation + consistency flags', icon: '🎚' },
       { id: 't1-risk', kind: 'process', label: 'Elena — Risk Assessment', sub: 'Daily P&L vs max loss limit\nExposure % of capital\nEmit safe / warning / danger', icon: '🛡' },
       {
         id: 't1-risk-check', kind: 'decision', label: 'Risk level?',

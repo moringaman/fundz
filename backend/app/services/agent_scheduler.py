@@ -2722,21 +2722,16 @@ class AgentScheduler:
                     # Store for per-agent performance gating in run_agent
                     self._current_trader_perf = {p["trader_id"]: p for p in trader_perf_list}
 
-                    # James (PM) decides trader allocations via LLM
-                    trader_alloc_pct = await fund_manager.make_trader_allocation_decision(
-                        traders=self._traders,
-                        trader_performance=trader_perf_list,
-                        market_condition=market_condition or await fund_manager.analyze_market(),
-                        total_capital=total_capital,
-                        confluence_scores=confluence_scores,
-                    )
-
-                    # ── Phase 9.1: Consistency & Sharpe gating ──────────────
+                    # ── Phase 9.1: Consistency & probation flags ────────────
+                    # Full-pool model: allocation % is no longer the sizing lever
+                    # (_perf_mult and conf-floor tiers handle that). These checks exist to:
+                    #   (a) set _consistency_flags consumed by the leaderboard UI
+                    #   (b) fire team chat alerts when a trader enters/exits probation
+                    #       or triggers the INCONSISTENT (40% rule) flag
                     try:
                         from app.services.consistency_scorer import compute_consistency
                         import asyncio as _asyncio
                         _is_paper = _is_paper_mode()
-                        _cscores = {}
                         _tasks = [
                             compute_consistency(
                                 t["id"],
@@ -2751,15 +2746,7 @@ class AgentScheduler:
                         ):
                             if isinstance(_cr, Exception):
                                 continue
-                            _cscores[_t["id"]] = _cr
-                            proposed = trader_alloc_pct.get(_t["id"], 33.3)
-                            prev = _t.get("allocation_pct", 33.3)
 
-                            # ── Probation rule: negative P&L + win rate < 40% ──────────
-                            # A trader who is actively losing money should be capped at the
-                            # minimum allocation immediately — do not wait for the LLM or
-                            # Sharpe gate to act.  This prevents a -$200 trader from holding
-                            # 33% of the fund just because the LLM returned equal allocations.
                             _t_perf = next(
                                 (p for p in trader_perf_list if p.get("trader_id") == _t["id"]),
                                 {},
@@ -2770,140 +2757,72 @@ class AgentScheduler:
                             _on_probation = (
                                 _t_net_pnl < 0
                                 and _t_win_rate < 0.40
-                                and _t_trades >= 10          # need a real sample first
+                                and _t_trades >= 10
                             )
                             if _on_probation:
-                                trader_alloc_pct[_t["id"]] = trader_service.MIN_ALLOCATION_PCT
                                 prev_flag_prob = self._consistency_flags.get(_t["id"])
                                 if prev_flag_prob != "PROBATION":
                                     _prob_name = _t.get("name", _t["id"])
                                     asyncio.create_task(team_chat.add_message(
                                         agent_role="risk_manager",
                                         content=(
-                                            f"🔴 **Allocation Probation — {_prob_name}:** "
+                                            f"🔴 **Performance Probation — {_prob_name}:** "
                                             f"Net P&L ${_t_net_pnl:+.2f} with {_t_win_rate:.0%} win rate "
-                                            f"after {_t_trades} trades. Capital capped at "
-                                            f"{trader_service.MIN_ALLOCATION_PCT:.0f}% (minimum floor) "
-                                            f"until performance recovers above 40% win rate and positive P&L."
+                                            f"after {_t_trades} trades. Position sizing reduced via "
+                                            f"perf gate until performance recovers above 40% win rate "
+                                            f"and positive P&L."
                                         ),
                                         message_type="alert",
                                     ))
                                 self._consistency_flags[_t["id"]] = "PROBATION"
-                                continue  # skip Sharpe gating — already at floor
                             elif self._consistency_flags.get(_t["id"]) == "PROBATION":
-                                # Coming off probation — announce recovery
                                 _prob_name = _t.get("name", _t["id"])
                                 asyncio.create_task(team_chat.add_message(
                                     agent_role="risk_manager",
                                     content=(
                                         f"✅ **Probation lifted — {_prob_name}:** "
                                         f"Performance has recovered (WR {_t_win_rate:.0%}, "
-                                        f"P&L ${_t_net_pnl:+.2f}). Normal allocation rules resume."
+                                        f"P&L ${_t_net_pnl:+.2f}). Normal sizing rules resume."
                                     ),
                                     message_type="alert",
                                 ))
-
-                            # 40% Rule: block capital increase
-                            if _cr.consistency_flag == "INCONSISTENT":
-                                trader_alloc_pct[_t["id"]] = min(proposed, prev)
-
-                            # Sharpe gate multiplier
-                            trader_alloc_pct[_t["id"]] = max(
-                                trader_service.MIN_ALLOCATION_PCT,
-                                min(
-                                    trader_service.MAX_ALLOCATION_PCT,
-                                    trader_alloc_pct[_t["id"]] * _cr.sharpe_multiplier,
-                                ),
-                            )
-
-                            # Team chat alert on newly INCONSISTENT traders
-                            prev_flag = self._consistency_flags.get(_t["id"])
-                            if _cr.consistency_flag == "INCONSISTENT" and prev_flag != "INCONSISTENT":
-                                _name = _t.get("name", _t["id"])
-                                asyncio.create_task(team_chat.add_message(
-                                    agent_role="risk_manager",
-                                    content=(
-                                        f"⚠️ **Consistency Gate triggered — {_name}**: "
-                                        f"a single trade represents {_cr.offending_trade_pct:.0%} of "
-                                        f"period profit (40% rule exceeded). "
-                                        f"Capital increase blocked until distribution improves."
-                                    ),
-                                    message_type="alert",
-                                ))
-                            self._consistency_flags[_t["id"]] = _cr.consistency_flag
-
-                        # Re-normalize after gating adjustments.
-                        # IMPORTANT: skip if Sharpe multipliers already created a meaningful
-                        # spread — re-normalizing a 50/30/20 split back to 33/33/33 defeats
-                        # the entire purpose of performance-based allocation.
-                        _gated_vals = list(trader_alloc_pct.values())
-                        _gated_spread = (max(_gated_vals) - min(_gated_vals)) if _gated_vals else 0
-                        _total = sum(trader_alloc_pct.values())
-                        if _total > 0 and _gated_spread < 5.0:
-                            # Spread is still flat — normalize so allocations sum to 100
-                            trader_alloc_pct = {
-                                tid: pct / _total * 100
-                                for tid, pct in trader_alloc_pct.items()
-                            }
-                        elif _total > 0 and abs(_total - 100.0) > 5.0:
-                            # Spread is meaningful — only normalize if total has drifted >5% from 100
-                            trader_alloc_pct = {
-                                tid: pct / _total * 100
-                                for tid, pct in trader_alloc_pct.items()
-                            }
+                                self._consistency_flags[_t["id"]] = _cr.consistency_flag
+                            else:
+                                prev_flag = self._consistency_flags.get(_t["id"])
+                                if _cr.consistency_flag == "INCONSISTENT" and prev_flag != "INCONSISTENT":
+                                    _name = _t.get("name", _t["id"])
+                                    asyncio.create_task(team_chat.add_message(
+                                        agent_role="risk_manager",
+                                        content=(
+                                            f"⚠️ **Consistency Flag — {_name}**: "
+                                            f"a single trade represents {_cr.offending_trade_pct:.0%} of "
+                                            f"period profit (40% rule exceeded). "
+                                            f"Monitoring for continued inconsistency."
+                                        ),
+                                        message_type="alert",
+                                    ))
+                                self._consistency_flags[_t["id"]] = _cr.consistency_flag
                     except Exception as _ce:
-                        logger.warning(f"9.1 consistency gating failed (using raw allocations): {_ce}")
+                        logger.warning(f"9.1 consistency check failed: {_ce}")
                     # ─────────────────────────────────────────────────────────
 
-                    self._trader_allocations = trader_alloc_pct
-
-                    # Persist trader allocations to DB
-                    async with get_async_session() as session:
-                        for tid, pct in trader_alloc_pct.items():
-                            await trader_service.update_trader_allocation(session, tid, pct)
-
-                    # Each trader sub-allocates its portion to its own strategies
-                    for t in self._traders:
-                        if not t.get("is_enabled", True):
+                    # Full-pool model: each agent sizes against the full fund using
+                    # its own allocation_percentage config. No cascade, no trader-level
+                    # sub-division. _perf_mult + conf-floor tiers handle differentiation.
+                    _n_set = 0
+                    for a in agents_list:
+                        if not a.get("is_enabled", True):
                             continue
-                        t_agents = [a for a in agents_list if a.get("trader_id") == t["id"]]
-                        t_metrics = [m for m in agent_metrics
-                                     if m.get("agent_id") in {a["id"] for a in t_agents}]
-                        trader_capital = total_capital * trader_alloc_pct.get(t["id"], 33.3) / 100
-
-                        sub_alloc = await trader_service.allocate_to_agents(
-                            trader=t,
-                            trader_agents=t_agents,
-                            agent_metrics=t_metrics,
-                            trader_capital=trader_capital,
+                        self._current_allocation[a["id"]] = float(
+                            a.get("allocation_percentage") or 20.0
                         )
-                        self._trader_agent_allocations[t["id"]] = sub_alloc
-
-                        # Full-pool model: agent's sub-allocation % within its trader is used
-                        # directly as its fund-level %. The old trader_pct × agent_pct / 100
-                        # cascade compressed 3×3 agents to ~11% each, making every position
-                        # financially negligible. Now each agent sizes against the full fund.
-                        # Overdraft is impossible — position_value is hard-capped at 95% of
-                        # available USDT in run_agent. Performance differentiation is applied
-                        # via _perf_mult and per-trader confidence floor elevation instead.
-                        for aid, agent_pct in sub_alloc.items():
-                            self._current_allocation[aid] = agent_pct
-                            logger.debug(
-                                f"Full-pool allocation: {t.get('name','?')} "
-                                f"→ agent {aid[:8]} = {agent_pct:.1f}% of fund (direct sub-alloc, no cascade)"
-                            )
-
+                        _n_set += 1
                     logger.info(
-                        f"Team Tier: James allocated to {len(self._trader_allocations)} traders — "
-                        + ", ".join(f"{t.get('name','?')}={trader_alloc_pct.get(t['id'],0):.1f}%"
-                                    for t in self._traders if t.get("is_enabled", True))
-                    )
-                    await team_chat.log_trader_allocation(
-                        trader_alloc_pct=trader_alloc_pct,
-                        traders=[t for t in self._traders if t.get("is_enabled", True)],
+                        f"Team Tier: full-pool allocation refreshed for {_n_set} agents "
+                        f"(config pct, no cascade)"
                     )
             except Exception as e:
-                logger.error(f"Team Tier: Trader allocation failed (using PM direct fallback): {e}")
+                logger.error(f"Team Tier: perf/consistency update failed: {e}")
 
             # 2.5 Strategy Review: FM + TA joint evaluation (every 20 minutes)
             try:

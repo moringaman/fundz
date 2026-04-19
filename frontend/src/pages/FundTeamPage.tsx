@@ -11,7 +11,6 @@ import {
   useStrategyActions,
   useTradeRetrospective,
   useTraderLeaderboard,
-  useTraderAllocation,
 } from '../hooks/useQueries';
 import { DailyReportPanel } from '../components/DailyReportPanel';
 import { TeamChatPanel } from '../components/TeamChatPanel';
@@ -25,7 +24,6 @@ export function FundTeamPage() {
   const { data: riskData, isLoading: riskLoading } = useFundRiskAssessment();
   const { data: cioReport, isLoading: cioLoading } = useFundCIOReport();
   const { data: attribution, isLoading: attrLoading } = useFundPerformanceAttribution();
-  const { data: traderAllocation, isLoading: allocLoading } = useTraderAllocation();
   const { data: teamRoster } = useFundTeamRoster();
   // agents data available via _useAgents() if needed for future agent-name lookups
   const { data: strategyActions } = useStrategyActions();
@@ -178,13 +176,13 @@ export function FundTeamPage() {
                         </div>
                       </div>
                       <div className="stat-card">
-                        <div className="stat-label">Allocation</div>
-                        <div className="stat-value" style={{ fontSize: '.82rem', color: 'var(--accent)' }}>
-                          {t.allocation_pct?.toFixed(1)}%
+                        <div className="stat-label">Perf Tier</div>
+                        <div className="stat-value" style={{ fontSize: '.82rem', color: t.perf_mult >= 1.0 ? 'var(--green)' : t.perf_mult >= 0.85 ? 'var(--amber)' : 'var(--red)' }}>
+                          {t.perf_mult != null ? `${t.perf_mult.toFixed(2)}×` : '—'}
                         </div>
-                        {t.allocation_dollars > 0 && (
-                          <div style={{ fontSize: '.6rem', fontFamily: 'var(--mono)', color: 'var(--text-dim)', marginTop: '.1rem' }}>
-                            ${t.allocation_dollars?.toLocaleString('en-US', { maximumFractionDigits: 0 })}
+                        {t.perf_tier && (
+                          <div style={{ fontSize: '.6rem', fontFamily: 'var(--mono)', color: 'var(--text-dim)', marginTop: '.1rem', textTransform: 'uppercase' }}>
+                            {t.perf_tier}
                           </div>
                         )}
                       </div>
@@ -696,51 +694,6 @@ export function FundTeamPage() {
             </div>
           ) : (
             <div style={{ color: 'var(--text-dim)', fontSize: '.75rem', textAlign: 'center', padding: '1rem' }}>No attribution data</div>
-          )}
-        </div>
-
-        {/* === Capital Allocation === */}
-        <div className="panel">
-          <div className="panel-header">
-            <div className="panel-title">
-              <img src={getTeamMember('portfolio_manager').avatar} alt={getTeamMember('portfolio_manager').name} style={{ width: '36px', height: '36px', borderRadius: '50%', objectFit: 'cover' }} />
-              <div style={{ marginLeft: '.75rem' }}>
-                <div style={{ fontSize: '.9rem', fontWeight: 700 }}>{getTeamMember('portfolio_manager').name}</div>
-                <div style={{ fontSize: '.65rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)', marginTop: '.125rem' }}>{getTeamMember('portfolio_manager').title}</div>
-              </div>
-            </div>
-            <span style={{ fontSize: '.65rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)' }}>ALLOCATION</span>
-          </div>
-
-          {allocLoading ? (
-            <div style={{ display: 'flex', justifyContent: 'center', padding: '1.5rem', color: 'var(--text-dim)' }}>Calculating allocation...</div>
-          ) : traderAllocation?.traders?.length > 0 ? (
-            <div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '.75rem' }}>
-                {(traderAllocation.traders as any[]).map((t: any) => (
-                  <div key={t.id}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: '.35rem' }}>
-                      <span style={{ fontSize: '.75rem', fontFamily: 'var(--sans)', color: 'var(--text)', fontWeight: 500 }}>
-                        {t.avatar} {t.name}
-                        <span style={{ fontSize: '.6rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)', marginLeft: '.35rem' }}>{t.llm_model}</span>
-                      </span>
-                      <span style={{ fontSize: '.8rem', fontFamily: 'var(--mono)', fontWeight: 700, color: 'var(--accent)', flexShrink: 0, marginLeft: '.5rem' }}>{(t.allocation_pct as number).toFixed(1)}%</span>
-                    </div>
-                    <div style={{ height: '14px', background: 'var(--bg-hover)', borderRadius: '4px', overflow: 'hidden', boxShadow: 'inset 0 1px 2px rgba(0,0,0,0.2)' }}>
-                      <div style={{ height: '100%', width: `${Math.min(t.allocation_pct, 100)}%`, background: 'linear-gradient(90deg, var(--accent), var(--accent-bright))', borderRadius: '4px', transition: 'width 0.3s ease' }} />
-                    </div>
-                  </div>
-                ))}
-              </div>
-
-              {traderAllocation.reasoning && (
-                <div style={{ marginTop: '.75rem', fontSize: '.68rem', color: 'var(--text-secondary)', lineHeight: 1.5, padding: '.5rem', background: 'var(--bg-hover)', borderRadius: '4px', borderLeft: '2px solid var(--accent)' }}>
-                  {traderAllocation.reasoning}
-                </div>
-              )}
-            </div>
-          ) : (
-            <div style={{ color: 'var(--text-dim)', fontSize: '.75rem', textAlign: 'center', padding: '1rem' }}>No allocation data</div>
           )}
         </div>
 

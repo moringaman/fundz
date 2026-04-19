@@ -392,7 +392,7 @@ export function DashboardPage() {
                         <div>
                           <div style={{ fontSize: '.75rem', fontWeight: 600, color: 'var(--text-primary)' }}>{t.name}</div>
                           <div style={{ fontSize: '.6rem', fontFamily: 'var(--mono)', color: 'var(--text-dim)' }}>
-                            {t.agent_count} agents · {t.allocation_pct?.toFixed(0)}%
+                            {t.agent_count} agents
                           </div>
                         </div>
                       </div>
