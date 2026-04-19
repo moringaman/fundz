@@ -34,6 +34,8 @@ REGIME_DEFENSIVE         = "DEFENSIVE"
 # Moderate: gross_pnl / total_fees < 2.5  (fees eating >28% of gross profit)
 REGIME_FEE_DRAG_SEVERE   = "FEE_DRAG_SEVERE"
 REGIME_FEE_DRAG_MODERATE = "FEE_DRAG_MODERATE"
+# High churn: > N trades/hour with poor fee coverage — enforce quality before quantity
+REGIME_HIGH_CHURN        = "HIGH_CHURN"
 
 REGIME_COLORS = {
     REGIME_AGGRESSIVE:        "green",
@@ -42,6 +44,7 @@ REGIME_COLORS = {
     REGIME_DEFENSIVE:         "red",
     REGIME_FEE_DRAG_SEVERE:   "red",
     REGIME_FEE_DRAG_MODERATE: "amber",
+    REGIME_HIGH_CHURN:        "amber",
 }
 
 # Fee drag detection thresholds
@@ -311,6 +314,22 @@ class GateAutopilot:
         except Exception as exc:
             logger.debug(f"Failed to gather fee drag metrics: {exc}")
 
+        # ── Trades executed in the last 60 minutes (churn detection) ──────────────
+        try:
+            from app.models import AgentRunRecord
+            one_hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)
+            async with get_async_session() as db:
+                recent_result = await db.execute(
+                    select(sqlfunc.count(AgentRunRecord.id)).where(
+                        AgentRunRecord.executed.is_(True),
+                        AgentRunRecord.timestamp >= one_hour_ago,
+                    )
+                )
+                metrics["trades_last_hour"] = int(recent_result.scalar_one_or_none() or 0)
+        except Exception as exc:
+            metrics["trades_last_hour"] = 0
+            logger.debug(f"Failed to gather trades_last_hour: {exc}")
+
         return metrics
 
 
@@ -326,7 +345,21 @@ class GateAutopilot:
         # Insufficient data → stay balanced
         if n < 5:
             return REGIME_BALANCED
-
+        # ── High churn detection (checked before fee drag) ──────────────────────────
+        # Many trades per hour combined with poor coverage = churn not edge.
+        # Trigger BEFORE FEE_DRAG so the regime fires early in the day when
+        # the fee budget is still intact but the hourly rate is already high.
+        _trades_1h   = metrics.get("trades_last_hour", 0)
+        _coverage_hc = metrics.get("fee_coverage_ratio")
+        _lifetime_hc = metrics.get("lifetime_trade_count", 0)
+        _HIGH_CHURN_TRADES_THRESHOLD = 5   # > 5 trades in last 60 min = churning
+        if (
+            _trades_1h > _HIGH_CHURN_TRADES_THRESHOLD
+            and _coverage_hc is not None
+            and _coverage_hc < _FEE_DRAG_MODERATE_RATIO
+            and _lifetime_hc >= 5
+        ):
+            return REGIME_HIGH_CHURN
         # ── Fee drag detection (checked before win-rate regime) ───────────────
         # High-frequency low-profit trading can show an acceptable win rate while
         # fees silently consume the majority of gross returns.  Detect and
@@ -413,6 +446,23 @@ class GateAutopilot:
             _set("sr_proximity_block_pct", _clamp(defaults.sr_proximity_block_pct + 0.0015, 0.003, 0.02))
             reason = (f"Win rate {wr:.0%} below target or negative daily PnL → "
                       f"tightened gates to reduce low-quality entries. {trade_sample_summary}")
+
+        elif regime == REGIME_HIGH_CHURN:
+            _trades_1h = metrics.get("trades_last_hour", 0)
+            _coverage  = metrics.get("fee_coverage_ratio", 0.0) or 0.0
+            _set("min_entry_confidence",       _clamp(defaults.min_entry_confidence + 0.10, 0.65, 0.78))
+            _set("circuit_breaker_max_trades", _clamp(defaults.circuit_breaker_max_trades - 8, 8, 15))
+            _set("fee_coverage_min_ratio",     _clamp(defaults.fee_coverage_min_ratio + 0.5, 3.0, 4.0))
+            # Raise per-trade EV coverage requirement to force higher-quality entries only.
+            # Reads the current gate value (default 3.0) and bumps it upward.
+            _current_ev = d.get("min_trade_ev_coverage_ratio", 3.0)
+            _set("min_trade_ev_coverage_ratio", _clamp(_current_ev + 2.0, 5.0, 12.0))
+            _set("mtf_mixed_penalty",          _clamp(defaults.mtf_mixed_penalty + 0.05, 0.20, 0.35))
+            reason = (
+                f"High churn: {_trades_1h} trades in last hour with fee coverage "
+                f"{_coverage:.2f}× — raising entry quality to enforce fewer, larger, "
+                f"higher-quality trades. {trade_sample_summary}"
+            )
 
         elif regime == REGIME_FEE_DRAG_MODERATE:
             _coverage  = metrics.get("fee_coverage_ratio", 0.0) or 0.0

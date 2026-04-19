@@ -108,7 +108,15 @@ class AgentScheduler:
         # Post-close cooldown: key = "agent_id:symbol", value = datetime of last close.
         # Prevents whipsaw re-entries on the same symbol within 15 minutes of a close.
         self._recent_closes: Dict[str, datetime] = {}
-        self._POST_CLOSE_COOLDOWN_SECONDS = 900  # 15 minutes
+        self._POST_CLOSE_COOLDOWN_SECONDS = 900  # 15 minutes (base; scales with fee pressure)
+
+        # Fee-pressure state: cached from team analysis cycle (15 min refresh)
+        # so per-trade paths don't need their own DB query.
+        self._cached_budget_ratio: float = 0.0
+
+        # Hourly trade counter: reset on UTC hour boundary, used by soft hourly limit gate.
+        self._trades_this_hour: int = 0
+        self._trades_hour_bucket: str = ""  # UTC hour string e.g. "2026-04-19T09"
 
         # Per-agent TA cache: key = "symbol:timeframe", value = (TechnicalAnalystReport, cached_at datetime)
         # TTL: 5 minutes — keeps context fresh without hammering Phemex on every agent run
@@ -2928,6 +2936,15 @@ class AgentScheduler:
             except Exception as e:
                 logger.error(f"Team Tier: SL/TP review failed: {e}")
 
+            # ── Cache daily fee budget ratio for per-trade interval & gate use ──
+            # Refreshes every 15 min (team cycle) so individual trade paths don't
+            # need their own DB query on every agent run.
+            try:
+                _fee_snap = await self._get_daily_fee_pressure()
+                self._cached_budget_ratio = float(_fee_snap.get("budget_used_ratio", 0.0) or 0.0)
+            except Exception:
+                pass
+
             # 4. Execution Coordinator: Optimize order timing
             try:
                 execution_plan = await execution_coordinator.optimize_execution_plan([])
@@ -3081,6 +3098,20 @@ class AgentScheduler:
                     interval = max(60, interval // 2)        # 2× faster during overlap
                 elif not _in_active:
                     interval = interval * 2                  # 0.5× outside active windows
+
+                # ── Fee-pressure interval scaling ─────────────────────────────
+                # As the daily fee budget depletes, slow all agents proportionally.
+                # This distributes trade opportunities across the day rather than
+                # exhausting the budget in the first few hours.
+                # Budget 0–20%: no change | 50%: ×2.1 | 80%: ×3.25 | 100%: ×4.0
+                _fee_ratio = self._cached_budget_ratio
+                if _fee_ratio > 0.20:
+                    _fee_slowdown = 1.0 + (_fee_ratio - 0.20) * 3.75
+                    interval = int(interval * _fee_slowdown)
+                    logger.debug(
+                        f"Fee-pressure scaling: {config.get('name')} interval ×{_fee_slowdown:.1f} "
+                        f"(budget {_fee_ratio:.0%} used)"
+                    )
 
                 last_run = config.get('_last_run')
 
@@ -4148,6 +4179,41 @@ class AgentScheduler:
                         executed=False, error="TP too low after fees"
                     )
 
+                # ── EV coverage gate: expected edge must cover fees by minimum multiple ──
+                # EV% = (win_rate × TP%) − ((1 − win_rate) × SL%)
+                # Coverage = EV% / round-trip-fee%
+                # Default 3.0×: passes all normal momentum/trend/breakout (50% WR / 2:1 R:R ≈ 12×)
+                # but blocks marginal scalping, ATR-squeezed targets, and below-breakeven WR setups.
+                # Uses the backtest win rate if available; falls back to a neutral 50% prior.
+                try:
+                    from app.api.routes.settings import get_trading_gates as _ev_gates_fn
+                    _min_ev_cov = float(getattr(_ev_gates_fn(), 'min_trade_ev_coverage_ratio', 3.0) or 3.0)
+                except Exception:
+                    _min_ev_cov = 3.0
+
+                _ev_win_rate = float(getattr(_bt_result, 'win_rate', 0.50) or 0.50) if '_bt_result' in dir() and _bt_result else 0.50
+                _ev_pct = (_ev_win_rate * take_profit_pct) - ((1.0 - _ev_win_rate) * stop_loss_pct)
+                _ev_coverage = _ev_pct / round_trip_fee_pct if round_trip_fee_pct > 0 else 99.0
+
+                if _ev_coverage < _min_ev_cov:
+                    _ev_reason = (
+                        f"EV coverage {_ev_coverage:.1f}× below {_min_ev_cov:.1f}× minimum "
+                        f"(WR={_ev_win_rate:.0%}, TP={take_profit_pct:.1f}%, "
+                        f"SL={stop_loss_pct:.1f}%, rt-fee={round_trip_fee_pct:.2f}%). "
+                        f"Trade does not earn enough edge to justify the fee cost."
+                    )
+                    logger.info(f"EV coverage gate blocked {name} {signal.upper()} {symbol}: {_ev_reason}")
+                    self._record_run(agent_id, symbol, signal, confidence, current_price, False, error="EV coverage too low")
+                    await team_chat.log_trade_blocked(
+                        trader_name=_trader_name, trader_avatar=_trader_avatar,
+                        agent_name=name, symbol=symbol, side=signal, reason=_ev_reason,
+                    )
+                    return AgentRun(
+                        agent_id=agent_id, timestamp=datetime.now(), symbol=symbol,
+                        signal="hold", confidence=0, price=current_price,
+                        executed=False, error="EV coverage too low",
+                    )
+
                 # Each agent is fully isolated via the (user_id, agent_id, symbol) unique constraint.
                 # Different agents — even on the same symbol — operate independently and should not
                 # block each other. No cross-agent conflict gate needed here.
@@ -4159,8 +4225,15 @@ class AgentScheduler:
                 _last_close = self._recent_closes.get(_cooldown_key)
                 if _last_close:
                     _seconds_since_close = (datetime.now() - _last_close).total_seconds()
-                    if _seconds_since_close < self._POST_CLOSE_COOLDOWN_SECONDS:
-                        _mins_left = (self._POST_CLOSE_COOLDOWN_SECONDS - _seconds_since_close) / 60
+                    # Dynamic cooldown: scales with fee budget consumption so re-entries
+                    # are slower when the budget is already partially depleted.
+                    # 0% budget: 15 min base | 50%: ~22 min | 80%: ~34 min | 100%: 45 min (cap 60 min)
+                    _effective_cooldown = int(
+                        self._POST_CLOSE_COOLDOWN_SECONDS * max(1.0, 1.0 + self._cached_budget_ratio * 2.0)
+                    )
+                    _effective_cooldown = min(3600, _effective_cooldown)
+                    if _seconds_since_close < _effective_cooldown:
+                        _mins_left = (_effective_cooldown - _seconds_since_close) / 60
                         logger.info(
                             f"Post-close cooldown: {name}/{symbol} — "
                             f"{_mins_left:.0f}m remaining before re-entry allowed"
@@ -4708,6 +4781,40 @@ class AgentScheduler:
                             logger.info(f"Backtest PASS: {name}/{symbol} WR={_bt_result.win_rate:.0%} net={_bt_result.net_pnl:+.2f}")
                 # ─────────────────────────────────────────────────────────────────
 
+                # ── Hourly trade frequency gate ───────────────────────────────────
+                # Soft fund-level cap: > max_trades_per_hour requires ≥0.85 confidence
+                # to override. Prevents the budget from being consumed by a burst of
+                # medium-quality entries in the first hour of the active session.
+                _hour_bucket = datetime.now().strftime("%Y-%m-%dT%H")
+                if _hour_bucket != self._trades_hour_bucket:
+                    self._trades_this_hour = 0
+                    self._trades_hour_bucket = _hour_bucket
+                try:
+                    from app.api.routes.settings import get_trading_gates as _hr_gates_fn
+                    _max_per_hour = int(getattr(_hr_gates_fn(), 'max_trades_per_hour', 4) or 4)
+                except Exception:
+                    _max_per_hour = 4
+
+                if self._trades_this_hour >= _max_per_hour and confidence < 0.85:
+                    _hr_reason = (
+                        f"Hourly trade limit reached: {self._trades_this_hour}/{_max_per_hour} "
+                        f"trades this hour. Confidence {confidence:.0%} < 85% required to override. "
+                        f"Preserving fee budget for higher-conviction setups."
+                    )
+                    logger.info(f"Hourly limit gate blocked {name} {signal.upper()} {symbol}: {_hr_reason}")
+                    self._record_run(agent_id, symbol, signal, confidence, current_price, False,
+                                     error="Hourly trade limit")
+                    await team_chat.log_trade_blocked(
+                        trader_name=_trader_name, trader_avatar=_trader_avatar,
+                        agent_name=name, symbol=symbol, side=signal, reason=_hr_reason,
+                    )
+                    return AgentRun(
+                        agent_id=agent_id, timestamp=datetime.now(), symbol=symbol,
+                        signal="hold", confidence=0, price=current_price,
+                        executed=False, error="Hourly trade limit",
+                    )
+                # ─────────────────────────────────────────────────────────────────
+
                 if use_paper and paper_trading._enabled:
                     try:
                         # Look up trader_id from agent config
@@ -4728,6 +4835,7 @@ class AgentScheduler:
                             liquidation_price=liquidation_price,
                         )
                         executed = True
+                        self._trades_this_hour += 1  # hourly frequency gate counter
 
                         # ── Scale-out levels ──────────────────────────────────────────
                         # Scale-out profiles are strategy-specific.
@@ -4829,6 +4937,7 @@ class AgentScheduler:
                         if order is None:
                             raise RuntimeError("live_trading.place_order returned None — check balance/price")
                         executed = True
+                        self._trades_this_hour += 1  # hourly frequency gate counter
 
                         # ── Record traded symbol in agent history ──────────────────────
                         try:

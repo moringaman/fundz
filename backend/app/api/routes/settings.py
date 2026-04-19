@@ -197,6 +197,20 @@ class TradingGates(BaseModel):
         description="Estimated slippage per execution leg in basis points (2.0 = 2 bps per entry and exit leg).")
     fee_coverage_include_funding: bool = Field(default=True,
         description="Include funding costs in fee-coverage net-edge calculation when available.")
+    # ── Per-Trade EV Quality Gate ─────────────────────────────────────────────
+    # Enforces that each trade earns a minimum multiple of its fee cost in expected value.
+    # EV% = (win_rate × TP%) − ((1 − win_rate) × SL%)
+    # Coverage = EV% / round-trip-fee%
+    # Default 3.0×: blocks marginal scalping/low-WR trades while passing
+    # all momentum/trend/breakout at normal win rates (50% WR / 2:1 R:R ≈ 12×).
+    min_trade_ev_coverage_ratio: float = Field(default=3.0, ge=0.5, le=50.0,
+        description="Minimum expected-value / round-trip-fee ratio per trade. EV% = (WR×TP%) − ((1−WR)×SL%). Trade must earn this multiple of its fee cost in expected value (3.0 = 3× fee cost minimum).")
+    # ── Hourly Trade Frequency Limit ─────────────────────────────────────────
+    # Soft fund-level cap on trades per UTC hour. Trades above the limit require
+    # ≥0.85 confidence to proceed. Prevents fee budget exhaustion from early-morning
+    # churn; high-conviction signals can always override.
+    max_trades_per_hour: int = Field(default=4, ge=1, le=20,
+        description="Soft hourly trade limit across all agents. Trades above this limit require 0.85+ confidence to proceed. Prevents early fee budget exhaustion from high-frequency churn.")
     # ── Confidence-Gated Leverage ────────────────────────────────────────────
     leverage_enabled: bool = Field(default=True,
         description="Allow leverage only on high-confidence trades.")
