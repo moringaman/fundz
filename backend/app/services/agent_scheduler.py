@@ -2663,6 +2663,16 @@ class AgentScheduler:
                         except Exception as _fe:
                             logger.debug(f"Fees-by-agent pre-fetch failed: {_fe}")
 
+                    # Fetch authoritative DB performance once — used to enrich trader_perf_list
+                    # so both James's allocation and the _current_trader_perf perf gate use
+                    # real closed-trade data rather than the in-memory metrics buffer (which
+                    # is empty on restart and lags the DB by many cycles).
+                    try:
+                        _db_agent_perf = await paper_trading.get_agent_performance_from_db()
+                    except Exception as _dbe:
+                        logger.debug(f"DB agent perf pre-fetch failed: {_dbe}")
+                        _db_agent_perf = {}
+
                     # Build trader performance summary for James
                     trader_perf_list = []
                     for t in self._traders:
@@ -2672,15 +2682,40 @@ class AgentScheduler:
                         perf = trader_service.get_trader_performance(t, t_agents, t_metrics)
                         _t_fees = sum(_fees_by_agent.get(a["id"], 0.0) for a in t_agents)
                         _gross_pnl = (perf.total_pnl or 0.0) + _t_fees
+
+                        # Override in-memory totals with DB-sourced data when available.
+                        # DB is authoritative: it survives restarts, includes all closed trades,
+                        # and is net-of-fees (unlike the in-memory buffer which mixes backtest data).
+                        _db_total_trades = 0
+                        _db_winning_trades = 0
+                        _db_net_pnl = 0.0
+                        for _a in t_agents:
+                            _ap = _db_agent_perf.get(_a["id"])
+                            if _ap:
+                                _db_total_trades += _ap["total_trades"]
+                                _db_winning_trades += int(_ap["total_trades"] * (_ap["win_rate"] or 0))
+                                _db_net_pnl += _ap["net_pnl"]
+                        if _db_total_trades > 0:
+                            _db_win_rate = _db_winning_trades / _db_total_trades
+                            # Use DB net P&L + fees back to reconstruct gross P&L
+                            _gross_pnl = _db_net_pnl + _t_fees
+                            _total_pnl_used = _db_net_pnl
+                            _win_rate_used  = _db_win_rate
+                            _total_trades_used = _db_total_trades
+                        else:
+                            _total_pnl_used    = perf.total_pnl
+                            _win_rate_used     = perf.win_rate
+                            _total_trades_used = perf.total_trades
+
                         trader_perf_list.append({
                             "trader_id": perf.trader_id,
                             "trader_name": perf.trader_name,
                             "agent_count": perf.agent_count,
-                            "total_pnl": perf.total_pnl,       # net (after fees)
+                            "total_pnl": _total_pnl_used,      # net (after fees)
                             "gross_pnl": _gross_pnl,           # before fees — used for allocation scoring
                             "total_fees": _t_fees,
-                            "win_rate": perf.win_rate,
-                            "total_trades": perf.total_trades,
+                            "win_rate": _win_rate_used,
+                            "total_trades": _total_trades_used,
                             "sharpe_ratio": getattr(perf, "sharpe_ratio", None),
                         })
 
