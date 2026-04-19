@@ -468,21 +468,62 @@ class TeamChatService:
         trade_signal: str,
     ) -> None:
         """Marcus (Technical Analyst) responds with chart confluence for the requested symbol."""
-        alignment = "✅ Aligned" if ta_signal == trade_signal else ("❌ Opposing" if (ta_signal == "buy" and trade_signal == "sell") or (ta_signal == "sell" and trade_signal == "buy") else "⚠️ Neutral")
+        # Normalise TA vocabulary for alignment check:
+        # TA emits 'bullish'/'bearish'; agent signals are 'buy'/'sell'.
+        _ta_norm = "buy" if ta_signal == "bullish" else ("sell" if ta_signal == "bearish" else ta_signal)
+        _is_aligned  = _ta_norm == trade_signal
+        _is_opposing = (_ta_norm == "buy" and trade_signal == "sell") or (_ta_norm == "sell" and trade_signal == "buy")
+        alignment = "✅ Aligned" if _is_aligned else ("❌ Opposing" if _is_opposing else "⚠️ Neutral")
+
+        # Friendly display names for the new leading-indicator pattern types
+        _PATTERN_LABELS = {
+            "ema8_21_bull_cross":     "EMA 8/21 Bull Cross ⚡",
+            "ema8_21_bear_cross":     "EMA 8/21 Bear Cross ⚡",
+            "rsi_bullish_divergence": "RSI Bullish Divergence ⚡",
+            "rsi_bearish_divergence": "RSI Bearish Divergence ⚡",
+        }
+
         pattern_text = ""
+        leading_flag = ""
         if patterns:
-            top = patterns[:3]
-            pattern_text = "\n\nPatterns identified: " + ", ".join(
-                f"**{p.name}** ({p.confidence:.0%})" for p in top if hasattr(p, 'name')
-            )
+            top = patterns[:4]
+            pattern_parts = []
+            has_leading = False
+            for p in top:
+                if not hasattr(p, 'pattern_type'):
+                    continue
+                pt = p.pattern_type or ""
+                label = _PATTERN_LABELS.get(pt)
+                if label is None:
+                    # Candlestick patterns start with "candle_" — pretty-print the suffix
+                    if pt.startswith("candle_"):
+                        label = "🕯 " + pt.replace("candle_", "").replace("_", " ").title()
+                    else:
+                        label = pt.replace("_", " ").title()
+                else:
+                    has_leading = True
+                pattern_parts.append(f"**{label}** ({p.confidence:.0%})")
+            if pattern_parts:
+                pattern_text = "\n\nPatterns detected: " + ", ".join(pattern_parts)
+            if has_leading:
+                leading_flag = "\n\n⚡ *Leading indicators active — signal fired before lagging confirmation.*"
+
         level_text = ""
         if support_levels or resistance_levels:
             s_str = ", ".join(fmt_price(s) for s in (support_levels or [])[:2]) or "—"
             r_str = ", ".join(fmt_price(r) for r in (resistance_levels or [])[:2]) or "—"
             level_text = f"\n\nKey levels — Support: {s_str} | Resistance: {r_str}"
+
+        # Veto notice: TA can now actually veto (vocab bug fixed in ccc35a1)
+        veto_note = ""
+        if _is_opposing and ta_confidence >= 0.75:
+            veto_note = f"\n\n🚫 **VETO ACTIVE** — {ta_confidence:.0%} opposing confidence exceeds the 75% veto threshold. This trade will be blocked."
+        elif _is_opposing and ta_confidence >= 0.55:
+            veto_note = f"\n\n⚠️ *Caution: opposing signal at {ta_confidence:.0%} — below veto threshold, trade may proceed.*"
+
         content = (
             f"TA confluence on **{symbol}**: signal **{ta_signal.upper()}** at {ta_confidence:.0%} confidence. "
-            f"Trade intent {alignment}.{pattern_text}{level_text}"
+            f"Trade intent {alignment}.{pattern_text}{leading_flag}{level_text}{veto_note}"
         )
         await self.add_message(
             agent_role="technical_analyst",

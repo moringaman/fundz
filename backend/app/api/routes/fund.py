@@ -17,6 +17,32 @@ from app.services.firm_advisor import firm_advisor
 router = APIRouter(prefix="/fund", tags=["fund"])
 
 
+# ── Performance gate helper ────────────────────────────────────────────────
+# Mirrors the _perf_mult / conf-floor logic in agent_scheduler.run_agent so
+# the UI can display the current tier and multiplier without a separate query.
+def _compute_perf_gate(tp: dict) -> dict:
+    """Return perf_mult, perf_tier, and conf_floor_boost from a trader perf dict."""
+    if not tp:
+        return {"perf_mult": 1.0, "perf_tier": "new", "conf_floor_boost": 0.0}
+    wr       = float(tp.get("win_rate", 0.5) or 0.5)
+    pnl      = float(tp.get("gross_pnl") if tp.get("gross_pnl") is not None else tp.get("total_pnl", 0) or 0)
+    n_trades = int(tp.get("total_trades", 0) or 0)
+    if n_trades < 5:
+        return {"perf_mult": 1.0, "perf_tier": "new", "conf_floor_boost": 0.0}
+    pnl_score = min(max(pnl / 500.0 + 0.5, 0.0), 1.0)
+    raw_score = wr * 0.60 + pnl_score * 0.40
+    perf_mult = round(0.60 + raw_score * 0.70, 3)
+    if wr >= 0.60 and pnl >= 0:
+        tier, boost = "strong",   0.00
+    elif wr >= 0.50:
+        tier, boost = "moderate", 0.07
+    elif wr >= 0.40:
+        tier, boost = "weak",     0.12
+    else:
+        tier, boost = "poor",     0.20
+    return {"perf_mult": perf_mult, "perf_tier": tier, "conf_floor_boost": boost}
+
+
 # ==================== Response Models ====================
 
 class MarketOpportunityResponse(BaseModel):
@@ -1008,6 +1034,9 @@ async def get_trader_leaderboard():
             "drawdown_warning_level": t.get("drawdown_warning_level"),
             "lifetime_drawdown_pct": t.get("lifetime_drawdown_pct"),
             "successor_of": t.get("successor_of"),
+            # Performance gate fields (full-pool sizing model)
+            # Computed from live _current_trader_perf; neutral defaults until ≥5 trades.
+            **_compute_perf_gate(agent_scheduler._current_trader_perf.get(t["id"], {})),
         })
 
     leaderboard.sort(key=lambda x: x["total_pnl"], reverse=True)

@@ -110,6 +110,71 @@ function DrawdownBadge({ level, drawdownPct }: { level: string; drawdownPct?: nu
   );
 }
 
+const PERF_GATE_STYLES: Record<string, { color: string; border: string; bg: string; icon: string }> = {
+  strong:   { color: 'var(--green)',  border: 'rgba(0,230,118,.35)',  bg: 'rgba(0,230,118,.08)',  icon: '▲' },
+  moderate: { color: 'var(--amber)',  border: 'rgba(255,176,0,.35)',  bg: 'rgba(255,176,0,.07)',  icon: '—' },
+  weak:     { color: '#f97316',       border: 'rgba(249,115,22,.35)', bg: 'rgba(249,115,22,.07)', icon: '▼' },
+  poor:     { color: 'var(--red)',    border: 'rgba(255,59,48,.35)',  bg: 'rgba(255,59,48,.08)',  icon: '▼▼' },
+  new:      { color: 'var(--text-dim)', border: 'var(--border)',      bg: 'var(--bg-hover)',      icon: '○' },
+};
+
+const PERF_GATE_LABELS: Record<string, string> = {
+  strong:   'STRONG',
+  moderate: 'MODERATE',
+  weak:     'WEAK',
+  poor:     'POOR',
+  new:      'NEW',
+};
+
+const PERF_GATE_TOOLTIPS: Record<string, string> = {
+  strong:   'Tier 1: WR ≥ 60% & P&L ≥ 0 — no conf floor penalty, full size boost',
+  moderate: 'Tier 2: WR ≥ 50% — conf floor +7%, agents need stronger signals to enter',
+  weak:     'Tier 3: WR ≥ 40% — conf floor +12%, fewer trades, position size penalised',
+  poor:     'Tier 4: WR < 40% — conf floor +20%, only highest-conviction setups allowed',
+  new:      'Fewer than 5 closed trades — neutral sizing, no floor penalty yet',
+};
+
+function PerfGateBadge({ tier, perfMult, confBoost }: {
+  tier: string; perfMult: number; confBoost: number;
+}) {
+  const s = PERF_GATE_STYLES[tier] || PERF_GATE_STYLES.new;
+  const label = PERF_GATE_LABELS[tier] || tier.toUpperCase();
+  const tooltip = PERF_GATE_TOOLTIPS[tier] || '';
+  const multColor = perfMult >= 1.0 ? 'var(--green)' : perfMult >= 0.85 ? 'var(--amber)' : 'var(--red)';
+  return (
+    <div style={{ display: 'flex', gap: '.3rem', alignItems: 'center', flexWrap: 'wrap' }}>
+      <span
+        title={tooltip}
+        style={{
+          fontSize: '.54rem', fontFamily: 'var(--mono)', padding: '.2rem .45rem',
+          background: s.bg, border: `1px solid ${s.border}`, color: s.color,
+          letterSpacing: '.06em', cursor: 'default',
+        }}
+      >{s.icon} PERF {label}</span>
+      {tier !== 'new' && (
+        <span
+          title={`Position size multiplier: ${perfMult.toFixed(2)}× (${perfMult >= 1 ? '+' : ''}${((perfMult - 1) * 100).toFixed(0)}%)`}
+          style={{
+            fontSize: '.54rem', fontFamily: 'var(--mono)', padding: '.2rem .45rem',
+            background: 'var(--bg-hover)', border: '1px solid var(--border)',
+            color: multColor, letterSpacing: '.06em', cursor: 'default',
+          }}
+        >{perfMult.toFixed(2)}× size</span>
+      )}
+      {confBoost > 0 && (
+        <span
+          title={`Entry confidence floor raised by +${(confBoost * 100).toFixed(0)}% — agents need stronger signals`}
+          style={{
+            fontSize: '.54rem', fontFamily: 'var(--mono)', padding: '.2rem .45rem',
+            background: 'var(--bg-hover)', border: '1px solid var(--border)',
+            color: 'var(--amber)', letterSpacing: '.06em', cursor: 'default',
+          }}
+        >+{(confBoost * 100).toFixed(0)}% conf floor</span>
+      )}
+    </div>
+  );
+}
+
 export function TradersPage() {
   const { data: leaderboard = [], isPending: tradersLoading } = useTraderLeaderboard();
   const { data: tradersData = [] } = useTraders();
@@ -265,6 +330,17 @@ export function TradersPage() {
                 </div>
               )}
 
+              {/* Performance gate badge */}
+              {t.perf_tier && (
+                <div style={{ marginTop: '.3rem' }}>
+                  <PerfGateBadge
+                    tier={t.perf_tier}
+                    perfMult={t.perf_mult ?? 1.0}
+                    confBoost={t.conf_floor_boost ?? 0}
+                  />
+                </div>
+              )}
+
               {/* 9.2 Drawdown warning badge */}
               {t.drawdown_warning_level && (
                 <div style={{ marginTop: '.3rem' }}>
@@ -326,6 +402,13 @@ export function TradersPage() {
                         score={selectedTrader.consistency_score ?? 0.5}
                         sharpe={selectedTrader.sharpe ?? 0}
                         sharpeTier={selectedTrader.sharpe_tier || 'medium'}
+                      />
+                    )}
+                    {selectedTrader.perf_tier && (
+                      <PerfGateBadge
+                        tier={selectedTrader.perf_tier}
+                        perfMult={selectedTrader.perf_mult ?? 1.0}
+                        confBoost={selectedTrader.conf_floor_boost ?? 0}
                       />
                     )}
                     {selectedTrader.drawdown_warning_level && (
