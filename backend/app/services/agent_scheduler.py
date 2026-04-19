@@ -4489,17 +4489,23 @@ class AgentScheduler:
 
                 # ── Correlation / concentration limit ─────────────────────────
                 # Prevent piling into the same asset/direction across all agents.
+                # Applies to BOTH longs and shorts — previously only longs were checked,
+                # allowing multiple agents to freely pile into the same short position.
                 # Settings: max 2 open positions same symbol, max dynamic % fund in one direction.
-                if signal == 'buy':
+                if signal in ('buy', 'sell'):
                     _all_open = list(await trading_service.get_positions())
-                    _same_sym_longs = [
+                    _is_long_signal = (signal == 'buy')
+                    _target_side = OrderSide.BUY if _is_long_signal else OrderSide.SELL
+                    _direction_label = "LONG" if _is_long_signal else "SHORT"
+
+                    _same_sym_positions = [
                         p for p in _all_open
-                        if p.symbol == symbol and p.side == OrderSide.BUY
+                        if p.symbol == symbol and p.side == _target_side
                     ]
                     _max_same = getattr(_limits, 'max_same_asset_positions', 2)
-                    if len(_same_sym_longs) >= _max_same:
+                    if len(_same_sym_positions) >= _max_same:
                         _corr_reason = (
-                            f"Correlation limit: already {len(_same_sym_longs)} open LONG "
+                            f"Correlation limit: already {len(_same_sym_positions)} open {_direction_label} "
                             f"positions on {symbol} (max {_max_same})"
                         )
                         logger.info(f"Concentration gate: {_corr_reason}")
@@ -4515,15 +4521,15 @@ class AgentScheduler:
                             executed=False, error=_corr_reason,
                         )
                     # Total directional concentration check (now with dynamic limit)
-                    _all_long_value = sum(
+                    _dir_value = sum(
                         p.quantity * (p.current_price or p.entry_price or 0)
-                        for p in _all_open if p.side == OrderSide.BUY
+                        for p in _all_open if p.side == _target_side
                     )
-                    _new_long_pct = (_all_long_value + position_value) / total_fund * 100 if total_fund > 0 else 0
-                    if _new_long_pct > _max_conc_pct:
+                    _new_dir_pct = (_dir_value + position_value) / total_fund * 100 if total_fund > 0 else 0
+                    if _new_dir_pct > _max_conc_pct:
                         _conc_reason = (
                             f"Directional concentration limit: adding this position would put "
-                            f"{_new_long_pct:.0f}% of fund in LONG (max {_max_conc_pct:.0f}%)"
+                            f"{_new_dir_pct:.0f}% of fund in {_direction_label} (max {_max_conc_pct:.0f}%)"
                         )
                         if _conc_boost_source:
                             _conc_reason += f" [dynamic: {_conc_boost_source}]"
@@ -4836,6 +4842,10 @@ class AgentScheduler:
                         )
                         executed = True
                         self._trades_this_hour += 1  # hourly frequency gate counter
+                        # Bust the shared TA cache so no other agent fires on the same
+                        # stale signal that just triggered this trade.  Forces a fresh
+                        # analysis call before any subsequent entry on this pair/timeframe.
+                        self._ta_cache.pop(f"{symbol}:{timeframe}", None)
 
                         # ── Scale-out levels ──────────────────────────────────────────
                         # Scale-out profiles are strategy-specific.
@@ -4938,6 +4948,8 @@ class AgentScheduler:
                             raise RuntimeError("live_trading.place_order returned None — check balance/price")
                         executed = True
                         self._trades_this_hour += 1  # hourly frequency gate counter
+                        # Bust the shared TA cache (same reason as paper path above).
+                        self._ta_cache.pop(f"{symbol}:{timeframe}", None)
 
                         # ── Record traded symbol in agent history ──────────────────────
                         try:

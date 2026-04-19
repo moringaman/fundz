@@ -529,6 +529,86 @@ class TechnicalAnalyst:
                     reasoning="MACD bearish crossover below zero line. Targets at structural levels."
                 ))
 
+        # ── Late-entry / exhaustion penalty ──────────────────────────────────
+        # Reduce confidence of patterns whose direction matches an extended move.
+        # Problem: agents enter shorts after 8 consecutive bearish candles — the move
+        # is already 80% done but the signal still fires at full confidence.
+        #
+        # Two checks:
+        #   1. Consecutive candle streak: >5 candles in one direction → −0.05/extra candle
+        #   2. Momentum deceleration: if the last 3 candle bodies are shrinking vs the
+        #      previous 3, momentum is exhausting → additional −0.08 penalty
+        #
+        # Penalties are capped so a valid pattern can't go below 0.40 confidence —
+        # we don't want to silence a signal entirely, just make it compete fairly.
+        if patterns and len(closes) >= 10:
+            try:
+                _recent = closes.iloc[-10:].values
+                # Count consecutive candles in each direction from the most recent bar back
+                _bearish_streak, _bullish_streak = 0, 0
+                for _i in range(len(_recent) - 1, 0, -1):
+                    if _recent[_i] < _recent[_i - 1]:
+                        if _bearish_streak == _i - (len(_recent) - 1 - _bearish_streak):
+                            _bearish_streak += 1
+                        else:
+                            break
+                    else:
+                        break
+                for _i in range(len(_recent) - 1, 0, -1):
+                    if _recent[_i] > _recent[_i - 1]:
+                        if _bullish_streak == _i - (len(_recent) - 1 - _bullish_streak):
+                            _bullish_streak += 1
+                        else:
+                            break
+                    else:
+                        break
+
+                # Simpler, more reliable streak count: walk backwards from tip
+                _bearish_streak = 0
+                _bullish_streak = 0
+                _c = closes.values
+                for _k in range(len(_c) - 1, 0, -1):
+                    if _c[_k] < _c[_k - 1]:
+                        _bearish_streak += 1
+                    else:
+                        break
+                for _k in range(len(_c) - 1, 0, -1):
+                    if _c[_k] > _c[_k - 1]:
+                        _bullish_streak += 1
+                    else:
+                        break
+
+                # Candle body sizes for momentum deceleration check
+                _opens = df['open'].values
+                _bodies_last3  = [abs(_c[-i] - _opens[-i]) for i in range(1, 4)]
+                _bodies_prev3  = [abs(_c[-i] - _opens[-i]) for i in range(4, 7)]
+                _avg_last3 = sum(_bodies_last3) / 3
+                _avg_prev3 = sum(_bodies_prev3) / 3
+                _decelerating = _avg_last3 < _avg_prev3 * 0.75  # last 3 bodies <75% of prev 3
+
+                penalised = []
+                for pat in patterns:
+                    _streak = _bearish_streak if pat.direction == "bearish" else _bullish_streak
+                    _penalty = 0.0
+                    if _streak > 5:
+                        _penalty += min((_streak - 5) * 0.05, 0.20)  # cap streak penalty at −0.20
+                    if _decelerating:
+                        # Only penalise if the deceleration matches the pattern direction
+                        _bearish_decel = _bearish_streak >= 3 and _decelerating
+                        _bullish_decel = _bullish_streak >= 3 and _decelerating
+                        if (pat.direction == "bearish" and _bearish_decel) or \
+                           (pat.direction == "bullish" and _bullish_decel):
+                            _penalty += 0.08
+                    if _penalty > 0:
+                        _new_conf = max(pat.confidence - _penalty, 0.40)
+                        if _new_conf < pat.confidence:
+                            pat.confidence = round(_new_conf, 3)
+                            pat.reasoning = pat.reasoning + f" [exhaustion −{_penalty:.2f}: streak={_streak}, decel={_decelerating}]"
+                    penalised.append(pat)
+                patterns = penalised
+            except Exception:
+                pass  # exhaustion check is advisory; never block signal generation
+
         return patterns
 
     def _analyze_multitimeframe(
@@ -601,19 +681,41 @@ class TechnicalAnalyst:
         if not patterns:
             return "hold", 0.3
 
-        best_pattern = max(patterns, key=lambda p: p.confidence)
-        
-        signal = best_pattern.direction
-        confidence = best_pattern.confidence
+        # ── Weighted consensus vote ───────────────────────────────────────────
+        # Previously this picked the single highest-confidence pattern, meaning
+        # one bearish signal at 0.75 would win over three bullish signals at 0.60
+        # each. Now we sum confidence weights by direction — a clear majority
+        # (>55% of total weight) is required for a directional signal.
+        bull_weight = sum(p.confidence for p in patterns if p.direction == "bullish")
+        bear_weight = sum(p.confidence for p in patterns if p.direction == "bearish")
+        total_weight = bull_weight + bear_weight
 
+        if total_weight == 0:
+            return "hold", 0.3
+
+        bull_share = bull_weight / total_weight
+        bear_share = bear_weight / total_weight
+
+        if bull_share > 0.55:
+            raw_signal = "bullish"
+            _bull_patterns = [p for p in patterns if p.direction == "bullish"]
+            raw_conf = bull_weight / len(_bull_patterns)
+        elif bear_share > 0.55:
+            raw_signal = "bearish"
+            _bear_patterns = [p for p in patterns if p.direction == "bearish"]
+            raw_conf = bear_weight / len(_bear_patterns)
+        else:
+            # No clear consensus — conflicting signals, stay flat.
+            return "hold", 0.3
+
+        # ── Multi-TF alignment check (unchanged logic) ────────────────────────
         if multi_tf and multi_tf.trend_confirmation:
-            if multi_tf.alignment == best_pattern.direction:
-                confidence = min(confidence + 0.15, 0.95)
+            if multi_tf.alignment == raw_signal:
+                raw_conf = min(raw_conf + 0.15, 0.95)
             else:
-                signal = "hold"
-                confidence = 0.2
+                return "hold", 0.2
 
-        return signal, confidence
+        return raw_signal, raw_conf
 
     def _generate_observations(
         self,
