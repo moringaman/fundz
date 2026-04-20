@@ -133,6 +133,8 @@ export function SettingsPage() {
     max_directional_concentration_pct: 40.0,
     confidence_size_reference: 0.78,
     confidence_size_floor: 0.25,
+    new_trader_starting_mult: 0.75,
+    perf_gate_min_trades: 5,
     ta_boost_multiplier: 0.20,
     ta_penalty_multiplier: 0.40,
     ta_min_confidence: 0.60,
@@ -1678,6 +1680,20 @@ export function SettingsPage() {
                 <input type="number" step="0.01" min="0.1" max="1.0" className="settings-input"
                   value={gatesForm.confidence_size_floor}
                   onChange={e => setGatesForm(p => ({ ...p, confidence_size_floor: parseFloat(e.target.value) }))} />
+              </div>
+              <div>
+                <label className="settings-label">New Trader Starting Multiplier</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>Size multiplier before the perf gate activates — 0.75 = earn up, 1.0 = full size from trade 1</p>
+                <input type="number" step="0.05" min="0.10" max="1.30" className="settings-input"
+                  value={(gatesForm as any).new_trader_starting_mult ?? 0.75}
+                  onChange={e => setGatesForm(p => ({ ...p, new_trader_starting_mult: parseFloat(e.target.value) }))} />
+              </div>
+              <div>
+                <label className="settings-label">Perf Gate Min Trades</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>Closed trades required before the perf gate formula activates</p>
+                <input type="number" step="1" min="1" max="50" className="settings-input"
+                  value={(gatesForm as any).perf_gate_min_trades ?? 5}
+                  onChange={e => setGatesForm(p => ({ ...p, perf_gate_min_trades: parseInt(e.target.value) }))} />
               </div>
               <div>
                 <label className="settings-label">Max Same-Asset Positions</label>

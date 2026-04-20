@@ -3796,7 +3796,8 @@ class AgentScheduler:
             # _perf_mult  — position size multiplier [0.60, 1.30]:
             #   Derived from a blended score of win rate (60%) + P&L score (40%).
             #   A top trader gets 1.30×; a consistently losing trader gets 0.60×.
-            #   Neutral (1.0×) until the trader has ≥5 closed trades.
+            #   Below perf_gate_min_trades (configurable, default 5) the
+            #   new_trader_starting_mult applies (configurable, default 0.75).
             #
             # _effective_min_entry_conf elevation — confidence floor tiers:
             #   Tier 1 (strong):   WR ≥ 60% AND gross P&L ≥ 0  → no change
@@ -3805,7 +3806,15 @@ class AgentScheduler:
             #   Tier 4 (poor):     WR < 40%                     → +20%
             #   Effect: underperforming traders must wait for higher-conviction setups,
             #   directly reducing their trade frequency and fee consumption.
-            _perf_mult = 1.0
+            try:
+                from app.api.routes.settings import get_trading_gates as _pg_gates
+                _pg = _pg_gates()
+                _perf_gate_min_trades    = _pg.perf_gate_min_trades
+                _new_trader_starting_mult = _pg.new_trader_starting_mult
+            except Exception:
+                _perf_gate_min_trades    = 5
+                _new_trader_starting_mult = 0.75
+            _perf_mult = _new_trader_starting_mult
             if _trader_id_pre:
                 _tp = self._current_trader_perf.get(_trader_id_pre, {})
                 _tp_wr     = float(_tp.get("win_rate", 0.5) or 0.5)
@@ -3814,7 +3823,7 @@ class AgentScheduler:
                     else (_tp.get("total_pnl", 0) or 0)
                 )
                 _tp_trades = int(_tp.get("total_trades", 0) or 0)
-                if _tp_trades >= 5:
+                if _tp_trades >= _perf_gate_min_trades:
                     _pnl_score = min(max(_tp_pnl / 500.0 + 0.5, 0.0), 1.0)
                     _raw_score = _tp_wr * 0.60 + _pnl_score * 0.40
                     _perf_mult = round(0.60 + _raw_score * 0.70, 3)  # [0.60, 1.30]
@@ -3833,6 +3842,12 @@ class AgentScheduler:
                             f"({_tp_trades} trades) → conf floor +{_trader_conf_boost:.0%}, "
                             f"size mult {_perf_mult:.3f}×"
                         )
+                else:
+                    logger.debug(
+                        f"Trader perf gate: {_trader_name} probationary "
+                        f"({_tp_trades}/{_perf_gate_min_trades} trades) → "
+                        f"starting mult {_perf_mult:.3f}×"
+                    )
 
             if signal in ('buy', 'sell'):
                 _fee_pressure = await self._get_daily_fee_pressure()

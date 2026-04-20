@@ -197,6 +197,18 @@ class TradingGates(BaseModel):
         description="Estimated slippage per execution leg in basis points (2.0 = 2 bps per entry and exit leg).")
     fee_coverage_include_funding: bool = Field(default=True,
         description="Include funding costs in fee-coverage net-edge calculation when available.")
+    # ── Trader Perf Gate ─────────────────────────────────────────────────────
+    # New traders start at this size multiplier until they have ≥5 closed trades,
+    # at which point the real perf gate formula takes over.
+    # 0.75 = conservative start (must prove the strategy first)
+    # 1.00 = neutral (current behaviour — full size from trade 1)
+    new_trader_starting_mult: float = Field(default=0.75, ge=0.10, le=1.30,
+        description="Position-size multiplier for traders with fewer than 5 closed trades. "
+                    "0.75 = probationary (earn up); 1.0 = neutral start.")
+    # Minimum closed-trade sample before the perf gate starts differentiating.
+    perf_gate_min_trades: int = Field(default=5, ge=1, le=50,
+        description="Minimum closed trades before the performance gate (perf_mult / conf-floor tiers) activates. Below this the new_trader_starting_mult applies.")
+
     # ── Per-Trade EV Quality Gate ─────────────────────────────────────────────
     # Enforces that each trade earns a minimum multiple of its fee cost in expected value.
     # EV% = (win_rate × TP%) − ((1 − win_rate) × SL%)

@@ -22,13 +22,21 @@ router = APIRouter(prefix="/fund", tags=["fund"])
 # the UI can display the current tier and multiplier without a separate query.
 def _compute_perf_gate(tp: dict) -> dict:
     """Return perf_mult, perf_tier, and conf_floor_boost from a trader perf dict."""
+    try:
+        from app.api.routes.settings import get_trading_gates as _gtg
+        _g = _gtg()
+        _min_trades  = _g.perf_gate_min_trades
+        _start_mult  = _g.new_trader_starting_mult
+    except Exception:
+        _min_trades  = 5
+        _start_mult  = 0.75
     if not tp:
-        return {"perf_mult": 1.0, "perf_tier": "new", "conf_floor_boost": 0.0}
+        return {"perf_mult": _start_mult, "perf_tier": "new", "conf_floor_boost": 0.0}
     wr       = float(tp.get("win_rate", 0.5) or 0.5)
     pnl      = float(tp.get("gross_pnl") if tp.get("gross_pnl") is not None else tp.get("total_pnl", 0) or 0)
     n_trades = int(tp.get("total_trades", 0) or 0)
-    if n_trades < 5:
-        return {"perf_mult": 1.0, "perf_tier": "new", "conf_floor_boost": 0.0}
+    if n_trades < _min_trades:
+        return {"perf_mult": _start_mult, "perf_tier": "new", "conf_floor_boost": 0.0}
     pnl_score = min(max(pnl / 500.0 + 0.5, 0.0), 1.0)
     raw_score = wr * 0.60 + pnl_score * 0.40
     perf_mult = round(0.60 + raw_score * 0.70, 3)
