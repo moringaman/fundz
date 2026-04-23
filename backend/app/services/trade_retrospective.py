@@ -74,7 +74,19 @@ class TradeRetrospectiveService:
         """
         try:
             from app.services.paper_trading import paper_trading
-            closed = await paper_trading.get_closed_trades(limit=200)
+            paper_closed = await paper_trading.get_closed_trades(limit=200)
+
+            # Include live Hyperliquid positions so agents running on real money
+            # also contribute to retrospective learning.  Failures are non-fatal —
+            # we degrade gracefully to paper-only if HL is misconfigured.
+            live_closed: list = []
+            try:
+                from app.services.hl_live_trading import hl_live_trading as _hl
+                live_closed = await _hl.get_closed_positions(lookback_hours=lookback_hours, limit=200)
+            except Exception as _hl_err:
+                logger.debug(f"Retrospective: HL closed positions unavailable (non-fatal): {_hl_err}")
+
+            closed = (paper_closed or []) + live_closed
             if not closed:
                 return None
 
@@ -202,34 +214,52 @@ class TradeRetrospectiveService:
                 holding_hours=round(holding_hours, 1),
             )
 
+            # Prefer stored entry_indicators (exact values at execution time) over
+            # post-hoc market_df approximation.  Stored values were written by the
+            # scheduler at position open time and are therefore more accurate —
+            # the post-hoc approach uses the nearest candle which may be hours off.
+            stored_ei = trade.get("entry_indicators")
+            if stored_ei:
+                analysis.rsi_at_entry = stored_ei.get("rsi")
+                analysis.trend_at_entry = stored_ei.get("trend")
+                _atr_pct = stored_ei.get("atr_pct")
+                if _atr_pct is not None:
+                    if _atr_pct > 3:
+                        analysis.volatility_at_entry = "high"
+                    elif _atr_pct > 1.5:
+                        analysis.volatility_at_entry = "medium"
+                    else:
+                        analysis.volatility_at_entry = "low"
+
             if market_df is not None and not market_df.empty:
                 entry_ts = entry_time.timestamp()
                 exit_ts = exit_time.timestamp()
 
-                # Find closest candle to entry
-                entry_idx = (market_df["timestamp"] - entry_ts).abs().idxmin()
-                if entry_idx is not None:
-                    analysis.rsi_at_entry = round(market_df.loc[entry_idx, "rsi"], 1) if pd.notna(market_df.loc[entry_idx, "rsi"]) else None
-                    sma20 = market_df.loc[entry_idx, "sma_20"]
-                    sma50 = market_df.loc[entry_idx, "sma_50"]
-                    close = market_df.loc[entry_idx, "close"]
-                    if pd.notna(sma20) and pd.notna(sma50):
-                        if close > sma20 > sma50:
-                            analysis.trend_at_entry = "up"
-                        elif close < sma20 < sma50:
-                            analysis.trend_at_entry = "down"
-                        else:
-                            analysis.trend_at_entry = "sideways"
-
-                    atr = market_df.loc[entry_idx, "atr"]
-                    if pd.notna(atr) and close > 0:
-                        atr_pct = atr / close * 100
-                        if atr_pct > 3:
-                            analysis.volatility_at_entry = "high"
-                        elif atr_pct > 1.5:
-                            analysis.volatility_at_entry = "medium"
-                        else:
-                            analysis.volatility_at_entry = "low"
+                # Fill any fields not covered by stored entry_indicators using
+                # post-hoc market data (legacy path or fields not in the snapshot).
+                if not stored_ei:
+                    entry_idx = (market_df["timestamp"] - entry_ts).abs().idxmin()
+                    if entry_idx is not None:
+                        analysis.rsi_at_entry = round(market_df.loc[entry_idx, "rsi"], 1) if pd.notna(market_df.loc[entry_idx, "rsi"]) else None
+                        sma20 = market_df.loc[entry_idx, "sma_20"]
+                        sma50 = market_df.loc[entry_idx, "sma_50"]
+                        close = market_df.loc[entry_idx, "close"]
+                        if pd.notna(sma20) and pd.notna(sma50):
+                            if close > sma20 > sma50:
+                                analysis.trend_at_entry = "up"
+                            elif close < sma20 < sma50:
+                                analysis.trend_at_entry = "down"
+                            else:
+                                analysis.trend_at_entry = "sideways"
+                        atr = market_df.loc[entry_idx, "atr"]
+                        if pd.notna(atr) and close > 0:
+                            atr_pct = atr / close * 100
+                            if atr_pct > 3:
+                                analysis.volatility_at_entry = "high"
+                            elif atr_pct > 1.5:
+                                analysis.volatility_at_entry = "medium"
+                            else:
+                                analysis.volatility_at_entry = "low"
 
                 # MFE/MAE: max favorable/adverse excursion during trade
                 trade_candles = market_df[
@@ -446,8 +476,9 @@ class TradeRetrospectiveService:
 
         insights: Dict[str, Dict[str, Any]] = {}
         for stype, trades in strategy_trades.items():
-            if len(trades) < 2:
-                continue  # need at least 2 trades for any meaningful signal
+            if len(trades) < 5:
+                continue  # Arrr, need at least 5 trades before we dare adjust confidence.
+                           # A 2-trade sample swinging ±20% would be mutiny against good agents.
 
             wins = [t for t in trades if t.result == "win"]
             losses = [t for t in trades if t.result == "loss"]
@@ -517,7 +548,58 @@ class TradeRetrospectiveService:
                 "confidence_adj_reason": confidence_adj_reason,
             }
 
+        # Persist to DB so the scheduler can warm _current_trade_insights on restart.
+        # Fire-and-forget via asyncio.create_task so we don't block the retrospective.
+        # Arrr, if the upsert fails we sail on — the in-memory insight is still used
+        # this cycle and will retry on the next 20-minute retrospective run.
+        import asyncio as _asyncio
+        _asyncio.create_task(self._persist_strategy_insights(insights))
+
         return insights
+
+    async def _persist_strategy_insights(self, insights: Dict[str, Dict]) -> None:
+        """Upsert strategy insight rows to DB for restart persistence."""
+        from app.database import get_async_session
+        from app.models import StrategyInsightRecord
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+        from app.services.paper_trading import paper_trading as _pt
+        is_paper = True  # retrospective only reads paper trades today; P2 extends this
+        try:
+            async with get_async_session() as db:
+                for stype, ins in insights.items():
+                    stmt = pg_insert(StrategyInsightRecord).values(
+                        strategy_type=stype,
+                        is_paper=is_paper,
+                        confidence_adj=ins["confidence_adj"],
+                        win_rate=ins.get("win_rate"),
+                        avg_win_pct=ins.get("avg_win_pct"),
+                        avg_loss_pct=ins.get("avg_loss_pct"),
+                        trade_count=ins.get("total_trades", 0),
+                        best_pattern=ins.get("best_pattern"),
+                        worst_pattern=ins.get("worst_pattern"),
+                        strengths=ins.get("strengths", []),
+                        weaknesses=ins.get("weaknesses", []),
+                        confidence_adj_reason=ins.get("confidence_adj_reason"),
+                    ).on_conflict_do_update(
+                        constraint="uq_strategy_insight_type_mode",
+                        set_={
+                            "confidence_adj": ins["confidence_adj"],
+                            "win_rate": ins.get("win_rate"),
+                            "avg_win_pct": ins.get("avg_win_pct"),
+                            "avg_loss_pct": ins.get("avg_loss_pct"),
+                            "trade_count": ins.get("total_trades", 0),
+                            "best_pattern": ins.get("best_pattern"),
+                            "worst_pattern": ins.get("worst_pattern"),
+                            "strengths": ins.get("strengths", []),
+                            "weaknesses": ins.get("weaknesses", []),
+                            "confidence_adj_reason": ins.get("confidence_adj_reason"),
+                            "updated_at": __import__("datetime").datetime.utcnow(),
+                        },
+                    )
+                    await db.execute(stmt)
+                await db.commit()
+        except Exception as e:
+            logger.warning(f"Strategy insight persist failed (non-fatal): {e}")
 
     def _recommend_adjustments(
         self,

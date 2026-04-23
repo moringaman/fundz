@@ -22,6 +22,8 @@ class ApiKeyStatus(BaseModel):
     has_phemex_key: bool = False
     phemex_testnet: bool = True
     key_hint: Optional[str] = None  # last 4 chars only
+    has_hyperliquid_key: bool = False
+    hyperliquid_wallet_address: Optional[str] = None  # public — safe to return
 
 
 class RiskLimits(BaseModel):
@@ -209,6 +211,16 @@ class TradingGates(BaseModel):
     perf_gate_min_trades: int = Field(default=5, ge=1, le=50,
         description="Minimum closed trades before the performance gate (perf_mult / conf-floor tiers) activates. Below this the new_trader_starting_mult applies.")
 
+    # ── Agent-level P&L hard block ────────────────────────────────────────────
+    # Blocks new entries from a specific agent when its cumulative net P&L falls
+    # below this floor, regardless of win rate. Catches the "high win rate, terrible
+    # R/R ratio" failure mode where an agent wins small but loses huge.
+    # Default -$500: stops a consistently losing agent before it can dig deeper.
+    agent_pnl_floor: float = Field(default=-500.0, le=0.0,
+        description="Cumulative net P&L floor per agent. When an agent's lifetime net P&L falls at or below this value (after agent_pnl_min_trades), new entries are blocked. Catches bad R/R ratios that a high win-rate masks. Set 0 to disable.")
+    agent_pnl_min_trades: int = Field(default=10, ge=1, le=200,
+        description="Minimum closed trades before the agent P&L floor gate activates. Prevents blocking new agents on a small sample of variance.")
+
     # ── Per-Trade EV Quality Gate ─────────────────────────────────────────────
     # Enforces that each trade earns a minimum multiple of its fee cost in expected value.
     # EV% = (win_rate × TP%) − ((1 − win_rate) × SL%)
@@ -270,6 +282,11 @@ class ApiKeySaveRequest(BaseModel):
     phemex_api_key: str
     phemex_api_secret: str
     phemex_testnet: bool = True
+
+
+class HyperliquidKeySaveRequest(BaseModel):
+    wallet_address: str
+    wallet_key: str  # private key — handled in memory only, never persisted to DB
 
 
 class RiskLimitsUpdateRequest(RiskLimits):
@@ -451,6 +468,8 @@ async def get_settings():
             has_phemex_key=bool(app_settings.phemex_api_key),
             phemex_testnet=app_settings.phemex_testnet,
             key_hint=_mask_key(app_settings.phemex_api_key),
+            has_hyperliquid_key=bool(app_settings.hyperliquid_wallet_key),
+            hyperliquid_wallet_address=app_settings.hyperliquid_wallet_address,
         ),
         risk_limits=_runtime_risk_limits,
         trading=_runtime_trading_prefs,
@@ -490,6 +509,38 @@ async def update_api_keys(req: ApiKeySaveRequest):
     }
 
 
+@router.put("/hyperliquid-keys")
+async def update_hyperliquid_keys(req: HyperliquidKeySaveRequest):
+    """Save Hyperliquid wallet credentials (updates runtime config only — never persisted to DB)."""
+    if not req.wallet_address or not req.wallet_key:
+        raise HTTPException(status_code=400, detail="Both wallet address and private key are required")
+
+    # Basic format validation — must be 0x-prefixed hex
+    addr = req.wallet_address.strip()
+    key = req.wallet_key.strip()
+    if not addr.startswith("0x") or len(addr) != 42:
+        raise HTTPException(status_code=400, detail="wallet_address must be a valid 0x Ethereum address (42 chars)")
+    if not (key.startswith("0x") and len(key) == 66) and len(key) != 64:
+        raise HTTPException(status_code=400, detail="wallet_key must be a 64-char hex private key (with or without 0x prefix)")
+
+    app_settings.hyperliquid_wallet_address = addr
+    app_settings.hyperliquid_wallet_key = key
+
+    # Reset the cached exchange client so next trade uses the new credentials
+    try:
+        from app.services.hl_live_trading import hl_live_trading
+        hl_live_trading._exchange = None
+        hl_live_trading._info_client = None
+    except Exception:
+        pass
+
+    return {
+        "status": "ok",
+        "message": "Hyperliquid credentials updated (runtime only)",
+        "wallet_address": addr,
+    }
+
+
 @router.put("/risk-limits", response_model=RiskLimits)
 async def update_risk_limits(req: RiskLimitsUpdateRequest):
     """Update risk management parameters (persisted to DB)."""
@@ -517,10 +568,19 @@ async def get_gates():
 
 @router.put("/gates", response_model=TradingGates)
 async def update_trading_gates(req: TradingGatesUpdateRequest):
-    """Update trading gate thresholds (persisted to DB, applied immediately)."""
+    """Update trading gate thresholds (persisted to DB, applied immediately).
+
+    Also persists the payload as the user's manual baseline so the autopilot
+    adjusts relative to the operator's chosen values rather than factory defaults.
+    """
     global _runtime_trading_gates
     _runtime_trading_gates = TradingGates(**req.model_dump())
-    await _save_setting("trading_gates", req.model_dump())
+    payload = req.model_dump()
+    await _save_setting("trading_gates", payload)
+    # Arrr, stash the captain's preferences so the autopilot knows whose seas it's sailing.
+    # Without this the BALANCED regime always resets to factory defaults,
+    # making every manual save pointless — the 30-min cycle undoes the lot.
+    await _save_setting("trading_gates_user_baseline", payload)
     return _runtime_trading_gates
 
 

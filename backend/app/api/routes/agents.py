@@ -27,6 +27,7 @@ class AgentConfig(BaseModel):
     run_interval_seconds: int = 3600
     indicators_config: dict = {}
     timeframe: str = "1h"
+    venue: str = "phemex"  # "phemex" | "hyperliquid"
 
 
 # Permitted timeframes per strategy — loaded from registry
@@ -55,6 +56,10 @@ class Agent(BaseModel):
     indicators_config: dict = {}
     timeframe: str = "1h"
     trader_id: Optional[str] = None
+    venue: str = "phemex"
+    is_pnl_suspended: bool = False
+    pnl_suspended_reason: Optional[str] = None
+    pnl_suspended_at: Optional[str] = None
     created_at: str
 
 
@@ -85,6 +90,13 @@ def agent_to_response(db_agent: DBAgent) -> Agent:
         indicators_config=db_agent.config.get("indicators_config", {}),
         timeframe=db_agent.config.get("timeframe", default_timeframe_for(db_agent.strategy_type)),
         trader_id=db_agent.trader_id,
+        venue=db_agent.venue or "phemex",
+        is_pnl_suspended=bool(getattr(db_agent, "is_pnl_suspended", False)),
+        pnl_suspended_reason=getattr(db_agent, "pnl_suspended_reason", None),
+        pnl_suspended_at=(
+            db_agent.pnl_suspended_at.isoformat()
+            if getattr(db_agent, "pnl_suspended_at", None) else None
+        ),
         created_at=db_agent.created_at.isoformat() if db_agent.created_at else datetime.now().isoformat()
     )
 
@@ -174,6 +186,7 @@ async def create_agent(config: AgentConfig, db: AsyncSession = Depends(get_db)):
         max_position_size=config.max_position_size,
         risk_limit=config.risk_limit,
         run_interval_seconds=config.run_interval_seconds,
+        venue=config.venue or "phemex",
     )
     db.add(agent)
     await db.commit()
@@ -212,6 +225,7 @@ async def update_agent(agent_id: str, config: AgentConfig, db: AsyncSession = De
     agent.max_position_size = config.max_position_size
     agent.risk_limit = config.risk_limit
     agent.run_interval_seconds = config.run_interval_seconds
+    agent.venue = config.venue or "phemex"
     
     await db.commit()
     await db.refresh(agent)
@@ -260,6 +274,49 @@ async def toggle_agent(agent_id: str, db: AsyncSession = Depends(get_db)):
     return {"is_enabled": agent.is_enabled}
 
 
+@router.post("/{agent_id}/unsuspend")
+async def unsuspend_agent(agent_id: str, db: AsyncSession = Depends(get_db)):
+    """Clear a P&L suspension so the agent can trade again.
+
+    Must be called by a trader or risk manager after reviewing the suspension
+    reason and confirming the agent's SL/TP settings are appropriate for
+    current market conditions. The suspension reason is preserved in
+    pnl_suspended_reason for audit trail; only is_pnl_suspended is cleared.
+    """
+    result = await db.execute(select(DBAgent).where(DBAgent.id == agent_id))
+    agent = result.scalar_one_or_none()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    if not getattr(agent, "is_pnl_suspended", False):
+        return {"message": "Agent is not currently suspended", "is_pnl_suspended": False}
+
+    agent.is_pnl_suspended = False
+    # Keep pnl_suspended_reason and pnl_suspended_at for audit trail
+    await db.commit()
+
+    # Clear the in-memory alert flag so it can fire again if the agent rebreaches
+    from app.services.agent_scheduler import agent_scheduler
+    setattr(agent_scheduler, f"_apnl_alerted_{agent_id}", False)
+
+    from app.services.team_chat import team_chat
+    await team_chat.add_message(
+        agent_role="risk_manager",
+        content=(
+            f"✅ **Agent Unsuspended — {agent.name}**: P&L suspension cleared by team review. "
+            f"Agent will resume trading on the next scheduler cycle. "
+            f"Original suspension reason: {getattr(agent, 'pnl_suspended_reason', 'N/A')}"
+        ),
+        message_type="alert",
+    )
+
+    return {
+        "message": f"Suspension cleared for {agent.name}. Agent will resume on the next cycle.",
+        "is_pnl_suspended": False,
+        "pnl_suspended_reason": getattr(agent, "pnl_suspended_reason", None),
+    }
+
+
 @router.get("/signals", response_model=List[AgentSignalResponse])
 async def get_signals(agent_id: Optional[str] = None, db: AsyncSession = Depends(get_db)):
     query = select(DBAgentSignal).order_by(DBAgentSignal.created_at.desc()).limit(50)
@@ -294,14 +351,21 @@ async def run_agent_backtest(
     agent = result.scalar_one_or_none()
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
-    
+
+    # Resolve SL/TP from the strategy registry so we get sensible values
+    # regardless of what `risk_limit` (a dollar-amount field) happens to be.
+    _strategy_info = strategy_registry.get(agent.strategy_type) or {}
+    _risk = _strategy_info.get("risk", {})
+    _stop_loss_pct  = _risk.get("stop_loss_pct",  2.5) / 100   # registry stores as 2.5 → 0.025
+    _take_profit_pct = _risk.get("take_profit_pct", 5.0) / 100  # registry stores as 5.0 → 0.050
+
     config = BacktestConfig(
         symbol=symbol,
         interval=interval,
         initial_balance=10000,
         position_size_pct=agent.allocation_percentage / 100,
-        stop_loss_pct=agent.risk_limit / 100,
-        take_profit_pct=agent.risk_limit * 2 / 100,
+        stop_loss_pct=_stop_loss_pct,
+        take_profit_pct=_take_profit_pct,
         strategy=agent.strategy_type,
     )
     

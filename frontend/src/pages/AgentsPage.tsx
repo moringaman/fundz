@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { Play } from 'lucide-react';
 import { useAppSelector } from '../store/hooks';
 import { automationApi } from '../lib/api';
@@ -30,6 +30,8 @@ export function AgentsPage() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [backtestResults, setBacktestResults] = useState<Record<string, any>>({});
   const [backtestLoading, setBacktestLoading] = useState<string | null>(null);
+  const [backtestProgress, setBacktestProgress] = useState<{ phase: string; pct: number } | null>(null);
+  const backtestTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [gridSummaries, setGridSummaries] = useState<Record<string, any>>({});
   const [cancellingGrid, setCancellingGrid] = useState<string | null>(null);
 
@@ -96,6 +98,7 @@ export function AgentsPage() {
     trailing_stop_pct: 0,
     run_interval_seconds: 3600,
     timeframe: '15m',
+    venue: 'phemex' as 'phemex' | 'hyperliquid',
   });
 
   const runAgentNow = async (agent: any) => {
@@ -137,6 +140,7 @@ export function AgentsPage() {
         trailing_stop_pct: 0,
         run_interval_seconds: 3600,
         timeframe: '15m',
+        venue: 'phemex' as 'phemex' | 'hyperliquid',
       });
       refetchAgents();
     } catch (error) {
@@ -176,8 +180,28 @@ export function AgentsPage() {
     }
   };
 
+  const BACKTEST_PHASES = [
+    { phase: 'Fetching candles…',        pct: 0  },
+    { phase: 'Fetching candles…',        pct: 18 },
+    { phase: 'Calculating indicators…', pct: 32 },
+    { phase: 'Calculating indicators…', pct: 48 },
+    { phase: 'Simulating trades…',       pct: 60 },
+    { phase: 'Simulating trades…',       pct: 72 },
+    { phase: 'Simulating trades…',       pct: 82 },
+    { phase: 'Computing metrics…',       pct: 91 },
+    { phase: 'Computing metrics…',       pct: 96 },
+  ];
+
   const runBacktest = async (agentId: string, symbol: string = 'BTCUSDT', timeframe: string = '1h') => {
     setBacktestLoading(agentId);
+    setBacktestProgress(BACKTEST_PHASES[0]);
+
+    let step = 0;
+    backtestTimerRef.current = setInterval(() => {
+      step = Math.min(step + 1, BACKTEST_PHASES.length - 1);
+      setBacktestProgress(BACKTEST_PHASES[step]);
+    }, 2800);
+
     try {
       const res = await fetch(`/api/agents/${agentId}/backtest?symbol=${symbol}&interval=${timeframe}`, { method: 'POST' });
       const data = await res.json();
@@ -185,7 +209,9 @@ export function AgentsPage() {
     } catch (error) {
       console.error('Failed to run backtest:', error);
     } finally {
+      if (backtestTimerRef.current) clearInterval(backtestTimerRef.current);
       setBacktestLoading(null);
+      setBacktestProgress(null);
     }
   };
 
@@ -201,6 +227,7 @@ export function AgentsPage() {
       trailing_stop_pct: agent.trailing_stop_pct || 0,
       run_interval_seconds: agent.run_interval_seconds,
       timeframe: agent.timeframe || '1h',
+      venue: (agent.venue || 'phemex') as 'phemex' | 'hyperliquid',
     });
     setEditingId(agent.id);
     setShowForm(false);
@@ -472,6 +499,25 @@ export function AgentsPage() {
             </select>
           </div>
 
+          <div className="form-group">
+            <label className="form-label">Trading Venue</label>
+            <div className="strategy-options" style={{ flexDirection: 'row' }}>
+              {(['phemex', 'hyperliquid'] as const).map((v) => (
+                <label key={v} className={`strategy-option ${formData.venue === v ? 'selected' : ''}`} style={{ flex: '1 1 auto' }}>
+                  <input
+                    type="radio"
+                    name="venue"
+                    value={v}
+                    checked={formData.venue === v}
+                    onChange={() => setFormData({ ...formData, venue: v })}
+                  />
+                  <span className="strategy-label">{v === 'phemex' ? '🔷 Phemex' : 'Ξ Hyperliquid'}</span>
+                  <span className="strategy-desc">{v === 'phemex' ? '0.06% taker' : '0.035% taker'}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+
           <button type="button" className="settings-btn" onClick={createAgent}>
             Create Strategy
           </button>
@@ -675,6 +721,25 @@ export function AgentsPage() {
                     </div>
                   </div>
 
+                  <div className="form-group">
+                    <label className="form-label">Trading Venue</label>
+                    <div className="strategy-options" style={{ flexDirection: 'row' }}>
+                      {(['phemex', 'hyperliquid'] as const).map((v) => (
+                        <label key={v} className={`strategy-option ${formData.venue === v ? 'selected' : ''}`} style={{ flex: '1 1 auto' }}>
+                          <input
+                            type="radio"
+                            name={`edit-venue-${agent.id}`}
+                            value={v}
+                            checked={formData.venue === v}
+                            onChange={() => setFormData({ ...formData, venue: v })}
+                          />
+                          <span className="strategy-label" style={{ fontSize: '.75rem' }}>{v === 'phemex' ? '🔷 Phemex' : 'Ξ Hyperliquid'}</span>
+                          <span className="strategy-desc" style={{ fontSize: '.65rem' }}>{v === 'phemex' ? '0.06%' : '0.035%'}</span>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+
                   <div className="edit-actions">
                     <button type="button" className="save-btn" onClick={() => updateAgent(agent.id)}>Save Changes</button>
                     <button type="button" className="cancel-btn" onClick={() => setEditingId(null)}>Cancel</button>
@@ -700,6 +765,13 @@ export function AgentsPage() {
                           }}>
                             {traderMap[agent.trader_id].config?.avatar || '🤖'} {traderMap[agent.trader_id].name}
                           </span>
+                        )}
+                        {agent.venue === 'hyperliquid' && (
+                          <span style={{
+                            fontSize: '.6rem', fontFamily: 'var(--mono)', padding: '.15rem .4rem',
+                            borderRadius: '4px', background: 'rgba(98,126,234,.12)', color: '#818cf8',
+                            border: '1px solid rgba(98,126,234,.25)',
+                          }}>Ξ HL</span>
                         )}
                       </div>
                     </div>
@@ -761,7 +833,19 @@ export function AgentsPage() {
                         ) : null}
                       </div>
                     </div>
-                    {backtestResults[agent.id] && (
+                    {backtestLoading === agent.id && backtestProgress && (
+                      <div className="backtest-progress-card">
+                        <div className="backtest-progress-phase">{backtestProgress.phase}</div>
+                        <div className="backtest-progress-track">
+                          <div
+                            className="backtest-progress-fill"
+                            style={{ width: `${backtestProgress.pct}%` }}
+                          />
+                        </div>
+                        <div className="backtest-progress-pct">{backtestProgress.pct}%</div>
+                      </div>
+                    )}
+                    {!backtestLoading && backtestResults[agent.id] && (
                       <div className="backtest-results">
                         <div className="backtest-metrics">
                           <span className={backtestResults[agent.id].metrics.net_pnl >= 0 ? 'positive' : 'negative'}>
@@ -956,7 +1040,7 @@ export function AgentsPage() {
                       onClick={() => runBacktest(agent.id, (agent.trading_pairs ?? [])[0] || 'BTCUSDT', agent.timeframe || '1h')}
                       disabled={backtestLoading === agent.id}
                     >
-                      {backtestLoading === agent.id ? 'Running...' : 'Backtest'}
+                      {backtestLoading === agent.id ? backtestProgress?.phase.replace('…', '') || 'Running…' : 'Backtest'}
                     </button>
                     <button type="button" className="edit-btn" onClick={() => startEdit(agent)}>Edit</button>
                     <button type="button" className="delete-btn" onClick={() => deleteAgent(agent.id)}>Delete</button>

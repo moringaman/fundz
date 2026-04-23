@@ -59,5 +59,9 @@ class HyperliquidClient:
         """Returns open orders: coin, side, sz, limitPx, orderType."""
         return await self._post({"type": "frontendOpenOrders", "user": address})
 
+    async def get_all_mids(self) -> Dict[str, str]:
+        """Returns mid prices for all assets as {coin: price_str}, e.g. {"BTC": "50000.0"}."""
+        return await self._post({"type": "allMids"})
+
     async def close(self) -> None:
         await self._client.aclose()

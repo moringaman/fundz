@@ -38,6 +38,17 @@ export function useBalance() {
   });
 }
 
+// ─── Hyperliquid balance ──────────────────────────────────────────────────────
+export function useHyperliquidBalance() {
+  return useQuery({
+    queryKey: ['hlBalance'],
+    queryFn: () => tradingApi.getHyperliquidBalance().then((r) => r.data),
+    refetchInterval: 20_000,
+    staleTime: 15_000,
+    retry: false,
+  });
+}
+
 // ─── Open orders ─────────────────────────────────────────────────────────────
 export function useOpenOrders(symbol?: string) {
   return useQuery({

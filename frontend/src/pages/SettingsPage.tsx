@@ -1266,8 +1266,8 @@ export function SettingsPage() {
 
             {/* Description */}
             <p style={{ fontSize: '.75rem', color: 'var(--text-secondary)', lineHeight: 1.5, marginBottom: autopilot?.enabled ? '.75rem' : 0 }}>
-              When active, risk automatically adjusts gate thresholds every 30 min based on rolling win rate,
-              daily P&L, and session timing.  Manual saves are preserved as a baseline but may be overridden at the next cycle.
+              When active, adjusts gate thresholds every 30 min based on rolling win rate, daily P&L, and session timing.
+              Your saved settings are used as the baseline — autopilot nudges values relative to what you set, not factory defaults.
             </p>
 
             {/* Status detail — only shown when enabled */}

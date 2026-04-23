@@ -114,6 +114,138 @@ const StateMessage = styled.div`
   font-style: italic;
 `;
 
+const EmptyState = styled.div`
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 2.25rem 1rem 2rem;
+  overflow: hidden;
+
+  /* Subtle horizontal scanlines behind everything */
+  &::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 11px,
+      rgba(36, 54, 80, 0.35) 12px
+    );
+    pointer-events: none;
+  }
+`;
+
+const RadarRing = styled.div`
+  position: relative;
+  width: 72px;
+  height: 72px;
+  margin-bottom: 1.25rem;
+  flex-shrink: 0;
+
+  /* Static outer ring */
+  &::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: 50%;
+    border: 1px solid rgba(139, 163, 199, 0.18);
+  }
+
+  /* Pulsing ring that expands outward */
+  &::after {
+    content: '';
+    position: absolute;
+    inset: 12px;
+    border-radius: 50%;
+    border: 1px solid rgba(59, 130, 246, 0.45);
+    animation: radar-pulse 2.8s ease-out infinite;
+  }
+
+  @keyframes radar-pulse {
+    0%   { inset: 12px; opacity: 0.7; border-color: rgba(59,130,246,0.55); }
+    100% { inset: -14px; opacity: 0; border-color: rgba(59,130,246,0); }
+  }
+`;
+
+const RadarCore = styled.div`
+  position: absolute;
+  inset: 50%;
+  transform: translate(-50%, -50%);
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 38% 38%, #1e3a5f, #0d1a2e);
+  border: 1px solid rgba(59, 130, 246, 0.3);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  /* Inner dot */
+  &::after {
+    content: '';
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #3b82f6;
+    box-shadow: 0 0 8px #3b82f6, 0 0 16px rgba(59,130,246,0.4);
+    animation: core-blink 2.8s ease-in-out infinite;
+  }
+
+  @keyframes core-blink {
+    0%, 100% { opacity: 1; }
+    50%       { opacity: 0.35; }
+  }
+`;
+
+const EmptyLabel = styled.div`
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--text-secondary, #8ba3c7);
+  margin-bottom: 0.35rem;
+`;
+
+const EmptySubtext = styled.div`
+  font-size: 0.72rem;
+  color: rgba(139, 163, 199, 0.55);
+  letter-spacing: 0.03em;
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+`;
+
+const LiveDot = styled.span`
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #3b82f6;
+  animation: dot-pulse 2s ease-in-out infinite;
+  flex-shrink: 0;
+
+  @keyframes dot-pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50%       { opacity: 0.4; transform: scale(0.7); }
+  }
+`;
+
+export const PositionEmptyState: React.FC<{ isPaper?: boolean }> = ({ isPaper = true }) => (
+  <EmptyState>
+    <RadarRing>
+      <RadarCore />
+    </RadarRing>
+    <EmptyLabel>No open positions</EmptyLabel>
+    <EmptySubtext>
+      <LiveDot />
+      Agents scanning for setups · {isPaper ? 'Paper' : 'Live'} mode
+    </EmptySubtext>
+  </EmptyState>
+);
+
 export const PositionsTableComponent: React.FC = () => {
   const [positions, setPositions] = useState<Position[]>([]);
   const [loading, setLoading] = useState(true);
@@ -163,7 +295,7 @@ export const PositionsTableComponent: React.FC = () => {
       {loading && <StateMessage>Loading positions…</StateMessage>}
       {error && <StateMessage style={{ color: 'var(--red, #ff5370)' }}>{error}</StateMessage>}
       {!loading && !error && positions.length === 0 && (
-        <StateMessage>There are currently no open positions.</StateMessage>
+        <PositionEmptyState isPaper={isPaper} />
       )}
       {!loading && !error && positions.length > 0 && (
         <StyledTable>

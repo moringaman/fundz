@@ -4,10 +4,13 @@ from pydantic import BaseModel
 from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from decimal import Decimal
+import uuid
 
 from app.database import get_db
 from app.clients.phemex import PhemexClient
+from app.clients.hyperliquid import HyperliquidClient
 from app.config import settings
 from app.models import (
     Trade as DBTrade, 
@@ -18,6 +21,7 @@ from app.models import (
 )
 
 router = APIRouter(prefix="/trading", tags=["trading"])
+hyperliquid_client = HyperliquidClient()
 
 phemex_client = PhemexClient(
     api_key=settings.phemex_api_key,
@@ -231,21 +235,25 @@ async def get_balance(db: AsyncSession = Depends(get_db)):
             asset = b.get("currency", "")
             available = parse_phemex_value(b.get("balanceEv"))
             locked = parse_phemex_value(b.get("lockedTradingBalanceEv"))
-            
-            db_balance = DBBalance(
+
+            stmt = pg_insert(DBBalance).values(
+                id=str(uuid.uuid4()),
                 user_id="default-user",
                 asset=asset,
                 available=available,
                 locked=locked,
+            ).on_conflict_do_update(
+                index_elements=["user_id", "asset"],
+                set_={"available": available, "locked": locked},
             )
-            db.add(db_balance)
-            
+            await db.execute(stmt)
+
             result.append(BalanceResponse(
                 asset=asset,
                 available=available,
                 locked=locked
             ))
-        
+
         await db.commit()
         return result
     except Exception as e:
@@ -261,6 +269,60 @@ def get_demo_balances():
         BalanceResponse(asset="USDT", available=10000.0, locked=0.0),
         BalanceResponse(asset="ETH", available=10.0, locked=0.0),
     ]
+
+
+class HyperliquidBalanceResponse(BaseModel):
+    account_value: float
+    margin_used: float
+    free_margin: float
+    unrealized_pnl: float
+    positions: List[dict]
+
+
+@router.get("/hl-balance", response_model=HyperliquidBalanceResponse)
+async def get_hyperliquid_balance():
+    """Fetch Hyperliquid account balance and open positions for the configured wallet."""
+    address = settings.hyperliquid_wallet_address
+    if not address:
+        raise HTTPException(
+            status_code=404,
+            detail="Hyperliquid wallet address not configured",
+        )
+    try:
+        state = await hyperliquid_client.get_clearinghouse_state(address)
+        summary = state.get("marginSummary", {})
+        account_value = float(summary.get("accountValue", 0))
+        total_margin_used = float(summary.get("totalMarginUsed", 0))
+        total_raw_usd = float(summary.get("totalRawUsd", 0))
+        unrealized_pnl = float(summary.get("totalUnrealizedPnl", 0))
+        free_margin = account_value - total_margin_used
+
+        positions = []
+        for item in state.get("assetPositions", []):
+            pos = item.get("position", {})
+            size = float(pos.get("szi", 0))
+            if size == 0:
+                continue
+            positions.append({
+                "coin": pos.get("coin", ""),
+                "size": size,
+                "entry_price": float(pos.get("entryPx") or 0),
+                "unrealized_pnl": float(pos.get("unrealizedPnl") or 0),
+                "leverage": pos.get("leverage", {}).get("value", 1),
+                "position_value": float(pos.get("positionValue") or 0),
+            })
+
+        return HyperliquidBalanceResponse(
+            account_value=account_value,
+            margin_used=total_margin_used,
+            free_margin=free_margin,
+            unrealized_pnl=unrealized_pnl,
+            positions=positions,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Hyperliquid API error: {e}")
 
 
 def parse_phemex_value(value) -> float:

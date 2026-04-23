@@ -51,6 +51,9 @@ class Settings(BaseSettings):
     phemex_api_secret: Optional[str] = None
     phemex_testnet: bool = True
 
+    hyperliquid_wallet_address: Optional[str] = None
+    hyperliquid_wallet_key: Optional[str] = None
+
     llm_provider: str = "openrouter"
     openai_api_key: Optional[str] = None
     anthropic_api_key: Optional[str] = None

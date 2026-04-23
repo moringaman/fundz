@@ -224,7 +224,11 @@ class FundManagerAgent:
                     reasons.append(f"Profitable: ${total_pnl:.2f}")
                 elif total_pnl < -100:
                     score -= 30
-                    reasons.append(f"Losses: ${total_pnl:.2f}")
+                    reasons.append(f"Significant losses: ${total_pnl:.2f}")
+                elif total_pnl < 0:
+                    # Small negative P&L — still losing money despite any win rate advantage
+                    score -= 15
+                    reasons.append(f"Negative P&L: ${total_pnl:.2f}")
                 
                 if last_run:
                     parsed = datetime.fromisoformat(last_run.replace('Z', '+00:00'))
@@ -258,6 +262,17 @@ class FundManagerAgent:
                 action = "enable"
             elif score <= -20:
                 action = "disable"
+
+            # Hard gate: never enable an agent with negative net P&L once it has
+            # enough trades to form a meaningful sample. A high win rate with
+            # negative P&L means losses outweigh wins in size (poor risk/reward).
+            MIN_RUNS_FOR_PNL_GATE = 10
+            if action == "enable" and total_pnl < 0 and total_runs >= MIN_RUNS_FOR_PNL_GATE:
+                action = "maintain"
+                reasons.append(
+                    f"Blocked: negative net P&L (${total_pnl:.2f}) over {total_runs} runs "
+                    f"— win rate alone does not indicate profitability"
+                )
             
             confidence = min(abs(score) / 60, 1.0)
             

@@ -10,7 +10,7 @@ All callers import `trading_service` and call the same API regardless of mode.
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Dict, Optional
 
 from app.models import OrderSide
 
@@ -33,17 +33,29 @@ class TradingService:
     switching modes takes effect immediately on the next trade cycle.
     """
 
+    # Per-agent venue cache populated by agent_scheduler on load/register.
+    # Defaults to "phemex" for any agent not explicitly registered.
+    _agent_venues: Dict[str, str] = {}
+
+    def set_agent_venue(self, agent_id: str, venue: str) -> None:
+        """Register an agent's trading venue. Called by agent_scheduler on load."""
+        self._agent_venues[agent_id] = venue or "phemex"
+
     def _paper(self):
         from app.services.paper_trading import paper_trading
         return paper_trading
 
-    def _live(self):
+    def _live(self, agent_id: Optional[str] = None):
+        venue = self._agent_venues.get(agent_id or "", "phemex")
+        if venue == "hyperliquid":
+            from app.services.hl_live_trading import hl_live_trading
+            return hl_live_trading
         from app.services.live_trading import live_trading
         return live_trading
 
-    def _backend(self, force_paper: Optional[bool] = None):
+    def _backend(self, force_paper: Optional[bool] = None, agent_id: Optional[str] = None):
         is_paper = force_paper if force_paper is not None else _is_paper_mode()
-        return self._paper() if is_paper else self._live()
+        return self._paper() if is_paper else self._live(agent_id)
 
     # ── Core methods ───────────────────────────────────────────────────────
 
@@ -83,12 +95,7 @@ class TradingService:
         position_id: str,
         force_paper: Optional[bool] = None,
     ):
-        # Determine mode from position record if not forced
-        if force_paper is None:
-            is_paper = await self._detect_position_mode(position_id)
-        else:
-            is_paper = force_paper
-        svc = self._paper() if is_paper else self._live()
+        svc = await self._detect_backend(position_id, force_paper)
         return await svc.close_position(position_id)
 
     async def partial_close(
@@ -100,11 +107,7 @@ class TradingService:
         label: str = "scale-out",
         force_paper: Optional[bool] = None,
     ):
-        if force_paper is None:
-            is_paper = await self._detect_position_mode(position_id)
-        else:
-            is_paper = force_paper
-        svc = self._paper() if is_paper else self._live()
+        svc = await self._detect_backend(position_id, force_paper)
         return await svc.partial_close(
             position_id=position_id,
             close_pct=close_pct,
@@ -121,11 +124,7 @@ class TradingService:
         trailing_stop_pct=...,
         force_paper: Optional[bool] = None,
     ):
-        if force_paper is None:
-            is_paper = await self._detect_position_mode(position_id)
-        else:
-            is_paper = force_paper
-        svc = self._paper() if is_paper else self._live()
+        svc = await self._detect_backend(position_id, force_paper)
         return await svc.update_position_sl_tp(
             position_id=position_id,
             stop_loss_price=stop_loss_price,
@@ -140,11 +139,7 @@ class TradingService:
         is_short: bool = False,
         force_paper: Optional[bool] = None,
     ):
-        if force_paper is None:
-            is_paper = await self._detect_position_mode(position_id)
-        else:
-            is_paper = force_paper
-        svc = self._paper() if is_paper else self._live()
+        svc = await self._detect_backend(position_id, force_paper)
         return await svc.update_highest_price(
             position_id=position_id,
             current_price=current_price,
@@ -184,7 +179,25 @@ class TradingService:
     async def fetch_current_price(self, symbol: str) -> float:
         return await self._paper().fetch_current_price(symbol)
 
-    # ── Helper ─────────────────────────────────────────────────────────────
+    # ── Helpers ─────────────────────────────────────────────────────────────
+
+    async def _detect_backend(self, position_id: str, force_paper: Optional[bool] = None):
+        """Return the right service for a position — paper or the correct live venue."""
+        if force_paper is True:
+            return self._paper()
+        try:
+            from app.database import get_async_session
+            from app.models import Position
+            from sqlalchemy import select
+            async with get_async_session() as db:
+                pos = await db.scalar(select(Position).where(Position.id == position_id))
+                if pos is not None:
+                    if bool(pos.is_paper):
+                        return self._paper()
+                    return self._live(pos.agent_id)
+        except Exception:
+            pass
+        return self._paper() if _is_paper_mode() else self._live()
 
     async def _detect_position_mode(self, position_id: str) -> bool:
         """Look up whether a position is paper or live from the DB."""

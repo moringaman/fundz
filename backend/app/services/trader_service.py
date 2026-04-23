@@ -137,13 +137,22 @@ class TraderService:
         for a in trader_agents:
             m = metrics_by_id.get(a["id"], {})
             pairs = a.get("trading_pairs", [])
+            venue_stats = m.get("venue_stats") or {}
+            _venue_breakdown = ""
+            if venue_stats:
+                _parts = []
+                for _vn, _vs in venue_stats.items():
+                    _parts.append(f"{_vn}: WR={_vs.get('win_rate', 0):.0%} P&L=${_vs.get('pnl', 0):.2f} ({_vs.get('trades', 0)}t)")
+                _venue_breakdown = " [" + " | ".join(_parts) + "]"
             agent_summary_lines.append(
                 f"  • {a['name']} ({a.get('strategy_type','?')}) — "
                 f"pairs: {', '.join(pairs)}, "
+                f"venue: {a.get('venue', 'phemex')}, "
                 f"win_rate: {(m.get('win_rate', 0) * 100):.0f}%, "
                 f"P&L: ${m.get('total_pnl', 0):.2f}, "
                 f"runs: {m.get('total_runs', 0)}, "
                 f"enabled: {a.get('is_enabled', False)}"
+                f"{_venue_breakdown}"
             )
         agent_block = "\n".join(agent_summary_lines) if agent_summary_lines else "  (no agents yet)"
 
@@ -198,6 +207,27 @@ class TraderService:
         if config.get("succession_context"):
             succession_block = f"\nEVOLUTION CONTEXT FROM PREDECESSOR:\n{config['succession_context']}\n"
 
+        # Build venues block — Hyperliquid is always available for paper trading.
+        # Live trading additionally requires HYPERLIQUID_WALLET_KEY to be set.
+        _hl_live = bool(settings.hyperliquid_wallet_key)
+        _hl_live_note = (
+            " (live trading configured)"
+            if _hl_live
+            else " (paper trading only — wallet not configured for live)"
+        )
+        venues_block = (
+            "\nAVAILABLE TRADING VENUES:\n"
+            "  • phemex      — taker fee 0.06%, USDT-margined perps\n"
+            f"  • hyperliquid — taker fee 0.035%, USDC-margined perps{_hl_live_note}\n"
+            "\nVENUE SELECTION GUIDANCE:\n"
+            "  - Prefer hyperliquid for: ema_crossover, momentum, breakout, grid — strategies that trade"
+            " frequently and compound fee savings over many trades. At 0.035% vs 0.06% that is a 42%"
+            " reduction in fee drag per trade.\n"
+            "  - Use phemex for: mean_reversion or any strategy on a pair not listed on Hyperliquid"
+            " (check agent names; common pairs like BTCUSDT, ETHUSDT, SOLUSDT are on both).\n"
+            "  - If in doubt, choose hyperliquid — lower fees directly improve net P&L."
+        )
+
         prompt = f"""You are Trader "{trader['name']}", a competing portfolio trader in a hedge fund.
 
 YOUR TRADING STYLE: {config.get('style', 'Balanced approach')}
@@ -215,15 +245,16 @@ MARKET CONDITIONS:
 
 STRATEGY REFERENCE:
 {strategy_registry.ai_prompt_summary()}
+{venues_block}
 
 YOUR CURRENT AGENTS:
 {agent_block}
 
 Review your portfolio of agents. You may propose actions:
-- "create_agent": Create a new agent (name, strategy_type, trading_pairs, stop_loss_pct, take_profit_pct)
+- "create_agent": Create a new agent (name, strategy_type, trading_pairs, stop_loss_pct, take_profit_pct, venue)
 - "disable_agent": Disable an underperforming agent (agent_id, reason)
 - "enable_agent": Re-enable a previously disabled agent (agent_id, reason)
-- "adjust_params": Adjust parameters of an existing agent (agent_id, params)
+- "adjust_params": Adjust parameters of an existing agent (agent_id, params: {stop_loss_pct, take_profit_pct, trailing_stop_pct, allocation_percentage, venue})
 
 Rules:
 - Maximum 4 agents per trader
@@ -236,11 +267,12 @@ Rules:
 - Grid strategy (`strategy_type: "grid"`) requires Marina's explicit recommendation or confirmed ranging/low-volatility regime before proposing
 - Marina's research recommendations above are research-grade signals — strongly consider them when proposing new agents or re-enabling existing ones
 - Refer to the strategy reference below for guidance on which strategy to use in current conditions
+- For "venue": choose from the available venues listed above. Follow the venue selection guidance above — hyperliquid is preferred for most strategies when available due to its lower fee structure.
 
 Return JSON:
 {{
   "actions": [
-    {{"action": "create_agent", "name": "SOL_Momentum", "strategy_type": "momentum", "trading_pairs": ["SOLUSDT"], "stop_loss_pct": 3.5, "take_profit_pct": 7.0, "reason": "..."}},
+    {{"action": "create_agent", "name": "SOL_Momentum", "strategy_type": "momentum", "trading_pairs": ["SOLUSDT"], "stop_loss_pct": 3.5, "take_profit_pct": 7.0, "venue": "hyperliquid", "reason": "..."}},
     ...
   ],
   "reasoning": "explanation of your decisions"

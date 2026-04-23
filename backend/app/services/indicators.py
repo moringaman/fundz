@@ -282,6 +282,319 @@ class IndicatorService:
             "pattern_signal":   "buy" if net > 0 else ("sell" if net < 0 else "neutral"),
         }
 
+    def calculate_ichimoku(
+        self, high: pd.Series, low: pd.Series, close: pd.Series,
+        tenkan_period: int = 9, kijun_period: int = 26,
+        senkou_b_period: int = 52, displacement: int = 26,
+    ) -> Dict[str, Any]:
+        """Ichimoku Cloud — all-in-one trend, momentum, and S/R system.
+
+        Needs at least senkou_b_period + displacement bars (78 by default) for
+        meaningful output.  Below that threshold every field is None / False.
+
+        Signals returned:
+          cloud_bullish     — price above both Span A and Span B
+          cloud_bearish     — price below both spans (sells favoured)
+          cloud_neutral     — price inside the cloud (chop zone)
+          tk_cross_bullish  — Tenkan crossed above Kijun this bar (momentum BUY)
+          tk_cross_bearish  — Tenkan crossed below Kijun this bar (momentum SELL)
+          cloud_color       — "green" if Span A > Span B, "red" otherwise
+          above_cloud_pct   — % distance from price to cloud top (negative = below)
+        """
+        _empty: Dict[str, Any] = {
+            "tenkan": None, "kijun": None, "senkou_a": None, "senkou_b": None,
+            "chikou": None, "cloud_bullish": False, "cloud_bearish": False,
+            "cloud_neutral": True, "tk_cross_bullish": False, "tk_cross_bearish": False,
+            "cloud_color": None, "above_cloud_pct": None,
+        }
+        min_bars = senkou_b_period + displacement
+        if len(close) < min_bars:
+            return _empty
+
+        h = high.reset_index(drop=True)
+        l = low.reset_index(drop=True)
+        c = close.reset_index(drop=True)
+
+        def _midpoint(s_h: pd.Series, s_l: pd.Series, period: int) -> pd.Series:
+            return (s_h.rolling(period).max() + s_l.rolling(period).min()) / 2
+
+        tenkan   = _midpoint(h, l, tenkan_period)
+        kijun    = _midpoint(h, l, kijun_period)
+        senkou_a = ((tenkan + kijun) / 2).shift(displacement)
+        senkou_b = _midpoint(h, l, senkou_b_period).shift(displacement)
+        chikou   = c.shift(-displacement)
+
+        def _safe(s: pd.Series) -> Optional[float]:
+            v = s.iloc[-1]
+            return float(v) if not pd.isna(v) else None
+
+        t_val  = _safe(tenkan)
+        k_val  = _safe(kijun)
+        sa_val = _safe(senkou_a)
+        sb_val = _safe(senkou_b)
+        ch_idx = len(chikou) - displacement - 1
+        ch_val = float(chikou.iloc[ch_idx]) if ch_idx >= 0 and not pd.isna(chikou.iloc[ch_idx]) else None
+
+        price = float(c.iloc[-1])
+
+        # TK cross: compare current vs previous bar — only valid when both bars are clean
+        tk_bull = tk_bear = False
+        if len(tenkan) >= 2 and len(kijun) >= 2:
+            prev_t = tenkan.iloc[-2]
+            prev_k = kijun.iloc[-2]
+            if (not pd.isna(prev_t) and not pd.isna(prev_k) and
+                    t_val is not None and k_val is not None):
+                tk_bull = bool((prev_t <= prev_k) and (t_val > k_val))
+                tk_bear = bool((prev_t >= prev_k) and (t_val < k_val))
+
+        cloud_top    = max(sa_val, sb_val) if (sa_val is not None and sb_val is not None) else None
+        cloud_bottom = min(sa_val, sb_val) if (sa_val is not None and sb_val is not None) else None
+        cloud_bull   = cloud_top    is not None and price > cloud_top
+        cloud_bear   = cloud_bottom is not None and price < cloud_bottom
+        cloud_neut   = not cloud_bull and not cloud_bear
+        above_pct    = round((price - cloud_top) / cloud_top * 100, 3) if cloud_top and cloud_top > 0 else None
+
+        return {
+            "tenkan":           t_val,
+            "kijun":            k_val,
+            "senkou_a":         sa_val,
+            "senkou_b":         sb_val,
+            "chikou":           ch_val,
+            "cloud_bullish":    cloud_bull,
+            "cloud_bearish":    cloud_bear,
+            "cloud_neutral":    cloud_neut,
+            "tk_cross_bullish": tk_bull,
+            "tk_cross_bearish": tk_bear,
+            "cloud_color":      ("green" if (sa_val and sb_val and sa_val > sb_val) else
+                                 "red"   if (sa_val and sb_val and sa_val < sb_val) else None),
+            "above_cloud_pct":  above_pct,
+        }
+
+    def calculate_supertrend(
+        self, high: pd.Series, low: pd.Series, close: pd.Series,
+        period: int = 10, multiplier: float = 3.0,
+    ) -> Dict[str, Any]:
+        """ATR-based Supertrend indicator.
+
+        The Supertrend alternates between a lower band (bullish) and upper band
+        (bearish) based on whether close crosses the active band.  Once in a
+        bullish regime the lower band becomes a rising support/trailing stop;
+        once bearish, the upper band becomes a resistance ceiling.
+
+        Returns:
+            {
+                "supertrend":   float  — active band value
+                "trend":        "bullish" | "bearish" | "neutral"
+                "just_flipped": bool   — trend changed on the current bar
+                "distance_pct": float  — % distance from close to supertrend line
+            }
+        """
+        _empty: Dict[str, Any] = {
+            "supertrend": None, "trend": "neutral", "just_flipped": False, "distance_pct": None,
+        }
+        if len(close) < period + 1:
+            return _empty
+
+        h = high.reset_index(drop=True).astype(float)
+        l = low.reset_index(drop=True).astype(float)
+        c = close.reset_index(drop=True).astype(float)
+
+        atr        = self.calculate_atr(h, l, c, period)
+        hl2        = (h + l) / 2
+        upper_basic = hl2 + multiplier * atr
+        lower_basic = hl2 - multiplier * atr
+
+        upper_band = upper_basic.copy()
+        lower_band = lower_basic.copy()
+        supertrend = pd.Series(index=c.index, dtype=float)
+        trend_dir  = pd.Series(index=c.index, dtype=int)  # 1 = bullish, -1 = bearish
+
+        first = period
+        upper_band.iloc[first] = float(upper_basic.iloc[first])
+        lower_band.iloc[first] = float(lower_basic.iloc[first])
+        trend_dir.iloc[first]  = 1
+
+        for i in range(first + 1, len(c)):
+            # Upper band only tightens downward; lower band only tightens upward
+            upper_band.iloc[i] = (float(upper_basic.iloc[i])
+                if float(upper_basic.iloc[i]) < float(upper_band.iloc[i - 1])
+                   or float(c.iloc[i - 1]) > float(upper_band.iloc[i - 1])
+                else float(upper_band.iloc[i - 1]))
+            lower_band.iloc[i] = (float(lower_basic.iloc[i])
+                if float(lower_basic.iloc[i]) > float(lower_band.iloc[i - 1])
+                   or float(c.iloc[i - 1]) < float(lower_band.iloc[i - 1])
+                else float(lower_band.iloc[i - 1]))
+
+            prev_dir = int(trend_dir.iloc[i - 1])
+            if prev_dir == -1 and float(c.iloc[i]) > float(upper_band.iloc[i]):
+                trend_dir.iloc[i] = 1
+            elif prev_dir == 1 and float(c.iloc[i]) < float(lower_band.iloc[i]):
+                trend_dir.iloc[i] = -1
+            else:
+                trend_dir.iloc[i] = prev_dir
+
+            supertrend.iloc[i] = (float(lower_band.iloc[i]) if trend_dir.iloc[i] == 1
+                                  else float(upper_band.iloc[i]))
+
+        st_val = float(supertrend.iloc[-1]) if not pd.isna(supertrend.iloc[-1]) else None
+        td_val = int(trend_dir.iloc[-1])    if not pd.isna(trend_dir.iloc[-1])  else 0
+
+        just_flipped = (len(trend_dir) >= 2
+                        and not pd.isna(trend_dir.iloc[-2])
+                        and int(trend_dir.iloc[-2]) != td_val)
+
+        price    = float(c.iloc[-1])
+        dist_pct = round((price - st_val) / st_val * 100, 3) if st_val and st_val > 0 else None
+
+        return {
+            "supertrend":   st_val,
+            "trend":        "bullish" if td_val == 1 else ("bearish" if td_val == -1 else "neutral"),
+            "just_flipped": just_flipped,
+            "distance_pct": dist_pct,
+        }
+
+    def calculate_pivot_fibonacci(
+        self, high: pd.Series, low: pd.Series, close: pd.Series,
+        proximity_pct: float = 0.005,
+    ) -> Dict[str, Any]:
+        """Classic Pivot Points + Fibonacci retracement levels derived from prior session.
+
+        Uses the rolling 24-bar window as a proxy for the prior trading session
+        OHLC.  This makes the method timeframe-agnostic: on 1h it maps to 1 day;
+        on 4h it's 4 days, etc.  Operators who want strict session alignment should
+        pass pre-sliced series.
+
+        Standard floor pivots:
+            PP  = (H + L + C) / 3
+            R1  = 2·PP − L    S1 = 2·PP − H
+            R2  = PP + range  S2 = PP − range
+            R3  = H + 2(PP−L) S3 = L − 2(H−PP)
+
+        Fibonacci retracements at 0%, 23.6%, 38.2%, 50%, 61.8%, 78.6%, 100%
+        of the session range.
+        """
+        _empty: Dict[str, Any] = {
+            "pivot": None, "r1": None, "r2": None, "r3": None,
+            "s1": None, "s2": None, "s3": None,
+            "fib_levels": {}, "nearest_pivot_level": None,
+            "at_pivot_level": False, "pivot_bias": "neutral",
+        }
+        if len(close) < 2:
+            return _empty
+
+        h = high.reset_index(drop=True).astype(float)
+        l = low.reset_index(drop=True).astype(float)
+        c = close.reset_index(drop=True).astype(float)
+
+        session_len = min(24, len(c) - 1)
+        prev_h = float(h.iloc[-(session_len + 1):-1].max())
+        prev_l = float(l.iloc[-(session_len + 1):-1].min())
+        prev_c = float(c.iloc[-2])
+        price  = float(c.iloc[-1])
+        rng    = prev_h - prev_l
+
+        if rng <= 0:
+            return _empty
+
+        pp = (prev_h + prev_l + prev_c) / 3
+        r1 = 2 * pp - prev_l;  s1 = 2 * pp - prev_h
+        r2 = pp + rng;          s2 = pp - rng
+        r3 = prev_h + 2 * (pp - prev_l);  s3 = prev_l - 2 * (prev_h - pp)
+
+        fib_levels = {
+            f"{r * 100:.1f}": round(prev_h - rng * r, 6)
+            for r in [0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0]
+        }
+
+        all_levels = [pp, r1, r2, r3, s1, s2, s3] + list(fib_levels.values())
+        all_levels = [lvl for lvl in all_levels if not pd.isna(lvl)]
+
+        nearest  = min(all_levels, key=lambda lvl: abs(price - lvl)) if all_levels else None
+        at_pivot = (nearest is not None and
+                    abs(price - nearest) / max(abs(nearest), 1e-10) <= proximity_pct)
+
+        return {
+            "pivot":               round(pp, 6),
+            "r1":                  round(r1, 6),
+            "r2":                  round(r2, 6),
+            "r3":                  round(r3, 6),
+            "s1":                  round(s1, 6),
+            "s2":                  round(s2, 6),
+            "s3":                  round(s3, 6),
+            "fib_levels":          fib_levels,
+            "nearest_pivot_level": round(nearest, 6) if nearest is not None else None,
+            "at_pivot_level":      at_pivot,
+            "pivot_bias":          "bullish" if price > pp else ("bearish" if price < pp else "neutral"),
+        }
+
+    def calculate_fractals(
+        self, high: pd.Series, low: pd.Series, n: int = 2
+    ) -> Dict[str, Any]:
+        """Bill Williams fractals — 5-bar structural swing points.
+
+        A bearish fractal forms when bar[i] has the highest high of the 5-bar window
+        (bars i-2 through i+2).  A bullish fractal forms on the lowest low.
+        Because the pattern only CONFIRMS after the two right-side bars close, the
+        most recent confirmed fractal is always at index [-3] or earlier — we never
+        treat the last two bars as confirmed.  This prevents look-ahead bias in
+        the backtest loop.
+
+        Args:
+            high: Series of bar highs
+            low:  Series of bar lows
+            n:    Half-window size (default 2 → classic 5-bar Williams fractal)
+
+        Returns:
+            {
+                "up_fractals":   list[float]  — confirmed bullish fractal prices (ascending)
+                "down_fractals": list[float]  — confirmed bearish fractal prices (ascending)
+                "last_up_fractal":   float|None  — most recent bullish fractal price
+                "last_down_fractal": float|None  — most recent bearish fractal price
+                "fractal_up_count":   int
+                "fractal_down_count": int
+            }
+        """
+        window = 2 * n + 1
+        if len(high) < window:
+            return {
+                "up_fractals": [], "down_fractals": [],
+                "last_up_fractal": None, "last_down_fractal": None,
+                "fractal_up_count": 0, "fractal_down_count": 0,
+            }
+
+        h = high.reset_index(drop=True)
+        l = low.reset_index(drop=True)
+
+        # Only evaluate up to len-n so we never read future bars (look-ahead guard)
+        up_fractals: list[float]   = []
+        down_fractals: list[float] = []
+
+        for i in range(n, len(h) - n):
+            window_highs = h.iloc[i - n: i + n + 1]
+            window_lows  = l.iloc[i - n: i + n + 1]
+
+            # Bearish fractal: centre bar has the highest high in the window
+            if float(h.iloc[i]) == float(window_highs.max()):
+                # Require strict inequality on both sides to avoid flat-top noise
+                if (float(h.iloc[i]) > float(h.iloc[i - 1]) and
+                        float(h.iloc[i]) > float(h.iloc[i + 1])):
+                    down_fractals.append(float(h.iloc[i]))
+
+            # Bullish fractal: centre bar has the lowest low in the window
+            if float(l.iloc[i]) == float(window_lows.min()):
+                if (float(l.iloc[i]) < float(l.iloc[i - 1]) and
+                        float(l.iloc[i]) < float(l.iloc[i + 1])):
+                    up_fractals.append(float(l.iloc[i]))
+
+        return {
+            "up_fractals":        sorted(up_fractals),
+            "down_fractals":      sorted(down_fractals),
+            "last_up_fractal":    up_fractals[-1]   if up_fractals   else None,
+            "last_down_fractal":  down_fractals[-1] if down_fractals else None,
+            "fractal_up_count":   len(up_fractals),
+            "fractal_down_count": len(down_fractals),
+        }
+
     def calculate_support_resistance(
         self, high: pd.Series, low: pd.Series, close: pd.Series, lookback: int = 50, proximity_pct: float = 0.005
     ) -> Dict[str, Any]:
@@ -422,6 +735,15 @@ class IndicatorService:
         volume_sma = self.calculate_volume_sma(volume)
         adx = self.calculate_adx(high, low, close) if len(df) >= 28 else None
         sr  = self.calculate_support_resistance(high, low, close) if len(df) >= 10 else None
+        # Fractals need at least 5 bars (2n+1 with n=2); use last 200 bars for speed
+        frac_slice = min(len(df), 200)
+        fr  = self.calculate_fractals(high.iloc[-frac_slice:], low.iloc[-frac_slice:]) if len(df) >= 5 else None
+        # Ichimoku: 52 periods + 26 displacement = 78 bars minimum
+        ichi = self.calculate_ichimoku(high, low, close) if len(df) >= 78 else None
+        # Supertrend: ATR period (10) + 1 = 11 bars minimum
+        st   = self.calculate_supertrend(high, low, close) if len(df) >= 11 else None
+        # Pivot/Fib: needs prior session data (at least 2 bars)
+        pf   = self.calculate_pivot_fibonacci(high, low, close) if len(df) >= 2 else None
         _open = df.get("open", close)
         cp  = self.calculate_candle_patterns(_open, high, low, close) if len(df) >= 3 else None
 
@@ -451,11 +773,54 @@ class IndicatorService:
             "bearish_patterns":   cp["bearish_patterns"]  if cp else [],
             "pattern_weight":     cp["pattern_weight"]    if cp else 0.0,
             "pattern_signal":     cp["pattern_signal"]    if cp else "neutral",
+            # ── Williams fractals ─────────────────────────────────────────────
+            "last_up_fractal":    fr["last_up_fractal"]    if fr else None,
+            "last_down_fractal":  fr["last_down_fractal"]  if fr else None,
+            "fractal_up_count":   fr["fractal_up_count"]   if fr else 0,
+            "fractal_down_count": fr["fractal_down_count"] if fr else 0,
+            # ── Ichimoku Cloud ────────────────────────────────────────────────
+            "ichi_cloud_bullish":    ichi["cloud_bullish"]    if ichi else False,
+            "ichi_cloud_bearish":    ichi["cloud_bearish"]    if ichi else False,
+            "ichi_cloud_neutral":    ichi["cloud_neutral"]    if ichi else True,
+            "ichi_tk_cross_bull":    ichi["tk_cross_bullish"] if ichi else False,
+            "ichi_tk_cross_bear":    ichi["tk_cross_bearish"] if ichi else False,
+            "ichi_above_cloud_pct":  ichi["above_cloud_pct"]  if ichi else None,
+            "ichi_cloud_color":      ichi["cloud_color"]       if ichi else None,
+            "ichi_tenkan":           ichi["tenkan"]             if ichi else None,
+            "ichi_kijun":            ichi["kijun"]              if ichi else None,
+            # ── Supertrend ────────────────────────────────────────────────────
+            "supertrend":              st["supertrend"]   if st else None,
+            "supertrend_trend":        st["trend"]        if st else "neutral",
+            "supertrend_just_flipped": st["just_flipped"] if st else False,
+            "supertrend_distance_pct": st["distance_pct"] if st else None,
+            # ── Pivot Points + Fibonacci ──────────────────────────────────────
+            "pivot":               pf["pivot"]               if pf else None,
+            "pivot_r1":            pf["r1"]                  if pf else None,
+            "pivot_r2":            pf["r2"]                  if pf else None,
+            "pivot_r3":            pf["r3"]                  if pf else None,
+            "pivot_s1":            pf["s1"]                  if pf else None,
+            "pivot_s2":            pf["s2"]                  if pf else None,
+            "pivot_s3":            pf["s3"]                  if pf else None,
+            "pivot_fib_levels":    pf["fib_levels"]          if pf else {},
+            "at_pivot_level":      pf["at_pivot_level"]      if pf else False,
+            "pivot_bias":          pf["pivot_bias"]          if pf else "neutral",
+            "nearest_pivot_level": pf["nearest_pivot_level"] if pf else None,
         }
 
-    def generate_signal(self, df: pd.DataFrame, config: Dict[str, Any], market_context: Optional[Dict[str, Any]] = None) -> TradingSignal:
-        indicators = self.calculate_all(df)
-        
+    def generate_signal(
+        self,
+        df: pd.DataFrame,
+        config: Dict[str, Any],
+        market_context: Optional[Dict[str, Any]] = None,
+        _precomputed_indicators: Optional[Dict[str, Any]] = None,
+    ) -> TradingSignal:
+        # Arrr, when the backtest engine passes pre-computed indicators we skip
+        # calculate_all entirely — the whole O(n²) beast that made us stuck at 96%.
+        if _precomputed_indicators is not None:
+            indicators = _precomputed_indicators
+        else:
+            indicators = self.calculate_all(df)
+
         if not indicators.get("rsi"):
             return TradingSignal(
                 signal=Signal.HOLD,
@@ -484,7 +849,10 @@ class IndicatorService:
 
         # Volume context — current candle vs 20-period average
         volume_sma = indicators.get("volume_sma")
-        current_volume = float(df["volume"].iloc[-1]) if "volume" in df.columns else None
+        if _precomputed_indicators is not None:
+            current_volume = _precomputed_indicators.get("_current_volume")
+        else:
+            current_volume = float(df["volume"].iloc[-1]) if "volume" in df.columns else None
         volume_ratio = (current_volume / volume_sma) if (current_volume and volume_sma and volume_sma > 0) else None
 
         # Previous candle values for true crossover detection
@@ -492,7 +860,15 @@ class IndicatorService:
         prev_ema_fast = prev_ema_slow = None
         ema_fast_val = ema_slow_val = None
 
-        if len(df) >= 2 and strategy in ("breakout", "ema_crossover"):
+        # Arrr — when precomputed, read from the dict; skips duplicate SMA/EMA series recalc.
+        if _precomputed_indicators is not None:
+            prev_sma_20   = _precomputed_indicators.get("_prev_sma_20")
+            prev_sma_50   = _precomputed_indicators.get("_prev_sma_50")
+            ema_fast_val  = _precomputed_indicators.get("_ema_fast_val")
+            ema_slow_val  = _precomputed_indicators.get("_ema_slow_val")
+            prev_ema_fast = _precomputed_indicators.get("_prev_ema_fast")
+            prev_ema_slow = _precomputed_indicators.get("_prev_ema_slow")
+        elif len(df) >= 2 and strategy in ("breakout", "ema_crossover"):
             _close = df["close"]
             if strategy == "breakout":
                 _sma20_ser = self.calculate_sma(_close, 20)
@@ -516,10 +892,20 @@ class IndicatorService:
 
         signals: List[tuple] = []  # (Signal, weight, reasoning)
 
-        # Compute divergence before signal functions — used as a modifier after
-        _divergence = self.detect_divergence(df["close"]) if len(df) >= 22 else \
-                      {"bullish_divergence": False, "bearish_divergence": False,
-                       "divergence_weight": 0.0, "divergence_reason": ""}
+        # Compute divergence before signal functions — used as a modifier after.
+        # When precomputed, divergence is already in the dict (computed per-bar on
+        # a 22-row window in BacktestEngine._build_indicators_at).
+        if _precomputed_indicators is not None:
+            _divergence = {
+                "bullish_divergence": _precomputed_indicators.get("bullish_divergence", False),
+                "bearish_divergence": _precomputed_indicators.get("bearish_divergence", False),
+                "divergence_weight":  _precomputed_indicators.get("divergence_weight", 0.0),
+                "divergence_reason":  "",
+            }
+        else:
+            _divergence = self.detect_divergence(df["close"]) if len(df) >= 22 else \
+                          {"bullish_divergence": False, "bearish_divergence": False,
+                           "divergence_weight": 0.0, "divergence_reason": ""}
         # Add to indicators dict so it's visible in team context / logging
         indicators["bullish_divergence"] = _divergence["bullish_divergence"]
         indicators["bearish_divergence"] = _divergence["bearish_divergence"]
@@ -534,9 +920,22 @@ class IndicatorService:
                 rsi, price, bb_lower, bb_upper, bb_middle, sma_20, volume_ratio, sma_50
             )
         elif strategy == "breakout":
+            # BB width ratio — pre-computed when called from backtest, else derived on-the-fly.
+            if _precomputed_indicators is not None:
+                _bb_width_ratio = _precomputed_indicators.get("_bb_width_ratio")
+            else:
+                _bb_width_ratio = None
+                if bb_upper and bb_lower and bb_middle and bb_middle > 0 and len(df) >= 40:
+                    _close_bb = df["close"].astype(float)
+                    _bb_hist = self.calculate_bollinger_bands(_close_bb)
+                    _bb_widths = (_bb_hist["upper"] - _bb_hist["lower"]) / _bb_hist["middle"].replace(0, float("nan"))
+                    _avg_width = float(_bb_widths.iloc[-40:-1].mean()) if _bb_widths.iloc[-40:-1].notna().any() else None
+                    _cur_width = float(_bb_widths.iloc[-1]) if not pd.isna(_bb_widths.iloc[-1]) else None
+                    if _avg_width and _cur_width and _avg_width > 0:
+                        _bb_width_ratio = round(_cur_width / _avg_width, 3)
             signals = self._breakout_signals(
                 rsi, price, bb_lower, bb_upper, sma_20, sma_50, atr, macd, macd_signal_val,
-                prev_sma_20, prev_sma_50, volume_ratio
+                prev_sma_20, prev_sma_50, volume_ratio, bb_width_ratio=_bb_width_ratio
             )
         elif strategy == "grid":
             signals = self._grid_signals(
@@ -549,6 +948,13 @@ class IndicatorService:
                 config.get("indicators_config", {}),
                 volume_ratio,
             )
+        elif strategy == "wyckoff":
+            # Wyckoff needs the full df (time + OHLCV) — pass it directly rather than
+            # pre-computed scalar indicators, since IB detection is a time-series operation.
+            signals = self._wyckoff_signals(df, volume_ratio)
+        elif strategy == "fractal":
+            # Fractal breakout — needs raw OHLCV df plus pre-computed ADX and volume ratio
+            signals = self._fractal_signals(df, indicators.get("adx"), volume_ratio)
         else:
             signals = self._default_signals(
                 rsi, price, bb_lower, bb_upper, sma_20, sma_50, macd, macd_signal_val, volume_ratio
@@ -591,15 +997,21 @@ class IndicatorService:
         #
         # Affected strategies: momentum, breakout, ema_crossover (trend-following).
         # Not applied to: mean_reversion, grid (thrive in ranging/low-ADX regimes).
+        #
+        # Hard block threshold: ADX < 20 = no confirmed trend (industry standard).
+        # Rather than dampening and allowing a weakened trade through, we zero out
+        # confidence entirely so trend-following agents sit on their hands until
+        # a real trend develops. ADX 15 was too permissive — trades still executed.
         if adx is not None and final_signal != Signal.HOLD:
             _adx_trending_strategies = ("momentum", "breakout", "ema_crossover")
             _adx_ranging_strategies  = ("mean_reversion", "grid")
             if strategy in _adx_trending_strategies:
-                if adx < 15:
-                    # Only dampen when trend is truly absent (ADX < 15).
-                    # ADX 15–20 = early trend forming — don't suppress it.
-                    confidence *= 0.70
-                    reasoning += f" | ADX {adx:.1f} — no trend yet, dampening confidence -30%"
+                if adx < 20:
+                    # ADX < 20 = ranging / no trend — hard block, not a gentle nudge.
+                    # These strategies lose money in choppy markets; don't let them in.
+                    confidence = 0.0
+                    final_signal = Signal.HOLD
+                    reasoning += f" | ADX {adx:.1f} — no confirmed trend (< 20), blocking entry"
                 elif adx > 40:
                     confidence = min(confidence * 1.25, 1.0)
                     reasoning += f" | ADX {adx:.1f} — strong trend, boosting confidence +25%"
@@ -661,6 +1073,99 @@ class IndicatorService:
             elif final_signal == Signal.SELL and _pattern_weight > 0:
                 confidence = max(confidence - _pattern_weight, 0.01)
                 reasoning += f" | Candle pattern opposes: {', '.join(_bullish_pats)} (-{_pattern_weight:.2f})"
+
+        # ── Ichimoku Cloud confluence ──────────────────────────────────────────
+        # Cloud position and TK cross are applied universally — they're regime
+        # filters, not strategy-specific.  cloud_neutral (inside the cloud) is a
+        # no-man's land that lowers conviction; opposing cloud side penalises.
+        _ichi_bull  = indicators.get("ichi_cloud_bullish",  False)
+        _ichi_bear  = indicators.get("ichi_cloud_bearish",  False)
+        _ichi_neut  = indicators.get("ichi_cloud_neutral",  True)
+        _tk_bull    = indicators.get("ichi_tk_cross_bull",  False)
+        _tk_bear    = indicators.get("ichi_tk_cross_bear",  False)
+        if final_signal != Signal.HOLD:
+            if final_signal == Signal.BUY:
+                if _ichi_bull:
+                    confidence = min(confidence + 0.08, 1.0)
+                    reasoning += " | Ichimoku: price above cloud (+8%)"
+                elif _ichi_bear:
+                    confidence = max(confidence - 0.10, 0.01)
+                    reasoning += " | Ichimoku: buying below cloud (-10%)"
+                elif _ichi_neut:
+                    confidence = max(confidence - 0.03, 0.01)
+                    reasoning += " | Ichimoku: price inside cloud (-3%)"
+                if _tk_bull:
+                    confidence = min(confidence + 0.05, 1.0)
+                    reasoning += " | TK cross bullish (+5%)"
+                elif _tk_bear:
+                    confidence = max(confidence - 0.05, 0.01)
+                    reasoning += " | TK cross bearish (-5%)"
+            elif final_signal == Signal.SELL:
+                if _ichi_bear:
+                    confidence = min(confidence + 0.08, 1.0)
+                    reasoning += " | Ichimoku: price below cloud (+8%)"
+                elif _ichi_bull:
+                    confidence = max(confidence - 0.10, 0.01)
+                    reasoning += " | Ichimoku: selling above cloud (-10%)"
+                elif _ichi_neut:
+                    confidence = max(confidence - 0.03, 0.01)
+                    reasoning += " | Ichimoku: price inside cloud (-3%)"
+                if _tk_bear:
+                    confidence = min(confidence + 0.05, 1.0)
+                    reasoning += " | TK cross bearish (+5%)"
+                elif _tk_bull:
+                    confidence = max(confidence - 0.05, 0.01)
+                    reasoning += " | TK cross bullish (-5%)"
+
+        # ── Supertrend confluence ──────────────────────────────────────────────
+        # Aligned with signal: boost.  Opposing: penalise.  Fresh flip adds extra
+        # conviction — the band just committed to a new direction.
+        _st_trend   = indicators.get("supertrend_trend",        "neutral")
+        _st_flipped = indicators.get("supertrend_just_flipped", False)
+        if final_signal != Signal.HOLD:
+            if final_signal == Signal.BUY:
+                if _st_trend == "bullish":
+                    _boost = 0.10 if _st_flipped else 0.06
+                    confidence = min(confidence + _boost, 1.0)
+                    label = "just flipped bullish" if _st_flipped else "bullish"
+                    reasoning += f" | Supertrend {label} (+{_boost:.0%})"
+                elif _st_trend == "bearish":
+                    _pen = 0.12 if _st_flipped else 0.08
+                    confidence = max(confidence - _pen, 0.01)
+                    label = "just flipped bearish" if _st_flipped else "bearish"
+                    reasoning += f" | Supertrend {label} (-{_pen:.0%})"
+            elif final_signal == Signal.SELL:
+                if _st_trend == "bearish":
+                    _boost = 0.10 if _st_flipped else 0.06
+                    confidence = min(confidence + _boost, 1.0)
+                    label = "just flipped bearish" if _st_flipped else "bearish"
+                    reasoning += f" | Supertrend {label} (+{_boost:.0%})"
+                elif _st_trend == "bullish":
+                    _pen = 0.12 if _st_flipped else 0.08
+                    confidence = max(confidence - _pen, 0.01)
+                    label = "just flipped bullish" if _st_flipped else "bullish"
+                    reasoning += f" | Supertrend {label} (-{_pen:.0%})"
+
+        # ── Pivot + Fibonacci S/R confluence ──────────────────────────────────
+        # Institutional reference levels (daily pivots + Fib retracements) act like
+        # a second S/R layer.  Being at a pivot near support boosts BUY conviction;
+        # near resistance boosts SELL.  Pivot bias (above/below PP) reflects
+        # where institutional positioning is most likely concentrated.
+        _at_pivot  = indicators.get("at_pivot_level", False)
+        _piv_bias  = indicators.get("pivot_bias",     "neutral")
+        if final_signal != Signal.HOLD and _at_pivot:
+            if final_signal == Signal.BUY and _piv_bias == "bullish":
+                confidence = min(confidence + 0.05, 1.0)
+                reasoning += " | At pivot support (bullish bias) (+5%)"
+            elif final_signal == Signal.BUY and _piv_bias == "bearish":
+                confidence = max(confidence - 0.05, 0.01)
+                reasoning += " | At pivot resistance (bearish bias) (-5%)"
+            elif final_signal == Signal.SELL and _piv_bias == "bearish":
+                confidence = min(confidence + 0.05, 1.0)
+                reasoning += " | At pivot resistance (bearish bias) (+5%)"
+            elif final_signal == Signal.SELL and _piv_bias == "bullish":
+                confidence = max(confidence - 0.05, 0.01)
+                reasoning += " | At pivot support (bullish bias) (-5%)"
 
         # ── RSI divergence ────────────────────────────────────────────────────
         # Divergence is a high-conviction reversal signal (weight 0.35).
@@ -770,6 +1275,14 @@ class IndicatorService:
             elif strategy == "ema_crossover" and regime in ("ranging",):
                 confidence *= 0.7
                 adjustments.append("reduced confidence (EMA crossover generates false signals in ranging market)")
+            elif strategy == "fractal" and regime in ("trending_up", "trending_down"):
+                # Fractal breakouts work best with momentum behind them
+                confidence = min(confidence * 1.15, 1.0)
+                adjustments.append(f"boosted confidence (fractal breakout in {regime})")
+            elif strategy == "fractal" and regime in ("ranging",):
+                # In a range, fractal breakouts are more likely to be fakeouts
+                confidence *= 0.75
+                adjustments.append("reduced confidence (fractal breakout in ranging market — fakeout risk)")
             elif strategy in ("momentum",) and regime in ("trending_up",) and final_signal == Signal.BUY:
                 confidence = min(confidence * 1.15, 1.0)
                 adjustments.append("boosted confidence (momentum + trending_up + buy)")
@@ -936,7 +1449,7 @@ class IndicatorService:
         return signals
 
     def _breakout_signals(self, rsi, price, bb_lower, bb_upper, sma_20, sma_50, atr, macd, macd_signal_val,
-                          prev_sma_20=None, prev_sma_50=None, volume_ratio=None):
+                          prev_sma_20=None, prev_sma_50=None, volume_ratio=None, bb_width_ratio=None):
         """Breakout: detect range breaks — volume confirmation is critical here.
         
         Breakouts at the exact moment of band touch are often exhaustion, not strength.
@@ -947,15 +1460,30 @@ class IndicatorService:
         # Bollinger Band breakout (price outside bands = breakout)
         # CAUTION: At RSI >75 (overbought), a BB break is often exhaustion — reduce confidence
         # At RSI <25 (oversold), a BB break is often panic — reduce confidence
+        # ── BB width compression guard ─────────────────────────────────────────
+        # In a ranging market, Bollinger Bands compress. A price poke outside compressed
+        # bands is a fakeout: the range boundary is rejecting price, not launching it.
+        # Only fire full breakout signals when bands are at or above their 20-period
+        # average width (confirming volatility expansion is actually happening).
+        # bb_width_ratio < 0.8 = bands 20%+ narrower than recent average → fakeout risk.
+        # When ratio is None (insufficient data), allow through to avoid blocking on cold start.
+        _bands_expanding = bb_width_ratio is None or bb_width_ratio >= 0.8
+
         if bb_upper and price > bb_upper:
             rsi_overbought = rsi and rsi > 75
-            if not rsi_overbought:
+            if not _bands_expanding:
+                signals.append((Signal.BUY, 0.05,
+                    f"Price above BB but bands compressed (width ratio {bb_width_ratio:.2f}) — fakeout risk"))
+            elif not rsi_overbought:
                 signals.append((Signal.BUY, 0.25, "Price broke above upper BB — bullish breakout"))
             else:
                 signals.append((Signal.BUY, 0.08, f"Price broke above BB but RSI overbought {rsi:.0f} — weak entry risk"))
         elif bb_lower and price < bb_lower:
             rsi_oversold = rsi and rsi < 25
-            if not rsi_oversold:
+            if not _bands_expanding:
+                signals.append((Signal.SELL, 0.05,
+                    f"Price below BB but bands compressed (width ratio {bb_width_ratio:.2f}) — fakeout risk"))
+            elif not rsi_oversold:
                 signals.append((Signal.SELL, 0.25, "Price broke below lower BB — bearish breakout"))
             else:
                 signals.append((Signal.SELL, 0.08, f"Price broke below BB but RSI oversold {rsi:.0f} — weak entry risk"))
@@ -1164,6 +1692,157 @@ class IndicatorService:
 
         return signals
 
+    def _wyckoff_signals(self, df: pd.DataFrame, volume_ratio=None) -> List[tuple]:
+        """Intraday Wyckoff — Phase C liquidity sweep detection against the session Initial Balance.
+
+        APPROACH: Option 3 — stateless recalculation on every call.
+        Each tick we re-derive the IB from the df that was fetched upstream.
+        No state is kept between calls — the IB is recalculated from today's candles.
+        This is correct but has one weakness: if the agent is called at exactly the
+        moment of reclaim (before the candle closes), it may miss the entry.
+        Good enough for a sanity test. Upgrade to stateful when confirmed profitable.
+
+        ROADMAP — Stateful approach (proper production implementation):
+          Store per-agent: ib_high, ib_low, ib_established (bool), session_date (str),
+          sweep_detected (bool), sweep_direction ('long'|'short'), sweep_price (float).
+          State storage options (in order of preference):
+            1. Agent DB JSON column `wyckoff_state` — survives restarts, zero infra cost.
+               Requires one migration. Scheduler writes on sweep detection.
+            2. In-memory dict `{agent_id: {...}}` in scheduler — fast, lost on restart.
+               Acceptable if the scheduler restart rate is low.
+            3. Redis key with 24h TTL — only worth it if you have Redis already serving
+               other real-time needs (you do via the cache, so this is viable).
+          Stateful benefits:
+            - Phase B tracking: suppress trading while in accumulation/distribution mid-range
+            - Second-attempt spring detection (2nd sweep after a failed Phase C is higher conviction)
+            - Entry on tick of reclaim (not end-of-candle confirmation lag)
+            - Phase D exit management: take partial profits at range midpoint, full at opposite IB boundary
+            - Session reset at UTC midnight without re-reading 200 candles
+        """
+        signals: List[tuple] = []
+
+        if "time" not in df.columns or len(df) < 10:
+            return signals
+
+        # ── 1. Session boundaries (UTC midnight) ───────────────────────────────
+        # Crypto is 24/7 — UTC midnight is a useful-enough session boundary.
+        # The first 2h typically sees the Composite Man establishing the day's range
+        # (news-driven gaps + Asian/London handoff flow sets the extremes).
+        import datetime
+        times = df["time"].astype(float)
+        latest_ts  = float(times.iloc[-1])
+        latest_dt  = datetime.datetime.utcfromtimestamp(latest_ts)
+        session_start_dt = latest_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        session_start_ts = session_start_dt.timestamp()
+        ib_end_ts        = session_start_ts + (120 * 60)  # first 2 hours
+
+        # ── 2. Initial Balance candles ─────────────────────────────────────────
+        ib_mask = (times >= session_start_ts) & (times < ib_end_ts)
+        ib_df   = df[ib_mask]
+
+        # Require at least 4 IB candles (20 minutes on 5m, 60 minutes on 15m)
+        if len(ib_df) < 4:
+            signals.append((Signal.HOLD, 0.0,
+                f"Wyckoff: IB forming ({len(ib_df)} candles of ~24 required) — Phase A, hold"))
+            return signals
+
+        ib_high = float(ib_df["high"].max())
+        ib_low  = float(ib_df["low"].min())
+        ib_range     = ib_high - ib_low
+        ib_range_pct = ib_range / ib_low if ib_low > 0 else 0
+
+        # A flat IB (< 0.3%) means no tradeable range has been established
+        if ib_range_pct < 0.003:
+            signals.append((Signal.HOLD, 0.0,
+                f"Wyckoff: IB range too narrow ({ib_range_pct:.2%}) — no setup"))
+            return signals
+
+        price        = float(df["close"].iloc[-1])
+        post_ib_mask = times >= ib_end_ts
+        post_ib_df   = df[post_ib_mask]
+
+        # Still inside the IB window — Phase B wait mode
+        if len(post_ib_df) < 2:
+            _pos = (price - ib_low) / ib_range if ib_range > 0 else 0.5
+            signals.append((Signal.HOLD, 0.0,
+                f"Wyckoff Phase B: {_pos:.0%} through IB [{ib_low:.4f}–{ib_high:.4f}] — waiting for Phase C"))
+            return signals
+
+        # ── 3. Scan last 3 post-IB candles for a sweep-and-reclaim ────────────
+        # We need the sweep candle (the one that pierced the IB boundary) and the
+        # reclaim candle (the current candle that closed back inside the range).
+        # Three candles gives us enough lookback without going stale.
+        lookback     = post_ib_df.iloc[-3:] if len(post_ib_df) >= 3 else post_ib_df
+        sweep_low    = float(lookback["low"].min())
+        sweep_high   = float(lookback["high"].max())
+
+        # ── Phase C Spring (long) ──────────────────────────────────────────────
+        # The sweep must be shallow (< 1% below IB low) — a genuine stop-run, not
+        # a breakdown. The reclaim must happen within 3 candles — stale reclaims
+        # are phase D continuations, not Phase C entries.
+        _swept_low    = sweep_low < ib_low
+        _reclaimed_low = price > ib_low
+        _sweep_depth  = (ib_low - sweep_low) / ib_low if _swept_low and ib_low > 0 else 0
+        _is_spring    = _swept_low and _reclaimed_low and _sweep_depth < 0.01
+
+        if _is_spring:
+            # Effort vs. Result: reversal volume should match or exceed sweep volume.
+            # Heavy volume into the sweep with no sustained breakdown = institutional absorption.
+            # Low reversal volume = weak hands covering, not institutions buying.
+            _sweep_idx   = lookback["low"].idxmin()
+            _sweep_vol   = float(df.loc[_sweep_idx, "volume"]) if "volume" in df.columns else None
+            _reclaim_vol = float(df["volume"].iloc[-1])        if "volume" in df.columns else None
+            _vol_ratio   = (_reclaim_vol / _sweep_vol) if (_sweep_vol and _sweep_vol > 0) else None
+            _vol_confirms = _vol_ratio is not None and _vol_ratio >= 0.8
+            _weight       = 0.65 if _vol_confirms else 0.40
+            _vol_note     = (
+                f", vol {_vol_ratio:.1f}× (absorption confirmed)" if _vol_confirms
+                else f", vol {_vol_ratio:.1f}× (weak — caution)"  if _vol_ratio is not None
+                else ""
+            )
+            signals.append((
+                Signal.BUY, _weight,
+                f"Wyckoff Spring: IB low {ib_low:.4f} swept to {sweep_low:.4f} "
+                f"({_sweep_depth:.2%}), reclaimed at {price:.4f}"
+                f"{_vol_note} | TP target: IB high {ib_high:.4f}"
+            ))
+
+        # ── Phase C Upthrust (short) ───────────────────────────────────────────
+        _swept_high    = sweep_high > ib_high
+        _reclaimed_high = price < ib_high
+        _sweep_height  = (sweep_high - ib_high) / ib_high if _swept_high and ib_high > 0 else 0
+        _is_upthrust   = _swept_high and _reclaimed_high and _sweep_height < 0.01
+
+        if _is_upthrust:
+            _sweep_idx   = lookback["high"].idxmax()
+            _sweep_vol   = float(df.loc[_sweep_idx, "volume"]) if "volume" in df.columns else None
+            _reclaim_vol = float(df["volume"].iloc[-1])        if "volume" in df.columns else None
+            _vol_ratio   = (_reclaim_vol / _sweep_vol) if (_sweep_vol and _sweep_vol > 0) else None
+            _vol_confirms = _vol_ratio is not None and _vol_ratio >= 0.8
+            _weight       = 0.65 if _vol_confirms else 0.40
+            _vol_note     = (
+                f", vol {_vol_ratio:.1f}× (distribution confirmed)" if _vol_confirms
+                else f", vol {_vol_ratio:.1f}× (weak — caution)"    if _vol_ratio is not None
+                else ""
+            )
+            signals.append((
+                Signal.SELL, _weight,
+                f"Wyckoff Upthrust: IB high {ib_high:.4f} swept to {sweep_high:.4f} "
+                f"({_sweep_height:.2%}), rejected to {price:.4f}"
+                f"{_vol_note} | TP target: IB low {ib_low:.4f}"
+            ))
+
+        # ── Phase B: price inside IB — wait ───────────────────────────────────
+        # Never trade the mid-range on Wyckoff. The Composite Man uses the middle
+        # of the range to accumulate or distribute against retail orders.
+        # , this be the discipline that separates Wyckoff from gambling.
+        if not signals:
+            _pos = (price - ib_low) / ib_range if ib_range > 0 else 0.5
+            signals.append((Signal.HOLD, 0.0,
+                f"Wyckoff Phase B: {_pos:.0%} through IB [{ib_low:.4f}–{ib_high:.4f}] — no sweep yet"))
+
+        return signals
+
     def _default_signals(self, rsi, price, bb_lower, bb_upper, sma_20, sma_50, macd, macd_signal_val, volume_ratio=None):
         """Balanced default strategy — require strong confluence."""
         signals = []
@@ -1206,5 +1885,112 @@ class IndicatorService:
                 signals.append((dom, 0.15, f"Volume {volume_ratio:.1f}× confirms signal"))
             elif volume_ratio < 0.5:
                 signals = [(s, w * 0.7, r + " [low-volume caution]") for s, w, r in signals]
+
+        return signals
+
+    def _fractal_signals(
+        self,
+        df: pd.DataFrame,
+        adx: Optional[float],
+        volume_ratio: Optional[float],
+    ) -> List[tuple]:
+        """Bill Williams fractal breakout strategy.
+
+        Entry logic:
+          BUY  — close breaks ABOVE the most recent confirmed bearish fractal high
+                 (price reclaims structural resistance → trend continuation or reversal)
+          SELL — close breaks BELOW the most recent confirmed bullish fractal low
+                 (price breaks structural support → continuation or reversal)
+
+        Confidence adjustments:
+          +0.15 if ADX > 25  (confirmed trend — breakout has follow-through)
+          +0.10 if volume_ratio >= 1.5  (institutional participation)
+          -0.10 if ADX < 15  (ranging market — fractal breakouts are noise-heavy)
+          -0.10 if bearish/bullish RSI divergence opposes the direction
+
+        Structural stop placement (recorded in reasoning so backtest can use it):
+          Long  stop → below the most recent bullish fractal low
+          Short stop → above the most recent bearish fractal high
+
+        Requires at least 5 bars and at least one confirmed fractal on each side.
+        """
+        signals: List[tuple] = []
+
+        if len(df) < 5:
+            return signals
+
+        high  = df["high"]  if "high"  in df.columns else df["close"]
+        low   = df["low"]   if "low"   in df.columns else df["close"]
+        close = df["close"]
+
+        # Use last 200 bars — same slice as calculate_all for consistency
+        frac_slice = min(len(df), 200)
+        fr = self.calculate_fractals(high.iloc[-frac_slice:], low.iloc[-frac_slice:])
+
+        last_up   = fr["last_up_fractal"]    # most recent bullish fractal (swing low)
+        last_down = fr["last_down_fractal"]  # most recent bearish fractal (swing high)
+
+        if last_up is None and last_down is None:
+            return signals
+
+        current_price = float(close.iloc[-1])
+        prev_price    = float(close.iloc[-2]) if len(close) >= 2 else current_price
+
+        # ── Bullish fractal breakout — close above bearish fractal high ───────
+        if last_down is not None and prev_price <= last_down < current_price:
+            base_weight = 0.55
+            reason = f"Fractal breakout LONG: close ${current_price:.4f} above bearish fractal ${last_down:.4f}"
+            if last_up is not None:
+                reason += f" | structural stop → ${last_up:.4f}"
+
+            if adx is not None:
+                if adx > 25:
+                    base_weight += 0.15
+                    reason += f" | ADX {adx:.1f} — trend confirmed"
+                elif adx < 15:
+                    base_weight -= 0.10
+                    reason += f" | ADX {adx:.1f} — ranging (caution)"
+
+            if volume_ratio is not None and volume_ratio >= 1.5:
+                base_weight += 0.10
+                reason += f" | volume {volume_ratio:.1f}× surge"
+
+            signals.append((Signal.BUY, round(base_weight, 3), reason))
+
+        # ── Bearish fractal breakout — close below bullish fractal low ────────
+        elif last_up is not None and prev_price >= last_up > current_price:
+            base_weight = 0.55
+            reason = f"Fractal breakdown SHORT: close ${current_price:.4f} below bullish fractal ${last_up:.4f}"
+            if last_down is not None:
+                reason += f" | structural stop → ${last_down:.4f}"
+
+            if adx is not None:
+                if adx > 25:
+                    base_weight += 0.15
+                    reason += f" | ADX {adx:.1f} — trend confirmed"
+                elif adx < 15:
+                    base_weight -= 0.10
+                    reason += f" | ADX {adx:.1f} — ranging (caution)"
+
+            if volume_ratio is not None and volume_ratio >= 1.5:
+                base_weight += 0.10
+                reason += f" | volume {volume_ratio:.1f}× surge"
+
+            signals.append((Signal.SELL, round(base_weight, 3), reason))
+
+        # ── Proximity-based setup signal (approaching fractal level) ──────────
+        # Weight 0.25 — not a full entry, gives the signal engine something to
+        # consider when combined with divergence or candle-pattern confluence.
+        elif not signals:
+            if last_down is not None:
+                dist_pct = abs(current_price - last_down) / max(last_down, 1e-10)
+                if dist_pct <= 0.003:  # within 0.3% of bearish fractal
+                    signals.append((Signal.BUY, 0.25,
+                        f"Approaching bearish fractal resistance ${last_down:.4f} (dist {dist_pct*100:.2f}%)"))
+            if last_up is not None:
+                dist_pct = abs(current_price - last_up) / max(last_up, 1e-10)
+                if dist_pct <= 0.003:
+                    signals.append((Signal.SELL, 0.25,
+                        f"Approaching bullish fractal support ${last_up:.4f} (dist {dist_pct*100:.2f}%)"))
 
         return signals

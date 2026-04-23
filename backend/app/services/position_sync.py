@@ -97,6 +97,22 @@ class PositionSyncService:
                 mark = _ep_to_float(phemex_pos.get("markPrice", 0) or phemex_pos.get("markPriceEp", 0))
                 upnl = _ep_to_float(phemex_pos.get("unrealisedPnl", 0) or phemex_pos.get("unrealisedPnlEv", 0))
 
+                # Extract leverage from Phemex response — Phemex returns it as a plain
+                # integer field. Fall back to 1 if absent.
+                _raw_lev = phemex_pos.get("leverage") or phemex_pos.get("longLeverage") or phemex_pos.get("shortLeverage")
+                try:
+                    _lev = max(float(_raw_lev), 1.0) if _raw_lev is not None else 1.0
+                except (TypeError, ValueError):
+                    _lev = 1.0
+
+                # Position cost (margin): Phemex provides this as posCostEv (Ev = × 1e8)
+                # or directly as posCost. Fall back to notional / leverage.
+                _cost_raw = phemex_pos.get("posCost") or phemex_pos.get("posCostEv")
+                try:
+                    _margin = _ep_to_float(_cost_raw) if _cost_raw else (qty * (entry or mark or 0)) / _lev
+                except (TypeError, ValueError):
+                    _margin = (qty * (entry or mark or 0)) / _lev
+
                 db_pos = existing_map.get((sym, side))
                 if db_pos:
                     if abs(db_pos.quantity - qty) > 1e-8:
@@ -106,6 +122,9 @@ class PositionSyncService:
                     db_pos.entry_price = entry or db_pos.entry_price
                     db_pos.current_price = mark or db_pos.current_price
                     db_pos.unrealized_pnl = upnl
+                    # Always refresh leverage + margin so they reflect current exchange state
+                    db_pos.leverage = _lev
+                    db_pos.margin_used = _margin
                     summary["synced"] += 1
                 else:
                     new_pos = Position(
@@ -113,10 +132,11 @@ class PositionSyncService:
                         symbol=sym, side=side, quantity=qty,
                         entry_price=entry, current_price=mark,
                         unrealized_pnl=upnl, is_paper=False,
+                        leverage=_lev, margin_used=_margin,
                     )
                     db.add(new_pos)
                     summary["created"] += 1
-                    logger.info(f"PositionSync: new live position {sym} {side.value} qty={qty:.6f}")
+                    logger.info(f"PositionSync: new live position {sym} {side.value} qty={qty:.6f} lev={_lev}x margin=${_margin:.2f}")
 
             live_keys = set(live_symbols_by_side.keys())
             for (sym, side), db_pos in existing_map.items():

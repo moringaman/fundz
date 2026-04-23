@@ -92,166 +92,205 @@ class EmailService:
 
         lb_text = "\n".join(
             f"  #{a.get('rank','-')} {a.get('name', a.get('agent_id','?'))}: "
-            f"P&L ${(a.get('total_pnl',0) or 0):+,.2f}, Win Rate {(a.get('win_rate',0) or 0):.0%}"
+            f"P&L ${(a.get('total_pnl',0) or 0):+,.2f}, Win Rate {(a.get('win_rate',0) or 0):.0%}, "
+            f"{a.get('total_trades', 0) or 0} trades"
             for a in leaderboard[:8]
         ) or "  No agent data yet."
 
-        prompt = f"""You are Victoria Montgomery, Chief Investment Officer of a sophisticated AI-powered crypto trading fund.
+        victoria_system = """You are Victoria Montgomery, Chief Investment Officer of an AI-powered crypto hedge fund.
 
-Write the daily fund summary email for {report_date}.
+Your character:
+- 20 years in derivatives and crypto. You have seen every market regime imaginable.
+- Dry wit, especially when the market misbehaves. You are real, not corporate.
+- You treat the AI trading agents like junior analysts on your desk. You name them directly.
+- You are honest about losses — you explain them without excuses and without spin.
+- You are decisive. You form a view and state it clearly. No hedging into meaninglessness.
+- Warm but professional. This letter goes to the trading desk, not to clients.
+- Every observation is specific. You reference actual numbers and actual agent names.
+- You write in short paragraphs. Maximum 4 sentences per paragraph. Never more."""
 
-PERSONA: Authoritative but warm. Analytical. Occasionally dry wit. You care deeply about performance and risk management.
+        victoria_user = f"""Write your personal daily assessment for {report_date}.
 
-OUTPUT FORMAT: Return ONLY valid JSON with exactly two keys:
-  "subject": a concise subject line (e.g. "Daily Fund Report — {report_date} | P&L ${total_pnl:+,.0f}")
-  "html": a complete, well-formatted HTML email body. Requirements:
-    - Start with a greeting paragraph to the trading team
-    - Use a clean HTML table for portfolio metrics (4 columns: Metric, Value)
-    - Use a separate HTML table for the agent leaderboard
-    - Use <h2> section headers: Portfolio Overview, Trading Activity, Agent Performance, Market & Risk, Victoria's Notes
-    - Use inline styles only (no <style> tags) — background #0d1117, text #e6edf3, accent #58a6ff
-    - Bold positive P&L green (#3fb950), negative red (#f85149)
-    - End with a personal paragraph from Victoria with her assessment and 1-2 forward-looking observations
-    - Professional email sign-off from Victoria
-    - Keep it readable — paragraphs, not walls of data
+Write 4 to 5 paragraphs of genuine prose. No headers, no bullet points, no JSON. Just the paragraphs, separated by blank lines.
+
+Structure:
+1. Opening — what does today's number tell you about the fund's health? Not just the sign of P&L but what's driving it and what it means.
+2. Agent performance — who performed well and why do you think so? Who underperformed and is it regime mismatch, bad R:R, or something structural? Name them.
+3. Market reading — what is the market telling you today? What regime do you think we're in and how well-positioned is the fund for what's coming?
+4. Risk and concern — what are you watching closely? What could go wrong in the next 48 hours? Be specific.
+5. Forward look — one sharp, non-obvious observation about tomorrow or the week ahead. End with a brief closing that sounds like you — not boilerplate.
 
 FUND DATA ({report_date}):
-Portfolio Value: ${portfolio_value:,.2f}
-Total P&L: ${total_pnl:+,.2f} ({daily_return:+.2f}%)
-Realized P&L: ${realized_pnl:+,.2f} | Unrealized P&L: ${unrealized_pnl:+,.2f}
-Trades Opened: {trades_opened} | Closed: {trades_closed} | Open Positions: {open_positions}
-Buy Volume: ${buy_vol:,.0f} | Sell Volume: ${sell_vol:,.0f}
-Risk Level: {risk_level.upper()} | CIO Sentiment: {cio_sentiment}
-CIO Note: {cio_summary[:400]}
-Market Conditions: {json.dumps(market)[:400]}
+Net P&L: ${total_pnl:+,.2f} ({daily_return:+.2f}%)
+Realized: ${realized_pnl:+,.2f} | Unrealized: ${unrealized_pnl:+,.2f}
+Trades: {trades_opened} opened, {trades_closed} closed | {open_positions} open positions
+Risk Level: {risk_level.upper()} | Sentiment: {cio_sentiment}
+Market: {json.dumps(market)[:500]}
 
-Agent Leaderboard:
+Internal CIO assessment (use as raw material — rewrite in your own voice, do not quote directly):
+{cio_summary[:800] or 'No formal assessment was generated today.'}
+
+Agent leaderboard:
 {lb_text}
 
-Team Discussion Highlight:
-{team_summary[:500] or 'No significant team discussions today.'}
-"""
+Team discussion today:
+{team_summary[:600] or 'No significant team discussions recorded today.'}"""
 
+        victoria_html_paragraphs = ""
         try:
-            resp = await llm_service._call_llm(prompt)
-            data = json.loads(resp.content)
-            subject = data.get("subject", f"Daily Fund Report — {report_date}")
-            html_body = data.get("html", "")
-            if html_body:
-                return subject, html_body
+            raw_prose = await llm_service._call_llm_text(
+                system_prompt=victoria_system,
+                user_prompt=victoria_user,
+                temperature=0.75,
+                max_tokens=1200,
+            )
+            if raw_prose and not raw_prose.startswith("I'm sorry"):
+                paragraphs = [p.strip() for p in raw_prose.split("\n\n") if p.strip()]
+                victoria_html_paragraphs = "\n".join(
+                    f'<p style="color:#c9d1d9;line-height:1.85;font-size:13.5px;margin:0 0 18px 0">{p}</p>'
+                    for p in paragraphs
+                )
         except Exception as e:
-            logger.warning(f"LLM email composition failed, using fallback: {e}")
+            logger.warning(f"Victoria prose generation failed, using fallback: {e}")
 
-        # ── Fallback: hand-crafted HTML email ──────────────────────────
+        # ── Build HTML email with Python-controlled structure ──────────
         pnl_color = "#3fb950" if total_pnl >= 0 else "#f85149"
         pnl_arrow = "📈" if total_pnl >= 0 else "📉"
-        subject = f"Daily Fund Report — {report_date} | P&L ${total_pnl:+,.0f}"
+        subject = f"Fund Report — {report_date} | Net P&L ${total_pnl:+,.0f}"
 
         lb_rows = ""
         for a in leaderboard[:8]:
             name = a.get("name", a.get("agent_id", "?"))
             pnl = a.get("total_pnl", 0) or 0
             wr = a.get("win_rate", 0) or 0
+            trades = a.get("total_trades", 0) or 0
             c = "#3fb950" if pnl >= 0 else "#f85149"
+            row_bg = "#1f2937" if (a.get("rank", 1) or 1) % 2 == 1 else "#161b22"
             lb_rows += (
-                f'<tr><td style="padding:6px 12px;border-bottom:1px solid #21262d">{a.get("rank","-")}</td>'
-                f'<td style="padding:6px 12px;border-bottom:1px solid #21262d">{name}</td>'
-                f'<td style="padding:6px 12px;border-bottom:1px solid #21262d;color:{c};font-weight:600">${pnl:+,.2f}</td>'
-                f'<td style="padding:6px 12px;border-bottom:1px solid #21262d">{wr:.0%}</td></tr>'
+                f'<tr style="background:{row_bg}">'
+                f'<td style="padding:8px 12px;border-bottom:1px solid #21262d;color:#8b949e">{a.get("rank","-")}</td>'
+                f'<td style="padding:8px 12px;border-bottom:1px solid #21262d;font-weight:600">{name}</td>'
+                f'<td style="padding:8px 12px;border-bottom:1px solid #21262d;color:{c};font-weight:700">${pnl:+,.2f}</td>'
+                f'<td style="padding:8px 12px;border-bottom:1px solid #21262d">{wr:.0%}</td>'
+                f'<td style="padding:8px 12px;border-bottom:1px solid #21262d;color:#8b949e">{trades} trades</td>'
+                f'</tr>'
+            )
+
+        # Use LLM-generated prose if available, otherwise a data-driven fallback
+        if not victoria_html_paragraphs:
+            direction_word = "positive territory" if total_pnl >= 0 else "the red"
+            victoria_html_paragraphs = (
+                f'<p style="color:#c9d1d9;line-height:1.85;font-size:13.5px;margin:0 0 18px 0">'
+                f'The fund closed {direction_word} today with a net P&L of '
+                f'<strong style="color:{pnl_color}">${total_pnl:+,.2f}</strong> ({daily_return:+.2f}%). '
+                f'We executed {trades_opened + trades_closed} trades and are carrying {open_positions} open positions into the next session. '
+                f'Risk level is currently <strong>{risk_level.upper()}</strong>.</p>'
+                f'<p style="color:#c9d1d9;line-height:1.85;font-size:13.5px;margin:0 0 18px 0">'
+                f'{cio_summary[:600] if cio_summary else "No CIO assessment was generated for today. Review the agent leaderboard for any agents showing deteriorating P&L relative to their win rate — that gap is where the fee drag hides."}'
+                f'</p>'
+                f'<p style="color:#c9d1d9;line-height:1.85;font-size:13.5px;margin:0 0 18px 0">'
+                f'As always, I remind the desk: win rate is vanity. P&L after fees is sanity. '
+                f'Any agent with a win rate above 60% and a negative cumulative P&L has an R:R problem, not a signal problem. '
+                f'Fix the exits before you fix the entries.</p>'
+            )
+
+        discussion_block = ""
+        if team_summary:
+            discussion_block = (
+                f'<h2 style="font-size:14px;font-weight:700;color:#58a6ff;text-transform:uppercase;'
+                f'letter-spacing:.08em;border-bottom:1px solid #21262d;padding-bottom:10px;margin:32px 0 16px 0">'
+                f'Team Discussion</h2>'
+                f'<p style="color:#c9d1d9;line-height:1.8;font-size:13px;margin:0 0 24px 0">'
+                f'{team_summary[:800].replace(chr(10), "<br><br>")}</p>'
             )
 
         html_body = f"""<!DOCTYPE html>
-<html>
+<html lang="en">
 <body style="margin:0;padding:0;background:#0d1117;font-family:'Segoe UI',Arial,sans-serif;color:#e6edf3">
-<div style="max-width:680px;margin:32px auto;background:#161b22;border-radius:12px;overflow:hidden;border:1px solid #30363d">
+<div style="max-width:660px;margin:32px auto;background:#161b22;border-radius:12px;overflow:hidden;border:1px solid #30363d">
 
-  <!-- Header -->
-  <div style="background:#1f2937;padding:28px 32px;border-bottom:1px solid #30363d">
-    <div style="font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:.1em;margin-bottom:6px">Phemex AI Trader</div>
-    <h1 style="margin:0;font-size:22px;font-weight:700;color:#f0f6fc">{pnl_arrow} Daily Fund Report</h1>
-    <div style="color:#8b949e;font-size:13px;margin-top:4px">{report_date}</div>
+  <!-- ── Header ───────────────────────────────────────────────────────── -->
+  <div style="background:linear-gradient(135deg,#1f2937 0%,#161b22 100%);padding:32px;border-bottom:1px solid #30363d">
+    <div style="font-size:11px;color:#58a6ff;text-transform:uppercase;letter-spacing:.12em;margin-bottom:8px">
+      Phemex AI Trader &mdash; Daily Fund Report
+    </div>
+    <h1 style="margin:0;font-size:26px;font-weight:700;color:#f0f6fc;line-height:1.2">
+      {pnl_arrow}&nbsp; <span style="color:{pnl_color}">${total_pnl:+,.2f}</span>
+    </h1>
+    <div style="color:#8b949e;font-size:13px;margin-top:8px">
+      {report_date} &nbsp;&middot;&nbsp; Portfolio Value: <strong style="color:#e6edf3">${portfolio_value:,.2f}</strong>
+      &nbsp;&middot;&nbsp; Daily Return: <strong style="color:{pnl_color}">{daily_return:+.2f}%</strong>
+    </div>
   </div>
 
-  <!-- Body -->
-  <div style="padding:28px 32px">
+  <!-- ── Body ─────────────────────────────────────────────────────────── -->
+  <div style="padding:32px">
 
-    <p style="color:#c9d1d9;line-height:1.7;margin-top:0">
-      Good morning, team. Here is your daily summary for <strong>{report_date}</strong>.
-      The fund {("performed positively" if total_pnl >= 0 else "faced headwinds")} today
-      with a net P&amp;L of <strong style="color:{pnl_color}">${total_pnl:+,.2f}</strong> ({daily_return:+.2f}%).
-    </p>
-
-    <!-- Portfolio Overview -->
-    <h2 style="font-size:15px;font-weight:700;color:#58a6ff;border-bottom:1px solid #21262d;padding-bottom:8px;margin-top:28px">📊 Portfolio Overview</h2>
-    <table style="width:100%;border-collapse:collapse;font-size:13px">
+    <!-- Portfolio metrics -->
+    <h2 style="font-size:14px;font-weight:700;color:#58a6ff;text-transform:uppercase;letter-spacing:.08em;border-bottom:1px solid #21262d;padding-bottom:10px;margin:0 0 16px 0">
+      Portfolio Overview
+    </h2>
+    <table style="width:100%;border-collapse:collapse;font-size:13px;margin-bottom:32px">
       <tr style="background:#1f2937">
-        <td style="padding:8px 12px;border-bottom:1px solid #21262d;color:#8b949e">Portfolio Value</td>
-        <td style="padding:8px 12px;border-bottom:1px solid #21262d;font-weight:600">${portfolio_value:,.2f}</td>
-        <td style="padding:8px 12px;border-bottom:1px solid #21262d;color:#8b949e">Total P&amp;L</td>
-        <td style="padding:8px 12px;border-bottom:1px solid #21262d;font-weight:600;color:{pnl_color}">${total_pnl:+,.2f}</td>
+        <td style="padding:10px 14px;border-bottom:1px solid #21262d;color:#8b949e;width:25%">Realized P&amp;L</td>
+        <td style="padding:10px 14px;border-bottom:1px solid #21262d;font-weight:600;color:{('#3fb950' if realized_pnl >= 0 else '#f85149')}">${realized_pnl:+,.2f}</td>
+        <td style="padding:10px 14px;border-bottom:1px solid #21262d;color:#8b949e;width:25%">Unrealized P&amp;L</td>
+        <td style="padding:10px 14px;border-bottom:1px solid #21262d;font-weight:600;color:{('#3fb950' if unrealized_pnl >= 0 else '#f85149')}">${unrealized_pnl:+,.2f}</td>
       </tr>
       <tr>
-        <td style="padding:8px 12px;border-bottom:1px solid #21262d;color:#8b949e">Realized P&amp;L</td>
-        <td style="padding:8px 12px;border-bottom:1px solid #21262d">${realized_pnl:+,.2f}</td>
-        <td style="padding:8px 12px;border-bottom:1px solid #21262d;color:#8b949e">Unrealized P&amp;L</td>
-        <td style="padding:8px 12px;border-bottom:1px solid #21262d">${unrealized_pnl:+,.2f}</td>
+        <td style="padding:10px 14px;border-bottom:1px solid #21262d;color:#8b949e">Trades Opened</td>
+        <td style="padding:10px 14px;border-bottom:1px solid #21262d">{trades_opened}</td>
+        <td style="padding:10px 14px;border-bottom:1px solid #21262d;color:#8b949e">Trades Closed</td>
+        <td style="padding:10px 14px;border-bottom:1px solid #21262d">{trades_closed}</td>
       </tr>
       <tr style="background:#1f2937">
-        <td style="padding:8px 12px;border-bottom:1px solid #21262d;color:#8b949e">Daily Return</td>
-        <td style="padding:8px 12px;border-bottom:1px solid #21262d;color:{pnl_color}">{daily_return:+.2f}%</td>
-        <td style="padding:8px 12px;border-bottom:1px solid #21262d;color:#8b949e">Risk Level</td>
-        <td style="padding:8px 12px;border-bottom:1px solid #21262d">{risk_level.upper()}</td>
-      </tr>
-    </table>
-
-    <!-- Trading Activity -->
-    <h2 style="font-size:15px;font-weight:700;color:#58a6ff;border-bottom:1px solid #21262d;padding-bottom:8px;margin-top:28px">📋 Trading Activity</h2>
-    <table style="width:100%;border-collapse:collapse;font-size:13px">
-      <tr style="background:#1f2937">
-        <td style="padding:8px 12px;border-bottom:1px solid #21262d;color:#8b949e">Trades Opened</td>
-        <td style="padding:8px 12px;border-bottom:1px solid #21262d">{trades_opened}</td>
-        <td style="padding:8px 12px;border-bottom:1px solid #21262d;color:#8b949e">Trades Closed</td>
-        <td style="padding:8px 12px;border-bottom:1px solid #21262d">{trades_closed}</td>
+        <td style="padding:10px 14px;border-bottom:1px solid #21262d;color:#8b949e">Open Positions</td>
+        <td style="padding:10px 14px;border-bottom:1px solid #21262d">{open_positions}</td>
+        <td style="padding:10px 14px;border-bottom:1px solid #21262d;color:#8b949e">Risk Level</td>
+        <td style="padding:10px 14px;border-bottom:1px solid #21262d;font-weight:600">{risk_level.upper()}</td>
       </tr>
       <tr>
-        <td style="padding:8px 12px;border-bottom:1px solid #21262d;color:#8b949e">Open Positions</td>
-        <td style="padding:8px 12px;border-bottom:1px solid #21262d">{open_positions}</td>
-        <td style="padding:8px 12px;border-bottom:1px solid #21262d;color:#8b949e">CIO Sentiment</td>
-        <td style="padding:8px 12px;border-bottom:1px solid #21262d">{cio_sentiment.title()}</td>
-      </tr>
-      <tr style="background:#1f2937">
-        <td style="padding:8px 12px;border-bottom:1px solid #21262d;color:#8b949e">Buy Volume</td>
-        <td style="padding:8px 12px;border-bottom:1px solid #21262d">${buy_vol:,.0f}</td>
-        <td style="padding:8px 12px;border-bottom:1px solid #21262d;color:#8b949e">Sell Volume</td>
-        <td style="padding:8px 12px;border-bottom:1px solid #21262d">${sell_vol:,.0f}</td>
+        <td style="padding:10px 14px;color:#8b949e">Buy Volume</td>
+        <td style="padding:10px 14px">${buy_vol:,.0f}</td>
+        <td style="padding:10px 14px;color:#8b949e">Sell Volume</td>
+        <td style="padding:10px 14px">${sell_vol:,.0f}</td>
       </tr>
     </table>
 
-    <!-- Agent Leaderboard -->
-    <h2 style="font-size:15px;font-weight:700;color:#58a6ff;border-bottom:1px solid #21262d;padding-bottom:8px;margin-top:28px">🏆 Agent Performance</h2>
-    <table style="width:100%;border-collapse:collapse;font-size:13px">
-      <tr style="background:#1f2937;color:#8b949e;font-size:11px;text-transform:uppercase;letter-spacing:.05em">
-        <td style="padding:6px 12px">#</td>
-        <td style="padding:6px 12px">Agent</td>
-        <td style="padding:6px 12px">P&amp;L</td>
-        <td style="padding:6px 12px">Win Rate</td>
+    <!-- Agent leaderboard -->
+    <h2 style="font-size:14px;font-weight:700;color:#58a6ff;text-transform:uppercase;letter-spacing:.08em;border-bottom:1px solid #21262d;padding-bottom:10px;margin:0 0 16px 0">
+      Agent Leaderboard
+    </h2>
+    <table style="width:100%;border-collapse:collapse;font-size:13px;margin-bottom:32px">
+      <tr style="background:#0d1117;color:#8b949e;font-size:11px;text-transform:uppercase;letter-spacing:.06em">
+        <td style="padding:8px 12px">#</td>
+        <td style="padding:8px 12px">Agent</td>
+        <td style="padding:8px 12px">Cumulative P&amp;L</td>
+        <td style="padding:8px 12px">Win Rate</td>
+        <td style="padding:8px 12px">Trades</td>
       </tr>
-      {lb_rows or '<tr><td colspan="4" style="padding:12px;color:#8b949e;text-align:center">No agent data yet</td></tr>'}
+      {lb_rows or '<tr><td colspan="5" style="padding:16px 12px;color:#8b949e;text-align:center;font-style:italic">No agent performance data available yet.</td></tr>'}
     </table>
 
-    <!-- Victoria's Notes -->
-    <h2 style="font-size:15px;font-weight:700;color:#58a6ff;border-bottom:1px solid #21262d;padding-bottom:8px;margin-top:28px">💼 Victoria's Notes</h2>
-    <p style="color:#c9d1d9;line-height:1.7">
-      {cio_summary[:500] if cio_summary else "No specific notes for today. The fund continues to operate within normal parameters."}
-    </p>
-    {(f'<p style="color:#c9d1d9;line-height:1.7"><strong>Team Discussion:</strong> {team_summary[:400]}</p>') if team_summary else ''}
+    <!-- Victoria's notes -->
+    <h2 style="font-size:14px;font-weight:700;color:#58a6ff;text-transform:uppercase;letter-spacing:.08em;border-bottom:1px solid #21262d;padding-bottom:10px;margin:0 0 20px 0">
+      Victoria's Assessment
+    </h2>
+    {victoria_html_paragraphs}
+
+    {discussion_block}
 
   </div>
 
-  <!-- Footer -->
-  <div style="padding:20px 32px;background:#1f2937;border-top:1px solid #30363d;font-size:11px;color:#8b949e">
-    <div>Victoria Montgomery &mdash; Chief Investment Officer, Phemex AI Trader</div>
-    <div style="margin-top:4px">Automated daily report &middot; {report_date}</div>
+  <!-- ── Footer ───────────────────────────────────────────────────────── -->
+  <div style="padding:20px 32px;background:#0d1117;border-top:1px solid #21262d;font-size:11px;color:#8b949e;display:flex;justify-content:space-between">
+    <div>
+      <strong style="color:#c9d1d9">Victoria Montgomery</strong><br>
+      Chief Investment Officer &mdash; Phemex AI Trader
+    </div>
+    <div style="text-align:right">
+      Automated daily report<br>{report_date}
+    </div>
   </div>
 
 </div>
@@ -270,9 +309,6 @@ Team Discussion Highlight:
 
         url = f"https://{self._domain}/api/v1/send-email"
         # body is now HTML; also send a stripped plain-text fallback
-        import re as _re
-        plain_fallback = _re.sub(r'<[^>]+>', '', body)
-        plain_fallback = _re.sub(r'&amp;', '&', _re.sub(r'&lt;', '<', _re.sub(r'&gt;', '>', _re.sub(r'&nbsp;', ' ', _re.sub(r'&mdash;', '—', _re.sub(r'&middot;', '·', plain_fallback))))))
         payload = {
             "email_type": "generic",
             "sender_org": "phemex-ai-trader",
@@ -281,8 +317,11 @@ Team Discussion Highlight:
             "message_subject": subject,
             "message_sent": False,
             "message_body": {
-                "generic_body": plain_fallback,
+                # html_body triggers the {{#if html_body}} branch in generic.hbs,
+                # which renders ONLY the full HTML document without any wrapper chrome.
+                # generic_body is kept as a plain-text fallback for non-HTML clients.
                 "html_body": body,
+                "generic_body": body,
             },
         }
 

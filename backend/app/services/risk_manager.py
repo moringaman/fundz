@@ -71,21 +71,28 @@ class RiskManager:
     ) -> RiskCheckResult:
         self._check_daily_reset()
         current_positions = current_positions or []
-        
-        total_exposure = sum(
-            pos.get('quantity', 0) * pos.get('entry_price', 0)
-            for pos in current_positions
-        )
+
+        # Exposure is measured as margin committed (notional ÷ leverage), not full notional.
+        # Using full notional would wrongly penalise leveraged positions — a $14k notional at
+        # 2× leverage only ties up $7k of capital, which is the true exposure to the fund.
+        def _margin(pos: Dict[str, Any]) -> float:
+            notional = pos.get('quantity', 0) * pos.get('entry_price', 0)
+            lev = max(pos.get('leverage', 1.0) or 1.0, 1.0)
+            return notional / lev
+
+        total_exposure = sum(_margin(p) for p in current_positions)
 
         total_leveraged_notional = sum(
             pos.get('notional', pos.get('quantity', 0) * pos.get('entry_price', 0))
             for pos in current_positions
         )
-        
-        trade_value = quantity * entry_price
+
+        # Incoming trade: use configured leverage from risk_config
+        _trade_leverage = max(risk_config.leverage or 1.0, 1.0)
+        trade_value = (quantity * entry_price) / _trade_leverage
         potential_exposure = total_exposure + trade_value
-        potential_leveraged_notional = total_leveraged_notional + trade_value
-        
+        potential_leveraged_notional = total_leveraged_notional + (quantity * entry_price)
+
         if potential_exposure > (risk_config.max_exposure or risk_config.max_position_size * 10):
             exposure_limit = risk_config.max_exposure or risk_config.max_position_size * 10
             return RiskCheckResult(
@@ -310,34 +317,32 @@ class RiskManager:
         try:
             timestamp = datetime.utcnow()
 
-            # Calculate portfolio metrics
-            total_exposure = sum(
-                pos.get('quantity', 0) * pos.get('current_price', pos.get('entry_price', 0))
-                for pos in current_positions
-            )
+            # Calculate portfolio metrics.
+            # Use margin (notional ÷ leverage) so leveraged positions don't falsely inflate exposure.
+            def _pos_margin(p: dict) -> float:
+                notional = p.get('quantity', 0) * p.get('current_price', p.get('entry_price', 0))
+                lev = max(p.get('leverage', 1.0) or 1.0, 1.0)
+                return notional / lev
+
+            total_exposure = sum(_pos_margin(p) for p in current_positions)
 
             exposure_pct = (total_exposure / total_capital * 100) if total_capital else 0
 
             # Convert daily P&L to percentage of capital for threshold comparison
             daily_pnl_pct = (daily_pnl / total_capital * 100) if total_capital else 0
 
-            # Find largest position
+            # Find largest position (by margin, consistent with exposure calc)
             largest_pos = None
             largest_symbol = None
             if current_positions:
-                largest_pos = max(
-                    current_positions,
-                    key=lambda p: p.get('quantity', 0) * p.get('current_price', p.get('entry_price', 0))
-                )
+                largest_pos = max(current_positions, key=_pos_margin)
                 largest_symbol = largest_pos.get('symbol')
 
             # Determine concentration risk
             # Only meaningful when 2+ positions exist — a single position is always "100%"
             # but that's not a concentration problem, just a small active portfolio.
             if largest_pos and len(current_positions) >= 2:
-                largest_exposure = (
-                    largest_pos.get('quantity', 0) * largest_pos.get('current_price', largest_pos.get('entry_price', 0))
-                ) / (total_exposure or 1) * 100
+                largest_exposure = _pos_margin(largest_pos) / (total_exposure or 1) * 100
                 if largest_exposure > 40:
                     concentration = "high"
                 elif largest_exposure > 25:

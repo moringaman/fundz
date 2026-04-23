@@ -19,13 +19,19 @@ from app.config import settings
 
 
 class PaperTradingService:
-    # Fee rates — Phemex spot taker: 0.1%, contract taker: 0.06%
-    SPOT_FEE_RATE = 0.001    # 0.10% for USDT spot pairs
-    CONTRACT_FEE_RATE = 0.0006  # 0.06% for coin-margined contracts
+    # Fee rates — Phemex spot taker: 0.1%, perp taker (USDT- and coin-margined): 0.06%
+    SPOT_FEE_RATE = 0.001    # 0.10% — spot only (not used in this system)
+    CONTRACT_FEE_RATE = 0.0006  # 0.06% — all Phemex perpetual contracts (USDT- and coin-margined)
+    HYPERLIQUID_FEE_RATE = 0.00035  # 0.035% HL taker — used for venue-accurate paper simulation
 
     @classmethod
-    def fee_rate_for(cls, symbol: str) -> float:
-        return cls.SPOT_FEE_RATE if symbol.endswith("USDT") else cls.CONTRACT_FEE_RATE
+    def fee_rate_for(cls, symbol: str, venue: str = "phemex") -> float:
+        if venue == "hyperliquid":
+            return cls.HYPERLIQUID_FEE_RATE
+        # Arrr, all symbols traded here be perpetual contracts (USDT-margined perps like
+        # ETHUSDT, BTCUSDT etc.). The old condition swapped spot and contract rates —
+        # ETHUSDT ends in "USDT" so it got 0.1% (spot) instead of 0.06% (perp). Ye fool.
+        return cls.CONTRACT_FEE_RATE
 
     def __init__(self, phemex_client: Optional[PhemexClient] = None):
         self.logger = logging.getLogger(__name__)
@@ -488,9 +494,11 @@ class PaperTradingService:
             pos_side = pos.side.value if hasattr(pos.side, 'value') else str(pos.side)
             is_short = pos_side.lower() == 'sell'
             qty = pos.quantity or 0
-            # Round-trip fee estimate so unrealized P&L matches closed-trade net P&L
+            # Deduct only the entry fee already paid — exit fee is charged when the
+            # position actually closes. Pre-charging it here caused trades to show
+            # negative P&L the instant they opened (double-counted the entry fee).
             _fr = self.fee_rate_for(pos.symbol)
-            _est_fees = (entry * qty * _fr) + (current_price * qty * _fr)
+            _est_fees = entry * qty * _fr
             if is_short:
                 unrealized = (entry - current_price) * qty - _est_fees
                 unrealized_pct = (unrealized / (entry * qty) * 100) if entry * qty > 0 else 0.0
@@ -836,104 +844,80 @@ class PaperTradingService:
 
         closed: list[dict] = []
         for (sym, agent_id), sides in groups.items():
-            # --- LONG trades: buy→sell FIFO ---
-            buys = list(sides["buys"])
-            buy_idx = 0
-            buy_remaining = buys[0].quantity if buys else 0
-
-            for sell in sides["sells"]:
-                remaining = sell.quantity
-                while remaining > 1e-12 and buy_idx < len(buys):
-                    fill = min(remaining, buy_remaining)
-                    buy = buys[buy_idx]
-                    pnl = fill * (sell.price - buy.price)
-                    fee = (buy.fee or 0) * (fill / buy.quantity) + (sell.fee or 0) * (fill / sell.quantity)
-                    net_pnl = pnl - fee
-                    entry_notional = fill * buy.price
-                    pnl_pct = (net_pnl / entry_notional * 100) if entry_notional else 0
-
-                    closed.append({
-                        "symbol": sym,
-                        "agent_id": agent_id if agent_id != "__none__" else None,
-                        "side": "long",
-                        "quantity": round(fill, 8),
-                        "entry_price": buy.price,
-                        "exit_price": sell.price,
-                        "entry_time": buy.created_at.isoformat() if buy.created_at else None,
-                        "exit_time": sell.created_at.isoformat() if sell.created_at else None,
-                        "gross_pnl": round(pnl, 6),
-                        "fee": round(fee, 6),
-                        "net_pnl": round(net_pnl, 6),
-                        "pnl_pct": round(pnl_pct, 4),
-                        "result": "win" if net_pnl > 0 else ("loss" if net_pnl < 0 else "breakeven"),
-                    })
-
-                    remaining -= fill
-                    buy_remaining -= fill
-                    if buy_remaining <= 1e-12:
-                        buy_idx += 1
-                        buy_remaining = buys[buy_idx].quantity if buy_idx < len(buys) else 0
-
-            # --- SHORT trades: sell→buy FIFO ---
-            # Unmatched sells (after long matching) are short entries
-            # Match remaining sells against buys that follow them chronologically
-            unmatched_sells = []
-            for s in sides["sells"]:
-                unmatched_sells.append({"order": s, "remaining": s.quantity})
-            # Subtract fills already used by long matching
-            for entry in unmatched_sells:
-                entry["remaining"] = 0  # reset — we'll rebuild from scratch
-
-            # Rebuild: sells that come BEFORE any matching buy = short entries
-            sell_list = list(sides["sells"])
-            buy_list = list(sides["buys"])
-            # Short detection: sells that weren't preceded by enough buys
-            cum_bought = 0.0
-            cum_sold = 0.0
-            all_orders = sorted(
-                [(o, "buy") for o in buy_list] + [(o, "sell") for o in sell_list],
-                key=lambda x: x[0].created_at
+            # Arrr, the old two-pass (long pass + independent short pass) was a leaky
+            # ship — a BUY used to cover a short could still be consumed by the long
+            # pass, creating ghost long trades with swapped entry/exit and identical P&L.
+            # The fix: one chronological FIFO pass with explicit long/short inventory.
+            # A BUY first covers any open shorts; remainder opens a long.
+            # A SELL first closes any open longs; remainder opens a short.
+            # Only completed round-trips land in `closed`. No order is double-counted.
+            all_orders_sorted = sorted(
+                [(o, "buy") for o in sides["buys"]] + [(o, "sell") for o in sides["sells"]],
+                key=lambda x: x[0].created_at,
             )
-            short_entries: list = []  # (order, qty)
-            short_remaining: list = []
 
-            for o, side_str in all_orders:
-                if side_str == "buy":
-                    cum_bought += o.quantity
-                    # Check if this buy covers any open shorts
-                    for sr in short_remaining:
-                        if sr["remaining"] <= 1e-12:
-                            continue
-                        cover = min(o.quantity, sr["remaining"])
-                        if cover > 1e-12:
-                            entry_order = sr["order"]
-                            pnl = cover * (entry_order.price - o.price)  # short P&L
-                            fee = (entry_order.fee or 0) * (cover / entry_order.quantity) + (o.fee or 0) * (cover / o.quantity)
-                            net_pnl = pnl - fee
-                            entry_notional = cover * entry_order.price
-                            pnl_pct = (net_pnl / entry_notional * 100) if entry_notional else 0
+            # Each entry: {"price": float, "qty": float, "order": o}
+            long_inv: list[dict] = []
+            short_inv: list[dict] = []
 
-                            closed.append({
-                                "symbol": sym,
-                                "agent_id": agent_id if agent_id != "__none__" else None,
-                                "side": "short",
-                                "quantity": round(cover, 8),
-                                "entry_price": entry_order.price,
-                                "exit_price": o.price,
-                                "entry_time": entry_order.created_at.isoformat() if entry_order.created_at else None,
-                                "exit_time": o.created_at.isoformat() if o.created_at else None,
-                                "gross_pnl": round(pnl, 6),
-                                "fee": round(fee, 6),
-                                "net_pnl": round(net_pnl, 6),
-                                "pnl_pct": round(pnl_pct, 4),
-                                "result": "win" if net_pnl > 0 else ("loss" if net_pnl < 0 else "breakeven"),
-                            })
-                            sr["remaining"] -= cover
+            def _make_record(direction: str, entry_o, exit_o, fill: float) -> dict:
+                if direction == "long":
+                    pnl = fill * (exit_o.price - entry_o.price)
                 else:
-                    cum_sold += o.quantity
-                    if cum_sold > cum_bought + 1e-12:
-                        short_qty = min(o.quantity, cum_sold - cum_bought)
-                        short_remaining.append({"order": o, "remaining": short_qty})
+                    pnl = fill * (entry_o.price - exit_o.price)
+                fee = (
+                    (entry_o.fee or 0) * (fill / entry_o.quantity)
+                    + (exit_o.fee or 0) * (fill / exit_o.quantity)
+                )
+                net_pnl = pnl - fee
+                entry_notional = fill * entry_o.price
+                pnl_pct = (net_pnl / entry_notional * 100) if entry_notional else 0
+                return {
+                    "symbol": sym,
+                    "agent_id": agent_id if agent_id != "__none__" else None,
+                    "side": direction,
+                    "quantity": round(fill, 8),
+                    "entry_price": entry_o.price,
+                    "exit_price": exit_o.price,
+                    "entry_time": entry_o.created_at.isoformat() if entry_o.created_at else None,
+                    "exit_time": exit_o.created_at.isoformat() if exit_o.created_at else None,
+                    "gross_pnl": round(pnl, 6),
+                    "fee": round(fee, 6),
+                    "net_pnl": round(net_pnl, 6),
+                    "pnl_pct": round(pnl_pct, 4),
+                    "result": "win" if net_pnl > 0 else ("loss" if net_pnl < 0 else "breakeven"),
+                }
+
+            for o, side_str in all_orders_sorted:
+                remaining = o.quantity
+
+                if side_str == "buy":
+                    # Cover open shorts first (FIFO)
+                    while remaining > 1e-12 and short_inv:
+                        slot = short_inv[0]
+                        fill = min(remaining, slot["qty"])
+                        closed.append(_make_record("short", slot["order"], o, fill))
+                        remaining -= fill
+                        slot["qty"] -= fill
+                        if slot["qty"] <= 1e-12:
+                            short_inv.pop(0)
+                    # Remainder is a new long position
+                    if remaining > 1e-12:
+                        long_inv.append({"price": o.price, "qty": remaining, "order": o})
+
+                else:  # sell
+                    # Close open longs first (FIFO)
+                    while remaining > 1e-12 and long_inv:
+                        slot = long_inv[0]
+                        fill = min(remaining, slot["qty"])
+                        closed.append(_make_record("long", slot["order"], o, fill))
+                        remaining -= fill
+                        slot["qty"] -= fill
+                        if slot["qty"] <= 1e-12:
+                            long_inv.pop(0)
+                    # Remainder opens a new short position
+                    if remaining > 1e-12:
+                        short_inv.append({"price": o.price, "qty": remaining, "order": o})
 
         # ── Consolidate FIFO slices that share the same exit order ────────
         # When multiple entry orders are closed by a single exit (e.g. 3

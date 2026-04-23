@@ -23,19 +23,20 @@ strategies:
       Momentum agents ride strong trends. Only trade when RSI is not extreme (30-70), 
       price is above SMA20 and SMA50 for longs, and MACD histogram is positive.
       Best in trending_up or trending_down regimes. Avoid ranging markets.
+      # , the R:R must be at least 3:1 or the fee drag sinks us — TP kept wide intentionally.
     market_conditions: ["trending_up", "trending_down"]
     avoid_conditions: ["ranging"]
     timeframes:
       default: "15m"
       allowed: ["15m", "30m", "1h"]
     risk:
-      stop_loss_pct: 2.5
-      take_profit_pct: 6.0
+      stop_loss_pct: 2.0
+      take_profit_pct: 7.5
       trailing_stop_pct: 3.5
     indicators:
       rsi_period: 14
-      rsi_overbought: 70
-      rsi_oversold: 30
+      rsi_overbought: 68
+      rsi_oversold: 32
       macd_fast: 12
       macd_slow: 26
       macd_signal: 9
@@ -50,24 +51,26 @@ strategies:
       EMA Crossover agents enter on a confirmed EMA 9 / 21 crossover.
       Golden cross (EMA9 crosses above EMA21) = buy signal.
       Death cross (EMA9 crosses below EMA21) = sell signal.
-      RSI filter: do not buy if RSI > 65, do not sell if RSI < 35.
+      RSI filter: do not buy if RSI > 60, do not sell if RSI < 40.
       MACD histogram confirms direction.
       Best in trending markets. Generates false signals in ranging / sideways markets.
+      # , tightened RSI to 60/40 — the 65/35 was letting in too many whipsaws.
+      # SL tightened and TP widened so a single winner pays for 3-4 losers.
     market_conditions: ["trending_up", "trending_down"]
     avoid_conditions: ["ranging"]
     timeframes:
       default: "1h"
       allowed: ["15m", "30m", "1h", "4h"]
     risk:
-      stop_loss_pct: 2.5
-      take_profit_pct: 6.0
+      stop_loss_pct: 2.0
+      take_profit_pct: 7.5
       trailing_stop_pct: 3.0
     indicators:
       ema_fast: 9
       ema_slow: 21
       rsi_period: 14
-      rsi_overbought: 65
-      rsi_oversold: 35
+      rsi_overbought: 60
+      rsi_oversold: 40
       macd_fast: 12
       macd_slow: 26
       macd_signal: 9
@@ -80,9 +83,11 @@ strategies:
     description: "Buys oversold / sells overbought extremes using Bollinger Bands + RSI. Best in sideways, ranging markets."
     ai_guidance: |
       Mean reversion agents trade price returning to average.
-      Buy when price touches or breaks below the lower Bollinger Band and RSI < 30.
-      Sell when price touches or breaks above the upper Bollinger Band and RSI > 70.
+      Buy when price touches or breaks below the lower Bollinger Band and RSI < 25.
+      Sell when price touches or breaks above the upper Bollinger Band and RSI > 75.
       Best in ranging or low-volatility markets. Dangerous in strong trends.
+      # , the old 4.5% TP was barely covering fees after two round trips.
+      # RSI extremes tightened to 25/75 — only the real outliers deserve a trade.
     market_conditions: ["ranging", "low_volatility"]
     avoid_conditions: ["trending_up", "trending_down"]
     timeframes:
@@ -90,7 +95,7 @@ strategies:
       allowed: ["15m", "30m", "1h", "4h"]
     risk:
       stop_loss_pct: 3.0
-      take_profit_pct: 4.5
+      take_profit_pct: 6.0
       trailing_stop_pct: 2.5
     indicators:
       bb_period: 20
@@ -111,8 +116,9 @@ strategies:
       Bearish breakout: price closes below lower Bollinger Band with ATR expanding.
       Require ATR > 1.5× recent average to confirm volatility expansion.
       Best after a period of consolidation. Avoid if already in a mature trend.
+      Do NOT trade breakouts in ranging markets — BB band touches in a range are fakeouts, not breakouts.
     market_conditions: ["consolidating", "pre_breakout"]
-    avoid_conditions: []
+    avoid_conditions: ["ranging"]
     timeframes:
       default: "1h"
       allowed: ["30m", "1h", "4h"]
@@ -164,9 +170,10 @@ strategies:
     ai_guidance: |
       Scalping agents make many small trades with tight stops.
       Use EMA 9/21 crossovers on 1m-15m charts.
-      RSI overbought: 65, oversold: 35 (tighter thresholds than momentum).
+      RSI overbought: 60, oversold: 40 (tighter thresholds — scalp fees are brutal at 0.6% round-trip).
       Only trade during high-volume periods. Avoid news events.
       Keep position sizes smaller than other strategies due to high trade frequency.
+      # , the old 2.5% TP barely left a doubloon after fees. Raised to 3.5% so the haul justifies the voyage.
     market_conditions: ["trending_up", "trending_down", "ranging"]
     avoid_conditions: []
     timeframes:
@@ -174,14 +181,14 @@ strategies:
       allowed: ["1m", "5m", "15m"]
     risk:
       stop_loss_pct: 1.0
-      take_profit_pct: 2.5
+      take_profit_pct: 3.5
       trailing_stop_pct: 1.5
     indicators:
       ema_fast: 9
       ema_slow: 21
       rsi_period: 7
-      rsi_overbought: 65
-      rsi_oversold: 35
+      rsi_overbought: 60
+      rsi_oversold: 40
     agent_naming: ["BTC_Scalp", "ETH_Scalp", "SOL_Scalper"]
     ai_propose: true
     require_marina: false
@@ -214,6 +221,38 @@ strategies:
     ai_propose: false
     require_marina: true
 
+  wyckoff:
+    label: "Wyckoff Intraday"
+    description: "Intraday Wyckoff liquidity-sweep strategy. Establishes the session Initial Balance (first 2h), then trades Phase C Springs (long) and Upthrusts (short) — price dips below/above the IB boundary and immediately reclaims it. Ignores mid-range noise."
+    ai_guidance: |
+      Wyckoff intraday agents trade liquidity sweeps against the day's Initial Balance (IB).
+      The IB is the high and low of the first 2 hours of the UTC session.
+      PHASE B (wait): price is inside the IB range. Do NOT trade. Wait.
+      PHASE C — Spring (long): price briefly dips below IB low by < 1%, then closes back above it.
+        Entry: at the reclaim of IB low. SL: below the sweep low. TP: IB high.
+      PHASE C — Upthrust (short): price briefly pokes above IB high by < 1%, then closes back below it.
+        Entry: at the rejection below IB high. SL: above the sweep high. TP: IB low.
+      Effort vs. Result filter: only enter if the reversal candle volume >= 80% of the sweep candle volume.
+      Low-volume sweeps are often noise, not genuine absorption.
+      # , the stateless recalculation is good enough for a sanity test.
+      # The proper fix be a per-agent session state store (see ROADMAP comment in _wyckoff_signals).
+    market_conditions: ["trending_up", "trending_down", "ranging", "volatile"]
+    avoid_conditions: []
+    timeframes:
+      default: "5m"
+      allowed: ["5m", "15m"]
+    risk:
+      stop_loss_pct: 1.5
+      take_profit_pct: 4.0
+      trailing_stop_pct: null
+    indicators:
+      ib_window_minutes: 120
+      sweep_max_depth_pct: 1.0
+      reversal_volume_ratio: 0.8
+    agent_naming: ["BTC_Wyckoff", "ETH_Wyckoff", "SOL_Wyckoff"]
+    ai_propose: true
+    require_marina: false
+
   ai:
     label: "AI Strategy"
     description: "LLM-powered analysis and signals. The AI considers all available indicators, whale data, market regime and team context to generate decisions."
@@ -229,10 +268,42 @@ strategies:
       default: "1h"
       allowed: ["5m", "15m", "30m", "1h", "4h", "1d"]
     risk:
-      stop_loss_pct: 2.5
-      take_profit_pct: 6.0
+      stop_loss_pct: 2.0
+      take_profit_pct: 7.5
       trailing_stop_pct: 3.0
     indicators: {}
     agent_naming: ["BTC_AI_Agent", "ETH_Intelligence", "AI_Macro"]
+    ai_propose: true
+    require_marina: false
+
+  fractal:
+    label: "Fractal Breakout"
+    description: "Bill Williams 5-bar fractal breakouts. Enters when price closes through a confirmed structural swing level, filtered by ADX trend strength and volume."
+    ai_guidance: |
+      Fractal breakout agents enter when price closes ABOVE the most recent bearish
+      fractal high (long) or BELOW the most recent bullish fractal low (short).
+      A fractal only confirms 2 bars after the swing bar closes — no look-ahead.
+      ADX > 25 required for full confidence; ADX < 15 reduces confidence (ranging fakeout risk).
+      Volume >= 1.5x average adds further conviction.
+      Stop placed at the opposing fractal (structural invalidation), not a fixed %.
+      Best in trending markets with clear swing structure.
+      # , fractal stops are tighter than % stops in trending markets — the structure
+      # tells ye where yer wrong, not an arbitrary number.
+    market_conditions: ["trending_up", "trending_down"]
+    avoid_conditions: ["ranging"]
+    timeframes:
+      default: "1h"
+      allowed: ["15m", "30m", "1h", "4h"]
+    risk:
+      stop_loss_pct: 2.5
+      take_profit_pct: 7.5
+      trailing_stop_pct: 3.5
+    indicators:
+      fractal_n: 2
+      adx_period: 14
+      adx_trend_threshold: 25
+      adx_ranging_threshold: 15
+      volume_confirmation_ratio: 1.5
+    agent_naming: ["BTC_Fractal", "ETH_Fractal", "SOL_Fractal"]
     ai_propose: true
     require_marina: false

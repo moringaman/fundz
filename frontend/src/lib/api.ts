@@ -44,7 +44,9 @@ export const tradingApi = {
   getPositions: () => api.get('trading/positions'),
   
   getBalance: () => api.get('trading/balance'),
-  
+
+  getHyperliquidBalance: () => api.get('trading/hl-balance'),
+
   getHistory: (symbol?: string, limit = 50) =>
     api.get(`trading/history${symbol ? `?symbol=${symbol}&limit=${limit}` : `?limit=${limit}`}`),
   

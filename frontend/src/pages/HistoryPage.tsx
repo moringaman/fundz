@@ -16,6 +16,7 @@ import { timeAgo } from '../utils/timeAgo';
 import { formatPrice, formatPnl, formatPnlPct } from '../utils/formatPrice';
 import { usePagination, Paginator } from '../components/common/Paginator';
 import { SkeletonStats, SkeletonTable } from '../components/common/Skeleton';
+import { PositionEmptyState } from '../components/PositionsTable';
 
 export function HistoryPage() {
   const { isPaper } = useTradingMode();
@@ -169,9 +170,7 @@ export function HistoryPage() {
         <div className="card">
           <h2 className="card-title">Open Positions ({positions.length})</h2>
           {positions.length === 0 ? (
-            <div style={{ padding: '2rem', textAlign: 'center', color: 'var(--text-muted)', fontSize: '.9rem' }}>
-              There are currently no open positions
-            </div>
+            <PositionEmptyState isPaper={tab === 'paper'} />
           ) : (
           <div className="trades-table">
             <div className="trades-header" style={{ gridTemplateColumns: '1fr 0.5fr 0.7fr 0.9fr 0.9fr 0.7fr 0.9fr 0.9fr 1fr 1fr 0.9fr 0.7fr 0.7fr 0.7fr 0.6fr' }}>

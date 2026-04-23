@@ -115,14 +115,17 @@ class StrategyReviewService:
             except Exception:
                 strategy_fit = {"fit_score": 0.5, "reasoning": "Analysis unavailable", "recommended_action": "maintain"}
 
-            # FM evaluation: combine performance + technical fit
-            win_rate = metrics.get('win_rate', 0.5) or 0
+            # FM evaluation: combine performance + technical fit.
+            # win_rate is None until _WIN_RATE_MIN_SAMPLE trades — use 0.5 (neutral)
+            # so that a missing sample doesn't register as 0% WR and tank the score.
+            win_rate = metrics.get('win_rate', 0.5) or 0.5
             total_pnl = metrics.get('total_pnl', 0) or 0
             total_runs = metrics.get('total_runs', 0) or 0
+            actual_trades = metrics.get('actual_trades', 0) or 0
 
             perf_score = win_rate * 0.6 + min(max(total_pnl / 500, -0.4), 0.4)
-            if total_runs < 3:
-                perf_score = 0.5  # neutral for new agents
+            if total_runs < 3 or actual_trades < 10:
+                perf_score = 0.5  # neutral for new/untested agents — not enough signal to judge
 
             # Combined score: 40% performance, 30% strategy fit, 30% confluence
             combined = perf_score * 0.4 + strategy_fit['fit_score'] * 0.3 + confluence * 0.3
@@ -141,6 +144,7 @@ class StrategyReviewService:
                 'fit_reasoning': strategy_fit['reasoning'],
                 'fit_action': strategy_fit['recommended_action'],
                 'total_runs': total_runs,
+                'actual_trades': actual_trades,
                 'win_rate': win_rate,
                 'total_pnl': total_pnl,
             }

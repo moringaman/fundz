@@ -1,6 +1,6 @@
 from typing import Dict, List, Optional
 from datetime import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import asyncio
 import json
 import logging
@@ -31,6 +31,11 @@ from app.services.trader_service import trader_service
 from app.services.telegram_service import telegram_service
 
 logger = logging.getLogger(__name__)
+
+# Minimum closed trades before win_rate is meaningful enough to drive scoring.
+# Below this threshold agents score neutral (0.5) rather than getting killed
+# after a bad first streak — a 3-loss start is noise, not signal.
+_WIN_RATE_MIN_SAMPLE = 10
 
 
 async def _send_telegram(coro) -> None:
@@ -63,6 +68,7 @@ class AgentRun:
     pnl: Optional[float] = None
     error: Optional[str] = None
     exit_reason: Optional[str] = None  # "stop-loss" | "take-profit" | "trailing-stop" | None
+    llm_reasoning: Optional[str] = None  # AI agent reasoning; None for indicator-only runs
 
 
 @dataclass
@@ -80,6 +86,8 @@ class AgentMetrics:
     last_run: Optional[datetime] = None
     win_rate: Optional[float] = None  # None until at least one trade closes
     avg_pnl: float = 0.0
+    # Per-venue breakdown: {venue: {"trades": int, "wins": int, "pnl": float}}
+    venue_stats: dict = field(default_factory=dict)
 
 
 class AgentScheduler:
@@ -141,6 +149,7 @@ class AgentScheduler:
         self._trader_allocations: Dict[str, float] = {}  # {trader_id: pct}
         self._trader_agent_allocations: Dict[str, Dict[str, float]] = {}  # {trader_id: {agent_id: pct}}
         self._current_trader_perf: Dict[str, dict] = {}  # {trader_id: perf dict} — refreshed every team analysis cycle
+        self._current_agent_perf: Dict[str, dict] = {}   # {agent_id: perf dict}  — refreshed alongside trader perf
         self._total_capital: float = 0.0  # Total fund capital — set from live or paper holdings
 
         # US Open session management
@@ -161,7 +170,14 @@ class AgentScheduler:
         self._setup_watchlist: Dict[str, dict] = {}
         self._WATCHLIST_CONF_LOW  = 0.55   # enter watchlist above this
         self._WATCHLIST_CONF_HIGH = 0.65   # remove from watchlist above this (trade or expired)
-        self._WATCHLIST_TTL_SECS  = 3600   # expire after 1 hour
+        # Watchlist TTL is 4× the candle interval so near-miss symbols stay
+        # relevant for a few cycles rather than a fixed wall-clock hour.
+        self._WATCHLIST_TF_SECS = {
+            "1m": 60, "3m": 180, "5m": 300, "15m": 900,
+            "30m": 1800, "1h": 3600, "2h": 7200, "4h": 14400,
+            "6h": 21600, "12h": 43200, "1d": 86400,
+        }  # base period per timeframe label
+        self._WATCHLIST_TTL_SECS  = 3600   # legacy fallback (kept for safety)
 
     async def _get_total_capital(self, positions_value: float = 0.0) -> float:
         """Return total fund capital.
@@ -486,6 +502,40 @@ class AgentScheduler:
         except Exception:
             pass
 
+        # AI self-learning: inject a rolling window of the agent's own past LLM reasoning
+        # and their outcomes so the LLM can reflect on its own previous logic.
+        # Loads the 5 most recent AI runs with stored reasoning for this agent+symbol.
+        if self._enabled_agents.get(agent_id, {}).get("strategy_type") == "ai":
+            try:
+                from app.models import AgentRunRecord as _RunRec
+                async with get_async_session() as _rl_db:
+                    _rl_rows = (await _rl_db.execute(
+                        select(_RunRec)
+                        .where(
+                            _RunRec.agent_id == agent_id,
+                            _RunRec.symbol == symbol,
+                            _RunRec.llm_reasoning.isnot(None),
+                        )
+                        .order_by(_RunRec.timestamp.desc())
+                        .limit(5)
+                    )).scalars().all()
+                if _rl_rows:
+                    ctx["llm_history"] = [
+                        {
+                            "signal": r.signal,
+                            "confidence": r.confidence,
+                            "reasoning_summary": (r.llm_reasoning or "")[:200],
+                            "outcome_pnl": r.pnl,
+                            "executed": r.executed,
+                            "mins_ago": int(
+                                (datetime.now().timestamp() - r.timestamp.timestamp()) / 60
+                            ) if r.timestamp else None,
+                        }
+                        for r in _rl_rows
+                    ]
+            except Exception:
+                pass  # LLM history is additive; signal generation continues
+
         return ctx if ctx else None
 
     _HTF_MAP = {
@@ -634,8 +684,64 @@ class AgentScheduler:
             mode_label = "paper" if current_is_paper else "LIVE"
             if loaded:
                 logger.info(f"Scheduler: restored {mode_label} metrics for {loaded} strategies from DB")
+
+            # ── Warm strategy insights from DB ────────────────────────────────
+            # Retrospective confidence adjustments are now persisted in
+            # StrategyInsightRecord so we can pre-populate _current_trade_insights
+            # before the first 20-minute cycle fires.  Without this the scheduler
+            # starts blind and may over-size positions on penalised strategies.
+            await self._load_strategy_insights_from_db(current_is_paper)
+
         except Exception as e:
             logger.warning(f"Scheduler: could not restore metrics from DB (will rebuild): {e}")
+
+    async def _load_strategy_insights_from_db(self, is_paper: bool) -> None:
+        """Warm _current_trade_insights["strategy_insights"] from persisted DB rows.
+
+        Called at startup so the confidence multipliers from the last retrospective
+        run are immediately available — the system doesn't wait 20 minutes to re-learn
+        what it already knew before the restart.
+        """
+        try:
+            from app.database import get_async_session
+            from app.models import StrategyInsightRecord
+            from sqlalchemy import select
+            async with get_async_session() as session:
+                rows = (await session.execute(
+                    select(StrategyInsightRecord).where(StrategyInsightRecord.is_paper == is_paper)
+                )).scalars().all()
+
+            if not rows:
+                return
+
+            strategy_insights: Dict[str, Dict] = {}
+            for row in rows:
+                strategy_insights[row.strategy_type] = {
+                    "strategy_type": row.strategy_type,
+                    "win_rate": row.win_rate,
+                    "avg_win_pct": row.avg_win_pct,
+                    "avg_loss_pct": row.avg_loss_pct,
+                    "total_trades": row.trade_count,
+                    "best_pattern": row.best_pattern,
+                    "worst_pattern": row.worst_pattern,
+                    "strengths": row.strengths or [],
+                    "weaknesses": row.weaknesses or [],
+                    "confidence_adj": row.confidence_adj,
+                    "confidence_adj_reason": row.confidence_adj_reason or "",
+                }
+
+            # Merge into _current_trade_insights without overwriting agent_insights
+            # that might have been populated by an earlier cycle this session.
+            if self._current_trade_insights is None:
+                self._current_trade_insights = {}
+            self._current_trade_insights["strategy_insights"] = strategy_insights
+            _adj_summary = [f"{k}:{v['confidence_adj']:+.2f}" for k, v in strategy_insights.items() if v["confidence_adj"] != 0.0]
+            logger.info(
+                f"Scheduler: warmed strategy insights for {len(strategy_insights)} strategies from DB "
+                f"(adjustments: {_adj_summary})"
+            )
+        except Exception as e:
+            logger.warning(f"Scheduler: could not load strategy insights from DB (non-fatal): {e}")
 
     async def _auto_register_agents(self):
         """Load enabled agents from DB and register them for automated trading.
@@ -671,6 +777,11 @@ class AgentScheduler:
                 if agent.get("is_enabled"):
                     self.register_agent(agent)
                     registered += 1
+                    # Register venue in trading_service so close/update calls
+                    # route to the correct live backend.
+                    trading_service.set_agent_venue(
+                        agent["id"], agent.get("venue", "phemex")
+                    )
 
                     # Bootstrap metrics from backtest if agent has never traded
                     metrics = self._agent_metrics.get(agent["id"])
@@ -678,6 +789,59 @@ class AgentScheduler:
                         await self._bootstrap_from_backtest(agent)
 
             logger.info(f"Auto-registered {registered}/{len(agents)} enabled agents for trading")
+
+            # ── Warm in-memory backtest cache from DB ─────────────────────
+            # Avoids every agent re-running a full backtest after a redeploy.
+            # Loads the most recent BacktestRecord per agent_id from the DB.
+            try:
+                from app.models import BacktestRecord as _BtRec
+                from app.services.backtest import BacktestResult as _BtRes
+                async with get_async_session() as _bt_db:
+                    _bt_rows = (await _bt_db.execute(
+                        select(_BtRec)
+                        .where(_BtRec.agent_id.in_([a["id"] for a in agents if a.get("trading_pairs")]))
+                        .order_by(_BtRec.created_at.desc())
+                    )).scalars().all()
+                # Keep only the most recent record per agent_id
+                _seen: set = set()
+                for _br in _bt_rows:
+                    if not _br.agent_id or _br.agent_id in _seen:
+                        continue
+                    _seen.add(_br.agent_id)
+                    _agent_cfg = self._enabled_agents.get(_br.agent_id, {})
+                    _pairs = _agent_cfg.get("trading_pairs") or []
+                    _sym = _pairs[0] if _pairs else None
+                    if not _sym:
+                        continue
+                    _cache_key = f"{_br.agent_id}:{_sym}"
+                    if _cache_key not in self._backtest_cache:
+                        _restored = _BtRes(
+                            total_trades=_br.total_trades or 0,
+                            winning_trades=_br.winning_trades or 0,
+                            losing_trades=_br.losing_trades or 0,
+                            win_rate=_br.win_rate or 0.0,
+                            total_pnl=_br.total_pnl or 0.0,
+                            net_pnl=_br.net_pnl or 0.0,
+                            total_fees=_br.total_fees or 0.0,
+                            max_drawdown=_br.max_drawdown or 0.0,
+                            sharpe_ratio=_br.sharpe_ratio or 0.0,
+                            avg_trade_pnl=_br.avg_trade_pnl or 0.0,
+                            profit_factor=_br.profit_factor or 0.0,
+                            avg_win=0.0,
+                            avg_loss=0.0,
+                            max_consecutive_wins=0,
+                            max_consecutive_losses=0,
+                            trades=_br.trades_data or [],
+                            equity_curve=_br.equity_curve or [],
+                        )
+                        # Mark as slightly stale (1 hour old) so a live backtest
+                        # will refresh it after the first trade cycle, but the
+                        # EV gate won't be blind immediately after restart.
+                        _stale_ts = datetime.now() - __import__('datetime').timedelta(hours=1)
+                        self._backtest_cache[_cache_key] = (_restored, _stale_ts)
+                logger.info(f"Warmed backtest cache: {len(self._backtest_cache)} entries from DB")
+            except Exception as _bt_warm_err:
+                logger.debug(f"Backtest cache warm-up skipped: {_bt_warm_err}")
         except Exception as e:
             logger.error(f"Failed to auto-register agents: {e}")
 
@@ -1967,25 +2131,27 @@ class AgentScheduler:
                             self._recent_closes[_cooldown_key] = datetime.now()
 
                             if pos.agent_id and pos.agent_id in self._agent_metrics:
-                                m = self._agent_metrics[pos.agent_id]
-                                m.total_pnl += pnl
-                                # Determine exit reason before recording
+                                # Arrr, route through _record_run so actual_trades, winning_trades,
+                                # win_rate, and the DB persist all fire in one place.
+                                # The old path only patched total_pnl directly and left a comment
+                                # that _record_run would handle the rest — it never did.
                                 _exit_type_pre = "trailing-stop" if "Trailing" in check.reason else (
                                     "take-profit" if "Take-profit" in check.reason else "stop-loss"
                                 )
-                                # Add this close to the agent_runs buffer so win rate is consistent
-                                self._agent_runs.append(AgentRun(
+                                self._record_run(
                                     agent_id=pos.agent_id,
-                                    timestamp=datetime.now(),
                                     symbol=pos.symbol,
                                     signal="sell" if not is_short else "buy",
-                                    confidence=0,
+                                    confidence=0.0,
                                     price=current_price,
                                     executed=True,
                                     pnl=pnl,
-                                    exit_reason=_exit_type_pre,
-                                ))
-                                # Win rate is updated by _record_run when pnl is set
+                                    strategy_type=self._enabled_agents.get(pos.agent_id, {}).get("strategy_type"),
+                                    use_paper=_pos_is_paper,
+                                )
+                                # Tag the run buffer entry with exit reason for team context
+                                if self._agent_runs:
+                                    self._agent_runs[-1].exit_reason = _exit_type_pre
 
                             # Log to team chat
                             from app.services.team_chat import team_chat
@@ -2487,6 +2653,7 @@ class AgentScheduler:
                         "trailing_stop_pct": a.config.get("trailing_stop_pct", 3.0),
                         "timeframe": a.config.get("timeframe", "1h"),
                         "trader_id": a.trader_id,
+                        "venue": a.venue or "phemex",
                     }
                     for a in agents
                 ]
@@ -2721,6 +2888,9 @@ class AgentScheduler:
 
                     # Store for per-agent performance gating in run_agent
                     self._current_trader_perf = {p["trader_id"]: p for p in trader_perf_list}
+                    # Also store agent-level perf so run_agent can gate on individual agent P&L,
+                    # not just the trader aggregate (which masks a bad agent behind good siblings).
+                    self._current_agent_perf = _db_agent_perf  # {agent_id: {net_pnl, win_rate, total_trades}}
 
                     # ── Phase 9.1: Consistency & probation flags ────────────
                     # Full-pool model: allocation % is no longer the sizing lever
@@ -2986,7 +3156,11 @@ class AgentScheduler:
             logger.error(f"Daily report generation failed: {e}")
 
     async def _maybe_send_daily_email(self):
-        """Send the daily summary email once at 5pm (configurable)."""
+        """Send the daily summary email once at 5pm (configurable).
+
+        The guard is persisted in daily_reports.email_sent_at so it survives
+        container restarts. The in-memory flag is a fast-path cache only.
+        """
         try:
             from app.config import settings as cfg
             from app.services.email_service import email_service
@@ -2998,13 +3172,26 @@ class AgentScheduler:
             target_hour = cfg.mail_daily_hour  # default 17 (5pm)
             today_str = now.strftime("%Y-%m-%d")
 
-            # Already sent today?
+            # Fast-path: already confirmed sent in this process lifetime
             if self._last_daily_email_date == today_str:
                 return
 
-            # Not yet 5pm?
+            # Not yet target hour?
             if now.hour < target_hour:
                 return
+
+            # Slow-path: check DB in case we restarted since the email was sent
+            from app.database import get_async_session
+            from app.models import DailyReport as _DailyReport
+            from sqlalchemy import select as _sel
+            async with get_async_session() as _db:
+                _row = (await _db.execute(
+                    _sel(_DailyReport).where(_DailyReport.report_date == today_str)
+                )).scalar_one_or_none()
+                if _row and getattr(_row, "email_sent_at", None):
+                    # Email already sent for today — update in-memory cache and bail
+                    self._last_daily_email_date = today_str
+                    return
 
             logger.info("Sending daily summary email")
             report = await daily_report_service.generate_daily_report(force=True)
@@ -3012,6 +3199,16 @@ class AgentScheduler:
                 ok = await email_service.send_daily_summary(report)
                 if ok:
                     self._last_daily_email_date = today_str
+
+                    # Persist sent timestamp to DB so restarts don't re-send
+                    async with get_async_session() as _db2:
+                        _row2 = (await _db2.execute(
+                            _sel(_DailyReport).where(_DailyReport.report_date == today_str)
+                        )).scalar_one_or_none()
+                        if _row2:
+                            _row2.email_sent_at = datetime.utcnow()
+                            await _db2.commit()
+
                     await team_chat.add_message(
                         agent_role="cio",
                         content="📧 Daily summary email dispatched to the trading team.",
@@ -3507,6 +3704,30 @@ class AgentScheduler:
                 executed=False,
                 error="No trading pairs configured"
             )
+
+        # ── P&L suspension check ───────────────────────────────────────────
+        # If the agent was suspended by the P&L gate, block all new entries until
+        # a human reviewer (trader / risk manager) explicitly clears the flag via
+        # POST /agents/{id}/unsuspend. This prevents the agent silently being
+        # re-blocked every cycle — the suspension sticks until reviewed.
+        try:
+            from app.database import get_async_session
+            from app.models import Agent as _AgentModel
+            async with get_async_session() as _db:
+                _agent_db = await _db.get(_AgentModel, agent_id)
+                if _agent_db and getattr(_agent_db, "is_pnl_suspended", False):
+                    return AgentRun(
+                        agent_id=agent_id,
+                        timestamp=timestamp,
+                        symbol=trading_pairs[0] if trading_pairs else "",
+                        signal="hold",
+                        confidence=0,
+                        price=0,
+                        executed=False,
+                        error="P&L suspended — awaiting team review",
+                    )
+        except Exception as _susp_err:
+            logger.debug(f"P&L suspension check failed for {name}: {_susp_err}")
         
         # ── Scan ALL pairs, pick the best opportunity ──────────────────────
         # Watchlisted symbols (near-miss from the previous cycle) are prepended
@@ -3517,7 +3738,8 @@ class AgentScheduler:
             _wage, _wagent = _wkey.split(":", 1)
             if _wage != agent_id:
                 continue
-            if (_now - _wentry["at"]).total_seconds() > self._WATCHLIST_TTL_SECS:
+            _wttl = _wentry.get("ttl_secs", self._WATCHLIST_TTL_SECS)
+            if (_now - _wentry["at"]).total_seconds() > _wttl:
                 del self._setup_watchlist[_wkey]
                 continue
             _wsym = _wkey.split(":", 1)[1]
@@ -3648,21 +3870,46 @@ class AgentScheduler:
 
                     # ── LLM pre-filter: skip the LLM when indicators say hold ──
                     # Run the deterministic indicator engine first (already have the df,
-                    # cost is near-zero). Only invoke the LLM when indicators show a
-                    # directional signal with >= 50% conviction — roughly 60-80% of
-                    # cycles will be skipped, cutting AI-agent LLM calls dramatically.
+                    # cost is near-zero). Only invoke the LLM when indicators show enough
+                    # directional conviction. Threshold is per-strategy and regime-aware:
+                    #   - trending strategies in a trending regime: lower bar (0.42) — indicators align well
+                    #   - mean-reversion in ranging: lower bar (0.42) — ideal regime
+                    #   - scalping: higher bar (0.58) — needs clean setup before LLM cost
+                    #   - any strategy in an adverse/ranging-for-trend regime: raised by 0.08
+                    _PRE_FILTER_BASE = {
+                        "momentum":       0.45,
+                        "breakout":       0.45,
+                        "trend_following": 0.42,
+                        "ema_crossover":  0.44,
+                        "mean_reversion": 0.42,
+                        "scalping":       0.58,
+                        "grid":           0.55,
+                        "ai":             0.45,
+                    }
+                    _pre_threshold = _PRE_FILTER_BASE.get(strategy_type, 0.50)
+                    _regime_for_pre = market_context.get("regime", "") if market_context else ""
+                    _strategy_prefers_trend = strategy_type in ("momentum", "breakout", "trend_following", "ema_crossover")
+                    _strategy_prefers_range = strategy_type in ("mean_reversion", "grid")
+                    _adverse_regime = (
+                        (_strategy_prefers_trend and _regime_for_pre in ("ranging", "low_volatility")) or
+                        (_strategy_prefers_range and _regime_for_pre in ("trending_up", "trending_down"))
+                    )
+                    if _adverse_regime:
+                        _pre_threshold = min(0.75, _pre_threshold + 0.08)
+
                     _pre_config = {
-                        'strategy': 'momentum',
+                        'strategy': strategy_type,
                         'indicators_config': self._enabled_agents.get(agent_id, {}).get('indicators_config', {}),
                     }
                     _pre_result = self.indicator_service.generate_signal(df, _pre_config, market_context=market_context)
                     _pre_sig = _pre_result.signal.value if _pre_result.signal else 'hold'
                     _pre_conf = _pre_result.confidence
 
-                    if _pre_sig == 'hold' or _pre_conf < 0.50:
+                    if _pre_sig == 'hold' or _pre_conf < _pre_threshold:
                         logger.debug(
                             f"AI agent {name} on {candidate_symbol}: "
-                            f"indicator pre-filter skipped LLM (sig={_pre_sig}, conf={_pre_conf:.2f})"
+                            f"indicator pre-filter skipped LLM (sig={_pre_sig}, conf={_pre_conf:.2f}, "
+                            f"threshold={_pre_threshold:.2f}, regime={_regime_for_pre or 'unknown'})"
                         )
                         sig = 'hold'
                         conf = _pre_conf
@@ -3701,7 +3948,27 @@ class AgentScheduler:
                         'strategy': strategy_type,
                         'indicators_config': _agent_cfg_ind.get('indicators_config', {}),
                     }
-                    signal_result = self.indicator_service.generate_signal(df, _ind_config, market_context=market_context)
+                    # Enrich market_context with lightweight team signals for non-AI agents:
+                    # whale bias direction and risk manager level so the indicator engine
+                    # can apply small confidence adjustments without incurring LLM cost.
+                    _enriched_ctx = dict(market_context) if market_context else {}
+                    try:
+                        from app.services.whale_intelligence import whale_intelligence as _whale_svc_ind
+                        _wr_ind = await _whale_svc_ind.fetch_whale_report()
+                        if _wr_ind:
+                            _coin_ind = _whale_svc_ind.symbol_to_coin(candidate_symbol)
+                            _bias_ind = _wr_ind.coin_biases.get(_coin_ind)
+                            if _bias_ind:
+                                _enriched_ctx["whale_bias"] = _bias_ind.bias
+                    except Exception:
+                        pass
+                    if self._current_risk_assessment:
+                        _enriched_ctx["risk_level"] = self._current_risk_assessment.risk_level
+                    if self._current_analyst_report:
+                        _reg = getattr(self._current_analyst_report, "market_regime", None)
+                        if _reg and not _enriched_ctx.get("regime"):
+                            _enriched_ctx["regime"] = getattr(_reg, "regime", "")
+                    signal_result = self.indicator_service.generate_signal(df, _ind_config, market_context=_enriched_ctx)
                     sig = signal_result.signal.value if signal_result.signal else 'hold'
                     conf = signal_result.confidence
                     reas = getattr(signal_result, 'reasoning', '')
@@ -3718,7 +3985,8 @@ class AgentScheduler:
                 # Above the upper bound: remove (setup either traded or expired strong).
                 _wk = f"{agent_id}:{candidate_symbol}"
                 if sig in ('buy', 'sell') and self._WATCHLIST_CONF_LOW <= conf <= self._WATCHLIST_CONF_HIGH:
-                    self._setup_watchlist[_wk] = {"confidence": conf, "signal": sig, "at": datetime.now()}
+                    _wl_ttl = self._WATCHLIST_TF_SECS.get(timeframe, 3600) * 4
+                    self._setup_watchlist[_wk] = {"confidence": conf, "signal": sig, "at": datetime.now(), "ttl_secs": _wl_ttl}
                     logger.debug(f"Watchlist ADD {candidate_symbol} conf={conf:.2f} sig={sig}")
                 elif conf > self._WATCHLIST_CONF_HIGH or sig == 'hold':
                     self._setup_watchlist.pop(_wk, None)
@@ -4048,6 +4316,94 @@ class AgentScheduler:
                             f"{_pre_dz_conf:.0%} → {confidence:.0%} (-{_dz_penalty:.0%}), trade proceeds"
                         )
 
+            # ── Agent-level P&L hard block ──────────────────────────────────────────
+            # A high win-rate agent can still be deeply unprofitable when its losses
+            # are much larger than its wins (bad R/R ratio). The trader-level gate
+            # misses this when other agents under the same trader are profitable.
+            # This gate checks the individual agent's cumulative net P&L against a
+            # configurable floor and blocks new entries when it's breached, regardless
+            # of win rate.
+            if signal in ('buy', 'sell') and confidence >= _effective_min_entry_conf:
+                _agent_net_pnl = float(
+                    (self._current_agent_perf.get(agent_id) or {}).get("net_pnl", 0.0) or 0.0
+                )
+                _agent_trades = int(
+                    (self._current_agent_perf.get(agent_id) or {}).get("total_trades", 0) or 0
+                )
+                try:
+                    _apnl_floor = float(getattr(_get_gates(), "agent_pnl_floor", -500.0) or -500.0)
+                    _apnl_min_trades = int(getattr(_get_gates(), "agent_pnl_min_trades", 10) or 10)
+                except Exception:
+                    _apnl_floor = -500.0
+                    _apnl_min_trades = 10
+
+                if _agent_trades >= _apnl_min_trades and _agent_net_pnl <= _apnl_floor:
+                    _apnl_reason = (
+                        f"Agent P&L floor breached: {name} cumulative net P&L ${_agent_net_pnl:+.2f} "
+                        f"≤ floor ${_apnl_floor:+.2f} after {_agent_trades} trades. "
+                        f"Win rate {float((self._current_agent_perf.get(agent_id) or {}).get('win_rate', 0) or 0):.0%} "
+                        f"but losses outweigh wins — suspended pending team review."
+                    )
+                    logger.warning(f"AGENT P&L GATE suspended {name} {signal.upper()} {symbol}: {_apnl_reason}")
+
+                    # Write suspension flag to DB so it persists across restarts
+                    # and requires explicit human action to clear (not just waiting for P&L to improve).
+                    try:
+                        from app.database import get_async_session
+                        from app.models import Agent as _AgentModel
+                        async with get_async_session() as _susp_db:
+                            _susp_agent = await _susp_db.get(_AgentModel, agent_id)
+                            if _susp_agent and not getattr(_susp_agent, "is_pnl_suspended", False):
+                                _susp_agent.is_pnl_suspended = True
+                                _susp_agent.pnl_suspended_reason = _apnl_reason
+                                _susp_agent.pnl_suspended_at = datetime.utcnow()
+                                await _susp_db.commit()
+                    except Exception as _susp_write_err:
+                        logger.error(f"Failed to write P&L suspension for {name}: {_susp_write_err}")
+
+                    self._record_run(agent_id, symbol, signal, confidence, current_price, False, error="Agent P&L suspended")
+                    await team_chat.log_trade_blocked(
+                        trader_name=_trader_name,
+                        trader_avatar=_trader_avatar,
+                        agent_name=name,
+                        symbol=symbol,
+                        side=signal,
+                        reason=_apnl_reason,
+                    )
+                    # Alert the team once so the trader is aware this agent needs review
+                    _apnl_alert_key = f"_apnl_alerted_{agent_id}"
+                    if not getattr(self, _apnl_alert_key, False):
+                        setattr(self, _apnl_alert_key, True)
+                        asyncio.create_task(team_chat.add_message(
+                            agent_role="risk_manager",
+                            content=(
+                                f"🔴 **Agent Suspended for Review — {name}**: cumulative net P&L ${_agent_net_pnl:+.2f} "
+                                f"has breached the ${_apnl_floor:+.2f} floor after {_agent_trades} trades. "
+                                f"The agent has been **suspended** and will not trade until a team member reviews it "
+                                f"and clears the suspension via the Agents panel. "
+                                f"Win rate ({float((self._current_agent_perf.get(agent_id) or {}).get('win_rate', 0) or 0):.0%}) "
+                                f"is misleading — average loss is significantly larger than average win. "
+                                f"**Action required:** review SL/TP configuration before re-enabling, "
+                                f"or wait for market conditions to shift to a regime this strategy suits."
+                            ),
+                            message_type="alert",
+                        ))
+                    return AgentRun(
+                        agent_id=agent_id,
+                        timestamp=datetime.now(),
+                        symbol=symbol,
+                        signal="hold",
+                        confidence=0,
+                        price=current_price,
+                        executed=False,
+                        error="Agent P&L suspended",
+                    )
+                elif _agent_trades >= _apnl_min_trades and _agent_net_pnl < 0:
+                    # P&L is negative but not yet at the floor — clear the alert flag
+                    # so it re-fires if the agent later breaches the floor after a partial recovery
+                    setattr(self, f"_apnl_alerted_{agent_id}", False)
+            # ── End agent P&L gate ────────────────────────────────────────────────────
+
             if signal in ['buy', 'sell'] and confidence >= _effective_min_entry_conf:
                 # Announce trade intent to the team before gates run
                 await team_chat.log_trade_intent(
@@ -4174,10 +4530,13 @@ class AgentScheduler:
                     logger.debug(f"Range sanity check skipped ({_range_err})")
 
                 # Minimum profit gate: reject trades where TP doesn't cover round-trip fees
-                # Use spot fee rate for USDT pairs, contract rate for coin-margined
-                # Phemex spot taker: 0.1% | Phemex contract taker: 0.06%
+                # Use venue-aware fee rate: Hyperliquid 0.035% | Phemex spot 0.1% | Phemex contract 0.06%
+                _agent_fee_venue = self._enabled_agents.get(agent_id, {}).get("venue", "phemex")
                 _is_spot = symbol.endswith("USDT")
-                _taker_fee_pct = 0.10 if _is_spot else 0.06
+                if _agent_fee_venue == "hyperliquid":
+                    _taker_fee_pct = 0.035  # HL perps: 0.035% taker (flat, all pairs)
+                else:
+                    _taker_fee_pct = 0.10 if _is_spot else 0.06
                 round_trip_fee_pct = _taker_fee_pct * 2
                 net_tp_pct = take_profit_pct - round_trip_fee_pct
                 if net_tp_pct < _min_net_tp_pct:
@@ -4539,10 +4898,49 @@ class AgentScheduler:
                             executed=False, error=_corr_reason,
                         )
                     # Total directional concentration check (now with dynamic limit)
-                    _dir_value = sum(
-                        p.quantity * (p.current_price or p.entry_price or 0)
-                        for p in _all_open if p.side == _target_side
-                    )
+                    # Use margin (capital committed) not full notional, so leveraged
+                    # positions don't falsely inflate the directional exposure figure.
+                    # position_value is already in margin terms (fund % × multipliers).
+                    #
+                    # Fallback chain for margin:
+                    #   1. p.margin_used (set by paper_trading or position_sync ← Phemex)
+                    #   2. notional / p.leverage (if leverage stored but margin not)
+                    #   3. Look up leverage from most recent Trade for this agent/symbol
+                    #   4. notional / 1.0 (conservative fallback)
+                    async def _p_margin_async(p) -> float:
+                        notional = p.quantity * (p.current_price or p.entry_price or 0)
+                        margin = float(getattr(p, 'margin_used', 0) or 0)
+                        if margin > 0:
+                            return margin
+                        lev = float(getattr(p, 'leverage', 1.0) or 1.0)
+                        if lev > 1.0:
+                            return notional / lev
+                        # Leverage missing from position record — look up from Trade history
+                        try:
+                            from app.database import get_async_session
+                            from app.models import Trade as _Trade, OrderSide as _OS
+                            from sqlalchemy import select as _sel
+                            async with get_async_session() as _db:
+                                _t = await _db.scalar(
+                                    _sel(_Trade)
+                                    .where(
+                                        _Trade.symbol == p.symbol,
+                                        _Trade.side == _OS.BUY,
+                                        _Trade.status.in_(["filled", "FILLED"]),
+                                    )
+                                    .order_by(_Trade.filled_at.desc())
+                                    .limit(1)
+                                )
+                                if _t and (_t.leverage or 0) > 1.0:
+                                    return notional / float(_t.leverage)
+                        except Exception:
+                            pass
+                        return notional  # conservative: treat as 1× if unknown
+
+                    _dir_value = 0.0
+                    for _p in _all_open:
+                        if _p.side == _target_side:
+                            _dir_value += await _p_margin_async(_p)
                     _new_dir_pct = (_dir_value + position_value) / total_fund * 100 if total_fund > 0 else 0
                     if _new_dir_pct > _max_conc_pct:
                         _conc_reason = (
@@ -4915,6 +5313,38 @@ class AgentScheduler:
                                 )
                                 if _pos:
                                     _pos.scale_out_levels = json.dumps(_scale_levels)
+                                    # Write indicator snapshot so retrospective analysis
+                                    # can correlate entry conditions with outcomes.
+                                    # Computed inline to avoid a full calculate_all re-run.
+                                    try:
+                                        import pandas as _pd_ei
+                                        _ei_close = df['close'].astype(float)
+                                        _ei_high  = df['high'].astype(float)
+                                        _ei_low   = df['low'].astype(float)
+                                        _ei_rsi_s = self.indicator_service.calculate_rsi(_ei_close)
+                                        _ei_rsi   = float(_ei_rsi_s.iloc[-1]) if not _pd_ei.isna(_ei_rsi_s.iloc[-1]) else None
+                                        _ei_atr_s = self.indicator_service.calculate_atr(_ei_high, _ei_low, _ei_close)
+                                        _ei_atr   = float(_ei_atr_s.iloc[-1]) if not _pd_ei.isna(_ei_atr_s.iloc[-1]) else None
+                                        _ei_atr_pct = round(_ei_atr / current_price * 100, 3) if _ei_atr and current_price else None
+                                        _ei_macd_d  = self.indicator_service.calculate_macd(_ei_close)
+                                        _ei_hist    = float(_ei_macd_d['histogram'].iloc[-1]) if not _pd_ei.isna(_ei_macd_d['histogram'].iloc[-1]) else None
+                                        _ei_sma20   = float(self.indicator_service.calculate_sma(_ei_close, 20).iloc[-1])
+                                        _ei_sma50   = float(self.indicator_service.calculate_sma(_ei_close, 50).iloc[-1])
+                                        _ei_trend   = "up" if current_price > _ei_sma20 > _ei_sma50 else ("down" if current_price < _ei_sma20 < _ei_sma50 else "sideways")
+                                        _ei_adx_s   = self.indicator_service.calculate_adx(_ei_high, _ei_low, _ei_close) if len(df) >= 28 else None
+                                        _ei_adx     = float(_ei_adx_s.iloc[-1]) if _ei_adx_s is not None and not _pd_ei.isna(_ei_adx_s.iloc[-1]) else None
+                                        _ei_bb      = self.indicator_service.calculate_bollinger_bands(_ei_close)
+                                        _ei_bb_pos  = round((current_price - float(_ei_bb['lower'].iloc[-1])) / max(float(_ei_bb['upper'].iloc[-1]) - float(_ei_bb['lower'].iloc[-1]), 1e-9), 3) if not _pd_ei.isna(_ei_bb['upper'].iloc[-1]) else None
+                                        _pos.entry_indicators = {
+                                            "rsi": round(_ei_rsi, 2) if _ei_rsi is not None else None,
+                                            "atr_pct": _ei_atr_pct,
+                                            "macd_hist_sign": (1 if _ei_hist > 0 else -1) if _ei_hist is not None else None,
+                                            "trend": _ei_trend,
+                                            "adx": round(_ei_adx, 2) if _ei_adx is not None else None,
+                                            "bb_position": _ei_bb_pos,
+                                        }
+                                    except Exception as _ei_err:
+                                        logger.debug(f"Entry indicator snapshot failed (non-fatal): {_ei_err}")
                                     await _db.commit()
                         except Exception as _sol_err:
                             logger.debug(f"Scale-out level write failed: {_sol_err}")
@@ -4948,7 +5378,11 @@ class AgentScheduler:
                         )
                 elif not use_paper:
                     try:
-                        from app.services.live_trading import live_trading as _live_svc
+                        _agent_venue = self._enabled_agents.get(agent_id, {}).get("venue", "phemex")
+                        if _agent_venue == "hyperliquid":
+                            from app.services.hl_live_trading import hl_live_trading as _live_svc
+                        else:
+                            from app.services.live_trading import live_trading as _live_svc
                         _agent_cfg_live = self._enabled_agents.get(agent_id, {})
                         _trader_id_live = _agent_cfg_live.get("trader_id")
                         order = await _live_svc.place_order(
@@ -5014,6 +5448,36 @@ class AgentScheduler:
                                 )
                                 if _live_pos:
                                     _live_pos.scale_out_levels = json.dumps(_live_scale_levels)
+                                    # Same entry indicator snapshot as paper path.
+                                    try:
+                                        import pandas as _pd_ei_live
+                                        _ei2_close = df['close'].astype(float)
+                                        _ei2_high  = df['high'].astype(float)
+                                        _ei2_low   = df['low'].astype(float)
+                                        _ei2_rsi_s = self.indicator_service.calculate_rsi(_ei2_close)
+                                        _ei2_rsi   = float(_ei2_rsi_s.iloc[-1]) if not _pd_ei_live.isna(_ei2_rsi_s.iloc[-1]) else None
+                                        _ei2_atr_s = self.indicator_service.calculate_atr(_ei2_high, _ei2_low, _ei2_close)
+                                        _ei2_atr   = float(_ei2_atr_s.iloc[-1]) if not _pd_ei_live.isna(_ei2_atr_s.iloc[-1]) else None
+                                        _ei2_atr_p = round(_ei2_atr / current_price * 100, 3) if _ei2_atr and current_price else None
+                                        _ei2_macd  = self.indicator_service.calculate_macd(_ei2_close)
+                                        _ei2_hist  = float(_ei2_macd['histogram'].iloc[-1]) if not _pd_ei_live.isna(_ei2_macd['histogram'].iloc[-1]) else None
+                                        _ei2_sma20 = float(self.indicator_service.calculate_sma(_ei2_close, 20).iloc[-1])
+                                        _ei2_sma50 = float(self.indicator_service.calculate_sma(_ei2_close, 50).iloc[-1])
+                                        _ei2_trend = "up" if current_price > _ei2_sma20 > _ei2_sma50 else ("down" if current_price < _ei2_sma20 < _ei2_sma50 else "sideways")
+                                        _ei2_adx_s = self.indicator_service.calculate_adx(_ei2_high, _ei2_low, _ei2_close) if len(df) >= 28 else None
+                                        _ei2_adx   = float(_ei2_adx_s.iloc[-1]) if _ei2_adx_s is not None and not _pd_ei_live.isna(_ei2_adx_s.iloc[-1]) else None
+                                        _ei2_bb    = self.indicator_service.calculate_bollinger_bands(_ei2_close)
+                                        _ei2_bb_p  = round((current_price - float(_ei2_bb['lower'].iloc[-1])) / max(float(_ei2_bb['upper'].iloc[-1]) - float(_ei2_bb['lower'].iloc[-1]), 1e-9), 3) if not _pd_ei_live.isna(_ei2_bb['upper'].iloc[-1]) else None
+                                        _live_pos.entry_indicators = {
+                                            "rsi": round(_ei2_rsi, 2) if _ei2_rsi is not None else None,
+                                            "atr_pct": _ei2_atr_p,
+                                            "macd_hist_sign": (1 if _ei2_hist > 0 else -1) if _ei2_hist is not None else None,
+                                            "trend": _ei2_trend,
+                                            "adx": round(_ei2_adx, 2) if _ei2_adx is not None else None,
+                                            "bb_position": _ei2_bb_p,
+                                        }
+                                    except Exception as _ei2_err:
+                                        logger.debug(f"Live entry indicator snapshot failed (non-fatal): {_ei2_err}")
                                     await _db.commit()
                         except Exception as _sol_err:
                             logger.debug(f"Live scale-out level write failed: {_sol_err}")
@@ -5058,7 +5522,8 @@ class AgentScheduler:
                         reason=_no_exec_reason,
                     )
             
-            self._record_run(agent_id, symbol, signal, confidence, current_price, executed, pnl, use_paper=use_paper)
+            _llm_reasoning_to_store = reasoning if strategy_type == "ai" else None
+            self._record_run(agent_id, symbol, signal, confidence, current_price, executed, pnl, use_paper=use_paper, llm_reasoning=_llm_reasoning_to_store)
             
             return AgentRun(
                 agent_id=agent_id,
@@ -5120,6 +5585,7 @@ class AgentScheduler:
         error: Optional[str] = None,
         strategy_type: Optional[str] = None,
         use_paper: bool = True,
+        llm_reasoning: Optional[str] = None,
     ):
         run = AgentRun(
             agent_id=agent_id,
@@ -5131,6 +5597,7 @@ class AgentScheduler:
             executed=executed,
             pnl=pnl,
             error=error,
+            llm_reasoning=llm_reasoning,
         )
         self._agent_runs.append(run)
         if len(self._agent_runs) > 1000:
@@ -5157,9 +5624,19 @@ class AgentScheduler:
                 metrics.winning_trades += 1
             metrics.total_pnl += pnl
             metrics.avg_pnl = metrics.total_pnl / metrics.actual_trades if metrics.actual_trades > 0 else 0
-        # Win rate = winning closed trades / all closed trades
-        # Uses persistent counters — not the prunable _agent_runs buffer
-        if metrics.actual_trades > 0:
+            # Per-venue attribution
+            _run_venue = self._enabled_agents.get(agent_id, {}).get("venue", "phemex")
+            _vs = metrics.venue_stats.setdefault(_run_venue, {"trades": 0, "wins": 0, "pnl": 0.0})
+            _vs["trades"] += 1
+            if pnl > 0:
+                _vs["wins"] += 1
+            _vs["pnl"] = round(_vs["pnl"] + pnl, 4)
+            _vs["win_rate"] = round(_vs["wins"] / _vs["trades"], 4) if _vs["trades"] > 0 else 0.0
+        # Win rate = winning closed trades / all closed trades.
+        # Only computed once we have a statistically meaningful sample — below
+        # _WIN_RATE_MIN_SAMPLE the value is None so strategy_review scores
+        # the agent as neutral rather than punishing an unlucky early streak.
+        if metrics.actual_trades >= _WIN_RATE_MIN_SAMPLE:
             metrics.win_rate = metrics.winning_trades / metrics.actual_trades
 
         asyncio.create_task(self._persist_run(run, metrics, strategy_type, use_paper))
@@ -5186,6 +5663,7 @@ class AgentScheduler:
                     error=run.error,
                     strategy_type=strategy_type,
                     use_paper=use_paper,
+                    llm_reasoning=run.llm_reasoning,
                 ))
                 stmt = pg_insert(AgentMetricRecord).values(
                     agent_id=metrics.agent_id,
@@ -5202,6 +5680,7 @@ class AgentScheduler:
                     win_rate=metrics.win_rate,
                     avg_pnl=metrics.avg_pnl,
                     last_run=metrics.last_run,
+                    venue_stats=metrics.venue_stats,
                 ).on_conflict_do_update(
                     index_elements=["agent_id", "is_paper"],
                     set_=dict(
@@ -5217,6 +5696,7 @@ class AgentScheduler:
                         win_rate=metrics.win_rate,
                         avg_pnl=metrics.avg_pnl,
                         last_run=metrics.last_run,
+                        venue_stats=metrics.venue_stats,
                     ),
                 )
                 await db.execute(stmt)
@@ -5871,6 +6351,11 @@ class AgentScheduler:
                         ]
                         strategy = action.get("strategy_type", "momentum")
 
+                        # Resolve venue — hyperliquid is always valid for paper trading;
+                        # live execution gates on the wallet key at order time.
+                        _requested_venue = action.get("venue", "phemex")
+                        venue = _requested_venue if _requested_venue in ("phemex", "hyperliquid") else "phemex"
+
                         # Derive a canonical name from the primary symbol + strategy so the
                         # name always reflects what the agent actually trades, regardless of
                         # what the LLM proposed (e.g. avoid "XRP_Momentum" trading SANDUSDT).
@@ -5889,6 +6374,7 @@ class AgentScheduler:
                             trader_id=trader["id"],
                             name=agent_name,
                             strategy_type=strategy,
+                            venue=venue,
                             config={
                                 "trading_pairs": trading_pairs,
                                 "auto_created": True,
@@ -5917,11 +6403,14 @@ class AgentScheduler:
                             "stop_loss_pct": action.get("stop_loss_pct", risk.default_stop_loss_pct),
                             "take_profit_pct": action.get("take_profit_pct", risk.default_take_profit_pct),
                             "trailing_stop_pct": action.get("trailing_stop_pct", 3.0),
+                            "venue": venue,
                         }
                         self.register_agent(agent_config)
+                        from app.services.trading_service import trading_service
+                        trading_service.set_agent_venue(new_agent.id, venue)
                         await self._bootstrap_from_backtest(agent_config)
                         result_msg = (
-                            f"Trader {trader['name']} created agent '{agent_name}' ({strategy})"
+                            f"Trader {trader['name']} created agent '{agent_name}' ({strategy}, venue={venue})"
                         )
                         logger.info(f"Trader strategy action: {result_msg}")
 
@@ -5966,6 +6455,37 @@ class AgentScheduler:
                                     config['_last_run'] = datetime.now()
                                 result_msg = f"Trader {trader['name']} enabled agent {agent.name}"
                                 logger.info(f"Trader strategy action: {result_msg}")
+
+                elif act == "adjust_params":
+                    agent_id = action.get("agent_id")
+                    params = action.get("params") or {}
+                    if agent_id and params:
+                        async with get_async_session() as db:
+                            agent = await db.get(DBAgent, agent_id)
+                            if agent and agent.trader_id == trader["id"]:
+                                changed = []
+                                # SL/TP/trailing adjustments
+                                for _field in ("stop_loss_pct", "take_profit_pct", "trailing_stop_pct", "allocation_percentage"):
+                                    if _field in params:
+                                        setattr(agent, _field, params[_field])
+                                        changed.append(f"{_field}={params[_field]}")
+                                # Venue change — validate and re-route
+                                if "venue" in params:
+                                    _new_venue = params["venue"]
+                                    # Hyperliquid is always valid for paper trading;
+                                    # live execution gates on the wallet key at order time.
+                                    _new_venue = _new_venue if _new_venue in ("phemex", "hyperliquid") else "phemex"
+                                    agent.venue = _new_venue
+                                    changed.append(f"venue={_new_venue}")
+                                    # Update in-memory routing immediately
+                                    from app.services.trading_service import trading_service as _ts_adj
+                                    _ts_adj.set_agent_venue(agent_id, _new_venue)
+                                    if agent_id in self._enabled_agents:
+                                        self._enabled_agents[agent_id]["venue"] = _new_venue
+                                if changed:
+                                    await db.commit()
+                                    result_msg = f"Trader {trader['name']} adjusted {agent.name}: {', '.join(changed)}"
+                                    logger.info(f"Trader strategy action: {result_msg}")
 
                 if result_msg:
                     await team_chat.add_message(

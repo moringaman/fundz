@@ -116,6 +116,14 @@ class Agent(Base):
     max_position_size = Column(Float, default=1000.0)
     risk_limit = Column(Float, default=100.0)
     run_interval_seconds = Column(Integer, default=300)
+    venue = Column(String(20), default="phemex")  # "phemex" | "hyperliquid"
+    # P&L suspension: set by the scheduler when cumulative net P&L breaches the
+    # configured floor (agent_pnl_floor). Must be cleared by a human reviewer
+    # (trader / risk manager) via POST /agents/{id}/unsuspend before the agent
+    # will trade again. Stores the reason so reviewers know what to address.
+    is_pnl_suspended = Column(Boolean, default=False, nullable=False)
+    pnl_suspended_reason = Column(Text, nullable=True)
+    pnl_suspended_at = Column(DateTime(timezone=True), nullable=True)
     last_run_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
@@ -224,6 +232,11 @@ class Position(Base):
     # Grid trading: link this position to a specific grid level
     grid_id = Column(String(36), nullable=True)
     grid_level_id = Column(String(36), nullable=True)
+    # Indicator snapshot at entry time — stored so the trade retrospective can
+    # identify which indicator regimes correlate with wins vs. losses without
+    # needing to post-hoc approximate from market data.
+    # Subset stored: {rsi, atr_pct, macd_hist_sign, trend, adx, bb_position}
+    entry_indicators = Column(JSON, nullable=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     __table_args__ = (
@@ -281,6 +294,7 @@ class AgentRunRecord(Base):
     error = Column(Text, nullable=True)
     strategy_type = Column(String(50), nullable=True)
     use_paper = Column(Boolean, default=True)
+    llm_reasoning = Column(Text, nullable=True)  # AI agent reasoning stored for self-learning
 
     __table_args__ = (
         Index("idx_agent_run_agent_id_ts", "agent_id", "timestamp"),
@@ -306,6 +320,10 @@ class AgentMetricRecord(Base):
     avg_pnl = Column(Float, default=0.0)
     last_run = Column(DateTime(timezone=True), nullable=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    # Per-venue breakdown — JSON dict keyed by venue name
+    # e.g. {"phemex": {"trades": 12, "pnl": 45.2, "win_rate": 0.58},
+    #        "hyperliquid": {"trades": 4, "pnl": 22.1, "win_rate": 0.75}}
+    venue_stats = Column(JSON, default=dict)
 
     __table_args__ = (
         UniqueConstraint("agent_id", "is_paper", name="uq_agent_metric_agent_mode"),
@@ -497,6 +515,9 @@ class DailyReport(Base):
     # CIO commentary
     cio_sentiment = Column(String(50), nullable=True)
     cio_summary = Column(Text, nullable=True)
+
+    # Email dispatch tracking — persisted so the guard survives container restarts
+    email_sent_at = Column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         Index("idx_daily_report_date", "report_date"),
@@ -720,3 +741,34 @@ class StrategyOverride(Base):
     notes = Column(Text, nullable=True)                     # admin notes / reason for override
 
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class StrategyInsightRecord(Base):
+    """Persisted output of TradeRetrospectiveService._compute_strategy_insights().
+
+    Survives container restarts so the scheduler can warm _current_trade_insights
+    before the first 20-minute retrospective cycle fires.  Without this the system
+    re-learns from scratch after every deploy, briefly firing at full confidence on
+    strategies that had been correctly penalised.
+    """
+    __tablename__ = "strategy_insight_records"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    strategy_type = Column(String(64), nullable=False)   # matches registry.yaml key
+    is_paper = Column(Boolean, nullable=False, default=True)
+    # Confidence multiplier: +0.10 (good), -0.20 (poor), 0.0 (neutral)
+    confidence_adj = Column(Float, default=0.0, nullable=False)
+    win_rate = Column(Float, nullable=True)
+    avg_win_pct = Column(Float, nullable=True)
+    avg_loss_pct = Column(Float, nullable=True)
+    trade_count = Column(Integer, default=0)
+    best_pattern = Column(String(100), nullable=True)
+    worst_pattern = Column(String(100), nullable=True)
+    strengths = Column(JSON, default=list)
+    weaknesses = Column(JSON, default=list)
+    confidence_adj_reason = Column(Text, nullable=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("strategy_type", "is_paper", name="uq_strategy_insight_type_mode"),
+    )

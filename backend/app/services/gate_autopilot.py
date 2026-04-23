@@ -140,12 +140,24 @@ class GateAutopilot:
     async def run_once(self) -> dict:
         """Evaluate metrics → classify regime → apply gate adjustments."""
         from app.database import get_async_session
-        from app.api.routes.settings import get_trading_gates, TradingGates
+        from app.api.routes.settings import get_trading_gates, TradingGates, _load_setting
 
         metrics = await self._gather_metrics()
         regime  = self._classify_regime(metrics)
         gates   = get_trading_gates()
-        new_gates, changes, reason = self._compute_adjustments(gates, regime, metrics)
+
+        # Arrr, respect the captain's manual orders.
+        # Use the operator's saved baseline so adjustments are relative to THEIR
+        # preferred values, not the factory defaults — otherwise every 30-min BALANCED
+        # cycle silently overwrites the manual saves and they think the UI is broken.
+        user_baseline: TradingGates
+        try:
+            baseline_data = await _load_setting("trading_gates_user_baseline")
+            user_baseline = TradingGates(**(baseline_data or {}))
+        except Exception:
+            user_baseline = TradingGates()
+
+        new_gates, changes, reason = self._compute_adjustments(gates, regime, metrics, user_baseline)
 
         # Only write to DB if something actually changed
         if changes:
@@ -394,11 +406,16 @@ class GateAutopilot:
         gates,
         regime: str,
         metrics: dict,
+        user_baseline=None,
     ):
         """Return (new_gates, changes_dict, human_reason)."""
         from app.api.routes.settings import TradingGates
 
-        defaults = TradingGates()   # factory-default values
+        # Arrr, the baseline is the captain's last saved preferences.
+        # If the crew hasn't set one yet we fall back to factory defaults.
+        # This is why adjustments feel relative to YOUR settings, not some
+        # hardcoded reference that ignores your manual saves.
+        defaults = user_baseline if user_baseline is not None else TradingGates()
         d = gates.model_dump()      # start from current live gates
         changes: dict = {}
         cld  = metrics["consecutive_losing_days"]

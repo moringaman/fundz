@@ -157,40 +157,6 @@ export function DailyReportPanel() {
               </div>
             )}
           </div>
-
-          {/* Agent Leaderboard */}
-          {report.agent_leaderboard && report.agent_leaderboard.length > 0 && (
-            <div className="daily-report-section" style={{ marginTop: '.75rem' }}>
-              <div className="daily-report-section-title">Agent Leaderboard</div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '.3rem' }}>
-                {report.agent_leaderboard.map((a: any, i: number) => (
-                  <div key={a.agent_id || i} style={{
-                    display: 'flex', alignItems: 'center', gap: '.6rem',
-                    padding: '.4rem .6rem', borderRadius: 6,
-                    background: i === 0 ? 'var(--green-dim)' : 'transparent',
-                  }}>
-                    <span style={{
-                      fontSize: '.7rem', fontWeight: 700, width: 20, textAlign: 'center',
-                      color: i === 0 ? 'var(--green)' : 'var(--text-dim)',
-                    }}>#{a.rank || i + 1}</span>
-                    <span style={{ flex: 1, fontSize: '.75rem', color: 'var(--text-primary)' }}>
-                      {a.name || a.agent_id}
-                    </span>
-                    <span style={{
-                      fontSize: '.75rem', fontFamily: 'var(--mono)', fontWeight: 700,
-                      color: pnlColor(a.total_pnl || 0),
-                    }}>
-                      ${(a.total_pnl || 0).toFixed(2)}
-                    </span>
-                    <span style={{ fontSize: '.65rem', color: 'var(--text-dim)' }}>
-                      WR {((a.win_rate || 0) * 100).toFixed(0)}%
-                    </span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
           {/* CIO Summary */}
           {report.cio_summary && (
             <div className="daily-report-section" style={{ marginTop: '.75rem' }}>
