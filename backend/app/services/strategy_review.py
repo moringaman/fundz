@@ -94,6 +94,39 @@ class StrategyReviewService:
             logger.error(f"Strategy review: confluence scoring failed: {e}")
             confluence_scores = {}
 
+        # Phase 3 — fetch latest sensitivity sweep per agent (best-effort).
+        # The most recent SensitivityRecord tells us whether the agent's chosen
+        # SL/TP/position-size sit on a plateau or knife-edge. Surfaced into the
+        # evaluation dict so downstream consumers (LLM prompts, UI) can reason
+        # about parameter fragility without re-running the sweep.
+        sensitivity_by_agent: Dict[str, Dict] = {}
+        try:
+            from sqlalchemy import select, desc
+            from app.models import SensitivityRecord
+            from app.database import get_async_session
+            agent_ids = [a['id'] for a in agents if a.get('id')]
+            if agent_ids:
+                async with get_async_session() as _sess:
+                    _q = (
+                        select(SensitivityRecord)
+                        .where(SensitivityRecord.agent_id.in_(agent_ids))
+                        .order_by(desc(SensitivityRecord.created_at))
+                    )
+                    _res = await _sess.execute(_q)
+                    for _row in _res.scalars().all():
+                        # Most recent wins; subsequent rows for same agent ignored
+                        if _row.agent_id and _row.agent_id not in sensitivity_by_agent:
+                            sensitivity_by_agent[_row.agent_id] = {
+                                'chosen_sharpe': _row.chosen_sharpe,
+                                'stability_score': _row.stability_score,
+                                'stability_tier': _row.stability_tier,
+                                'axis_x': _row.axis_x,
+                                'axis_y': _row.axis_y,
+                                'created_at': _row.created_at.isoformat() if _row.created_at else None,
+                            }
+        except Exception as _sens_err:
+            logger.debug(f"Sensitivity fetch failed (non-critical): {_sens_err}")
+
         # 3. Evaluate each agent
         agent_evaluations = []
         for agent in agents:
@@ -148,6 +181,12 @@ class StrategyReviewService:
                 'win_rate': win_rate,
                 'total_pnl': total_pnl,
             }
+            # Phase 3 — attach latest sensitivity sweep summary if available.
+            # Downstream (LLM prompts, UI) can reason about parameter fragility
+            # but the legacy scoring formula above is unchanged.
+            _sens = sensitivity_by_agent.get(agent_id)
+            if _sens:
+                evaluation['sensitivity'] = _sens
             agent_evaluations.append(evaluation)
 
         # 4. Propose actions — pass Marina's recommendations for regime-boosted scoring

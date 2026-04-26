@@ -450,6 +450,51 @@ class AgentDecision(Base):
     )
 
 
+class RegimeStateRecord(Base):
+    """Phase 4 — latest GMM regime classification per symbol.
+
+    One row per (symbol, refit). Most recent row per symbol is what
+    research_analyst reads as the statistical prior. Older rows kept for
+    audit trail (which regime did the model think we were in last week?).
+
+    The fitted GMM itself is NOT persisted here — only the classification and
+    enough metadata (label_centroids, fingerprint) to (a) detect drift across
+    refits and (b) seed the next refit's label-stability matching.
+    """
+    __tablename__ = "regime_states"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    symbol = Column(String(20), nullable=False)
+    timeframe = Column(String(10), default="1h")
+
+    # Argmax prediction at refit time
+    regime_label = Column(String(20), nullable=False)  # risk_off | range | risk_on
+    confidence = Column(Float, default=0.0)            # max posterior
+
+    # Full posterior over all labels — JSON because column count varies if we
+    # ever change n_components, and JSON keeps queries simple.
+    posteriors = Column(JSON, default=dict)
+
+    # Per-label centroid means [log_return, vol]; used for warm-start label
+    # stability across refits.
+    label_centroids = Column(JSON, default=dict)
+
+    # Hash of label_centroids; lets us detect "did the model meaningfully
+    # change?" without re-comparing centroids byte-by-byte.
+    model_fingerprint = Column(String(32), nullable=True)
+
+    # How many candles fed the fit; lower = lower confidence in the model itself
+    n_samples_fit = Column(Integer, default=0)
+    feature_window = Column(Integer, default=24)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("idx_regime_symbol_created", "symbol", "created_at"),
+        Index("idx_regime_created_at", "created_at"),
+    )
+
+
 class TeamChatMessageRecord(Base):
     """Persisted team chat messages for conversation history."""
     __tablename__ = "team_chat_messages"
@@ -553,6 +598,13 @@ class BacktestRecord(Base):
     # Extended data (stored as JSON for flexibility)
     equity_curve = Column(JSON, default=list)
     trades_data = Column(JSON, default=list)  # individual trade records
+    # Phase 1 — Monte Carlo bootstrap percentiles (final_pnl/max_drawdown/sharpe pXX
+    # plus downsampled equity_bands). Nullable so existing rows remain valid.
+    mc_summary = Column(JSON, nullable=True)
+    # Phase 2 — Walk-forward windows + degradation ratio. Stored on the same row
+    # as the full-period backtest that triggered it; one walk-forward run = one
+    # BacktestRecord with this populated and `source="walkforward"`.
+    walk_forward_summary = Column(JSON, nullable=True)
 
     # Source context
     source = Column(String(30), default="manual")  # manual, bootstrap, optimization, strategy_review
@@ -564,6 +616,51 @@ class BacktestRecord(Base):
         Index("idx_backtest_agent_id", "agent_id"),
         Index("idx_backtest_strategy", "strategy"),
         Index("idx_backtest_created_at", "created_at"),
+    )
+
+
+class SensitivityRecord(Base):
+    """Phase 3 — persisted strategy sensitivity sweep.
+
+    Distinct from BacktestRecord because the surface is N×M cells rather than a
+    single equity curve. Stored as one row with the full grid in JSON; headline
+    stats (chosen Sharpe, stability tier) get their own columns so queries can
+    filter without unpacking the JSON.
+    """
+    __tablename__ = "sensitivity_records"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    agent_id = Column(String(36), ForeignKey("agents.id", ondelete="SET NULL"), nullable=True)
+    symbol = Column(String(20), nullable=False)
+    strategy = Column(String(50), nullable=False)
+    interval = Column(String(10), default="1h")
+
+    axis_x = Column(String(30), nullable=False)
+    axis_y = Column(String(30), nullable=False)
+    chosen_x_value = Column(Float, nullable=False)
+    chosen_y_value = Column(Float, nullable=False)
+
+    chosen_sharpe = Column(Float, default=0.0)
+    chosen_net_pnl = Column(Float, default=0.0)
+    chosen_max_dd = Column(Float, default=0.0)
+
+    # std-dev of Sharpe over the chosen-cell's Moore neighbours; nullable when undefined
+    stability_score = Column(Float, nullable=True)
+    stability_tier = Column(String(20), default="unknown")  # plateau|moderate|knife_edge|unknown
+
+    n_cells_total = Column(Integer, default=0)
+    n_cells_valid = Column(Integer, default=0)
+
+    # Full surface dict: {axis_x, axis_y, values_x, values_y, cells[][]}
+    surface = Column(JSON, default=dict)
+
+    source = Column(String(30), default="manual")  # manual | strategy_review
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("idx_sensitivity_agent_id", "agent_id"),
+        Index("idx_sensitivity_strategy", "strategy"),
+        Index("idx_sensitivity_created_at", "created_at"),
     )
 
 

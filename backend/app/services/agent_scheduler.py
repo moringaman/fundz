@@ -447,6 +447,22 @@ class AgentScheduler:
         except Exception:
             pass  # Whale intelligence is additive; TA / signal generation continues
 
+        # Fear & Greed sentiment — behavioural psychology layer.
+        # The same data Marina received in her regime assessment, now injected
+        # per-agent so individual LLMs can factor it into entry decisions.
+        # Arrr — cached by SentimentService; no extra HTTP call per agent run.
+        try:
+            from app.services.sentiment_service import sentiment_service as _sent_svc
+            _fg = await _sent_svc.fetch_fear_greed()
+            if _fg.get("value") is not None:
+                ctx["sentiment"] = {
+                    "fear_greed_score": _fg["value"],
+                    "classification": _fg["label"],
+                    "context_block": _sent_svc.build_llm_context_block(_fg),
+                }
+        except Exception:
+            pass  # Sentiment is additive; signal generation continues
+
         # Market session context — lets agents self-regulate around high-volatility
         # windows (e.g. the US open at 13:00 UTC) with full situational awareness.
         try:
@@ -592,6 +608,21 @@ class AgentScheduler:
                 ctx["ta_alignment"] = ta_data.get("alignment", "unknown")
                 ctx["ta_confluence_score"] = ta_data.get("score", 0.0)
 
+        # Round-number proximity — sourced from TA cache (populated by TechnicalAnalystAgent).
+        # Injected here so generate_signal() can apply the round-number magnet modifier
+        # without the indicator engine needing its own price-level calculation.
+        try:
+            _ta_key_mc = f"{symbol}:1h"  # use 1h as the canonical reference frame
+            _ta_cached_mc = self._ta_cache.get(_ta_key_mc)
+            if _ta_cached_mc:
+                _ta_rep_mc, _ta_ts_mc = _ta_cached_mc
+                if (datetime.now() - _ta_ts_mc).total_seconds() < 600:
+                    _rn = getattr(getattr(_ta_rep_mc, "price_levels", None), "round_number_proximity", None)
+                    if _rn:
+                        ctx["round_number_proximity"] = _rn
+        except Exception:
+            pass
+
         # Risk level
         if self._current_risk_assessment:
             ctx["risk_level"] = self._current_risk_assessment.risk_level
@@ -622,6 +653,17 @@ class AgentScheduler:
                     "pnl": _last_closed.pnl,
                     "minutes_ago": int((datetime.now().timestamp() - _last_closed.timestamp.timestamp()) / 60),
                 }
+
+        # Fear & Greed score — used by indicators.generate_signal() for the
+        # sentiment_score-gated confidence multiplier (extreme fear + capitulation).
+        # Cached by SentimentService; no I/O cost per call.
+        try:
+            from app.services.sentiment_service import sentiment_service as _sent_mc
+            _fg_mc = _sent_mc._cached  # read cached value without triggering a fetch
+            if _fg_mc and _fg_mc.get("value") is not None:
+                ctx["sentiment_score"] = int(_fg_mc["value"])
+        except Exception:
+            pass
 
         return ctx if ctx else None
     
@@ -1078,6 +1120,12 @@ class AgentScheduler:
 
                 # DAILY EMAIL: Send once at 5pm
                 await self._maybe_send_daily_email()
+
+                # PHASE 4 — REGIME REFIT: nightly GMM refit for anchor symbols
+                # so research_analyst always has a fresh statistical prior.
+                # Cadence guard inside regime_service ensures at most one refit
+                # per ~23h per symbol, even if this loop runs every minute.
+                await self._maybe_refit_regime_models()
 
                 # POSITION MONITORING: Check SL/TP on every loop iteration
                 await self._monitor_open_positions()
@@ -3134,6 +3182,35 @@ class AgentScheduler:
         except Exception as e:
             logger.error(f"Team analysis tier failed: {e}")
 
+    async def _maybe_refit_regime_models(self):
+        """Phase 4 — daily GMM regime refit. The cadence guard inside
+        regime_service.refit_symbol() handles the actual once-per-day clamp;
+        this wrapper just swallows top-level errors so a flaky Phemex fetch
+        can't take down the scheduler loop.
+        """
+        try:
+            from app.services.regime_service import regime_service
+            results = await regime_service.refit_all()
+            if results:
+                # Only post to team chat when at least one symbol actually refitted
+                # (cadence guard returns no result on skipped refits).
+                summary = ", ".join(
+                    f"{r['symbol']}={r['regime_label']} (p={r['confidence']:.2f})"
+                    for r in results
+                )
+                logger.info(f"Regime refit completed: {summary}")
+                try:
+                    await team_chat.add_message(
+                        agent_role="research_analyst",
+                        content=f"🧮 GMM regime model refitted: {summary}",
+                        message_type="analysis",
+                    )
+                except Exception:
+                    # Team chat failure is non-critical for the refit
+                    pass
+        except Exception as e:
+            logger.error(f"Regime refit hook failed: {e}")
+
     async def _maybe_generate_daily_report(self):
         """Generate a daily report snapshot once per day (not repeatedly)."""
         try:
@@ -3924,7 +4001,7 @@ class AgentScheduler:
                         _trader_obj = next((t for t in self._traders if t.get("id") == _trader_id), None) if _trader_id else None
                         _trader_cfg = (_trader_obj or {}).get("config", {})
                         agent_context = {
-                            "trader_name":         (_trader_obj or {}).get("name", "Portfolio Manager"),
+                            "trader_name":         (_trader_obj or {}).get("name", name),
                             "trader_bio":          _trader_cfg.get("bio", ""),
                             "trader_style":        _trader_cfg.get("style", "Balanced and disciplined."),
                             "risk_tolerance":      _trader_cfg.get("risk_tolerance", "moderate"),
@@ -3948,6 +4025,14 @@ class AgentScheduler:
                         'strategy': strategy_type,
                         'indicators_config': _agent_cfg_ind.get('indicators_config', {}),
                     }
+                    # For Wyckoff agents, inject persisted session state so _wyckoff_signals
+                    # can reuse the Initial Balance established at session open instead of
+                    # recalculating it from scratch on every scheduler tick.
+                    if strategy_type == "wyckoff":
+                        _ind_config["wyckoff_state"] = (
+                            _agent_cfg_ind.get("config", {}).get("wyckoff_state", {})
+                            .get(candidate_symbol)
+                        )
                     # Enrich market_context with lightweight team signals for non-AI agents:
                     # whale bias direction and risk manager level so the indicator engine
                     # can apply small confidence adjustments without incurring LLM cost.
@@ -3972,6 +4057,29 @@ class AgentScheduler:
                     sig = signal_result.signal.value if signal_result.signal else 'hold'
                     conf = signal_result.confidence
                     reas = getattr(signal_result, 'reasoning', '')
+
+                    # Persist updated Wyckoff IB state back to Agent.config JSON.
+                    # No separate migration needed — wyckoff_state is just a key inside
+                    # the existing config JSON column, keyed by symbol for multi-pair support.
+                    if strategy_type == "wyckoff" and signal_result.wyckoff_state is not None:
+                        try:
+                            from app.database import get_async_session as _get_db_ws
+                            from app.models import Agent as _AgentModelWS
+                            async with _get_db_ws() as _ws_db:
+                                _agent_ws = await _ws_db.get(_AgentModelWS, agent_id)
+                                if _agent_ws is not None:
+                                    _ws_config = dict(_agent_ws.config or {})
+                                    _ws_states = dict(_ws_config.get("wyckoff_state", {}))
+                                    _ws_states[candidate_symbol] = signal_result.wyckoff_state
+                                    _ws_config["wyckoff_state"] = _ws_states
+                                    _agent_ws.config = _ws_config
+                                    await _ws_db.commit()
+                            # Mirror to in-memory config so next tick reads the fresh state
+                            # without waiting for another DB round-trip.
+                            _cfg_mem = self._enabled_agents.get(agent_id, {}).get("config", {})
+                            _cfg_mem.setdefault("wyckoff_state", {})[candidate_symbol] = signal_result.wyckoff_state
+                        except Exception as _ws_err:
+                            logger.debug(f"Wyckoff state persist failed for {agent_id}/{candidate_symbol}: {_ws_err}")
 
                 if sig in ('buy', 'sell') and conf > best_confidence:
                     best_symbol = candidate_symbol
@@ -4023,11 +4131,13 @@ class AgentScheduler:
             logger.info(f"Agent {name}: scanned {len(trading_pairs)} pairs, "
                        f"best opportunity: {signal.upper()} {symbol} ({confidence:.0%})")
 
-        # Resolve trader identity for chat messages
+        # Resolve trader identity for chat messages.
+        # Fall back to the agent's own name (not "Portfolio Manager") so unassigned
+        # agents don't appear in team chat as if the fund manager placed the trade.
         _agent_cfg_pre = self._enabled_agents.get(agent_id, {})
         _trader_id_pre = _agent_cfg_pre.get("trader_id")
-        _trader_name = "Portfolio Manager"
-        _trader_avatar = "💼"
+        _trader_name = name  # agent name as fallback — never impersonate the Portfolio Manager
+        _trader_avatar = "🤖"
         if _trader_id_pre:
             _trader_obj = next((t for t in self._traders if t.get("id") == _trader_id_pre), None)
             if _trader_obj:
@@ -5542,8 +5652,9 @@ class AgentScheduler:
             # Post to team chat so the intent isn't left dangling without resolution
             try:
                 _agent_cfg_err = self._enabled_agents.get(agent_id, {})
-                _trader_name_err = "Portfolio Manager"
-                _trader_avatar_err = "💼"
+                _agent_name_err = _agent_cfg_err.get("name", agent_id)
+                _trader_name_err = _agent_name_err  # fall back to agent name, not Portfolio Manager
+                _trader_avatar_err = "🤖"
                 _trader_id_err = _agent_cfg_err.get("trader_id")
                 if _trader_id_err and self._traders:
                     _t_err = next((t for t in self._traders if t.get("id") == _trader_id_err), None)

@@ -433,6 +433,10 @@ async def lifespan(app: FastAPI):
         ("agent_run_records", "llm_reasoning", "ALTER TABLE agent_run_records ADD COLUMN llm_reasoning TEXT"),
         # Per-venue performance attribution
         ("agent_metric_records", "venue_stats", "ALTER TABLE agent_metric_records ADD COLUMN venue_stats JSONB DEFAULT '{}'::jsonb"),
+        # Phase 1 quant rigour — Monte Carlo bootstrap percentiles on backtests
+        ("backtest_records", "mc_summary", "ALTER TABLE backtest_records ADD COLUMN mc_summary JSONB"),
+        # Phase 2 quant rigour — walk-forward analysis output
+        ("backtest_records", "walk_forward_summary", "ALTER TABLE backtest_records ADD COLUMN walk_forward_summary JSONB"),
     ]
     for table, column, ddl in _migrations:
         try:

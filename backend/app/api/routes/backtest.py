@@ -26,6 +26,11 @@ class BacktestRequest(BaseModel):
     # 3000 candles: ~125 days on 1h, ~20 days on 15m, ~500 days on 4h
     candle_limit: int = 3000
     agent_id: Optional[str] = None
+    # Phase 1 — Monte Carlo bootstrap of trade PnL. Default ON; flip off to skip
+    # the resampling step (e.g. for tight unit-test loops).
+    run_montecarlo: bool = True
+    mc_simulations: Optional[int] = None  # None → adaptive
+    mc_seed: Optional[int] = None         # for reproducible runs
 
 
 class BacktestResponse(BaseModel):
@@ -48,6 +53,9 @@ class BacktestResponse(BaseModel):
     trades: List[dict]
     equity_curve: List[float]
     drawdown_curve: List[float]
+    # Phase 1 — Monte Carlo bootstrap percentiles. None when MC was disabled or
+    # the backtest produced zero trades.
+    mc_summary: Optional[dict] = None
 
 
 @router.post("/run", response_model=BacktestResponse)
@@ -67,6 +75,9 @@ async def run_backtest(config: BacktestRequest):
             use_trailing_stop=config.use_trailing_stop,
             trailing_stop_pct=config.trailing_stop_pct,
             candle_limit=config.candle_limit,
+            run_montecarlo=config.run_montecarlo,
+            mc_simulations=config.mc_simulations,
+            mc_seed=config.mc_seed,
         )
 
         result = await backtest_engine.run_backtest(backtest_config)
@@ -94,6 +105,7 @@ async def run_backtest(config: BacktestRequest):
             trades=result.trades[-20:],  # last 20 trades for response
             equity_curve=result.equity_curve,
             drawdown_curve=result.drawdown_curve,
+            mc_summary=result.mc_summary,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -121,6 +133,281 @@ async def optimize_parameters(
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Optimization error: {str(e)}")
+
+
+# ── Phase 2 — Walk-forward analysis ─────────────────────────────────────────
+
+class WalkForwardRequest(BaseModel):
+    symbol: str
+    interval: str = "1h"
+    initial_balance: float = 10000.0
+    position_size_pct: float = 0.1
+    stop_loss_pct: float = 0.02
+    take_profit_pct: float = 0.05
+    strategy: str = "momentum"
+    candle_limit: int = 5000           # need more candles for multiple windows
+    n_windows: int = 6
+    mode: str = "anchored"             # "anchored" | "rolling"
+    agent_id: Optional[str] = None
+
+
+@router.post("/walk-forward")
+async def run_walk_forward_route(req: WalkForwardRequest):
+    """Run walk-forward analysis and persist as a BacktestRecord.
+
+    The persisted row carries the walk-forward summary plus the OOS-stitched
+    equity curve in `equity_curve` so the existing history view doesn't get
+    confused. Source is `walkforward` for filtering.
+    """
+    try:
+        from app.services.backtest_walkforward import run_walk_forward as _run_wf
+
+        if req.mode not in ("anchored", "rolling"):
+            raise ValueError(f"Invalid mode '{req.mode}', expected 'anchored' or 'rolling'")
+
+        cfg = BacktestConfig(
+            symbol=req.symbol,
+            interval=req.interval,
+            initial_balance=req.initial_balance,
+            position_size_pct=req.position_size_pct,
+            stop_loss_pct=req.stop_loss_pct,
+            take_profit_pct=req.take_profit_pct,
+            strategy=req.strategy,
+            candle_limit=req.candle_limit,
+            run_montecarlo=False,  # MC per window adds noise; full-run MC is the way
+        )
+
+        wf_result = await _run_wf(cfg, n_windows=req.n_windows, mode=req.mode)
+        wf_dict = wf_result.to_dict()
+
+        # Persist as BacktestRecord with source=walkforward. Pull headline metrics
+        # from the OOS aggregate so the standard history view shows OOS perf.
+        record_id = await _persist_walk_forward(req, cfg, wf_dict)
+
+        return {
+            "id": record_id,
+            "walk_forward": wf_dict,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Walk-forward error: {str(e)}")
+
+
+async def _persist_walk_forward(
+    req: "WalkForwardRequest",
+    cfg: BacktestConfig,
+    wf_dict: dict,
+) -> Optional[str]:
+    """Save walk-forward run as a BacktestRecord. Returns record id."""
+    try:
+        async with get_async_session() as session:
+            # Aggregate OOS metrics across windows for the headline columns
+            windows = wf_dict.get("windows", [])
+            n_oos_trades = sum(w.get("oos_total_trades", 0) for w in windows)
+            sum_oos_pnl = sum(w.get("oos_net_pnl", 0.0) for w in windows)
+            # Win rate weighted by trade count — simple approximation
+            wr_num = sum(
+                w.get("oos_win_rate", 0.0) * w.get("oos_total_trades", 0) for w in windows
+            )
+            agg_win_rate = (wr_num / n_oos_trades) if n_oos_trades > 0 else 0.0
+
+            record = BacktestRecord(
+                agent_id=req.agent_id,
+                symbol=req.symbol,
+                strategy=req.strategy,
+                interval=req.interval,
+                config_params={
+                    "initial_balance": cfg.initial_balance,
+                    "position_size_pct": cfg.position_size_pct,
+                    "stop_loss_pct": cfg.stop_loss_pct,
+                    "take_profit_pct": cfg.take_profit_pct,
+                    "n_windows": req.n_windows,
+                    "mode": req.mode,
+                },
+                total_trades=n_oos_trades,
+                winning_trades=0,  # not tracked per-window; kept zero for now
+                losing_trades=0,
+                win_rate=agg_win_rate,
+                total_pnl=sum_oos_pnl,
+                net_pnl=sum_oos_pnl,
+                total_fees=0.0,
+                max_drawdown=wf_dict.get("oos_max_drawdown", 0.0),
+                sharpe_ratio=wf_dict.get("mean_oos_sharpe", 0.0) or 0.0,
+                avg_trade_pnl=(sum_oos_pnl / n_oos_trades) if n_oos_trades > 0 else 0.0,
+                profit_factor=0.0,  # not aggregated cross-window
+                equity_curve=wf_dict.get("oos_equity_curve", [])[-200:],
+                trades_data=[],  # individual trades not retained across windows
+                walk_forward_summary=wf_dict,
+                source="walkforward",
+                candle_count=wf_dict.get("total_candles", 0),
+            )
+            session.add(record)
+            await session.commit()
+            return record.id
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Failed to persist walk-forward: {e}")
+        return None
+
+
+# ── Phase 3 — Strategy sensitivity sweep ─────────────────────────────────────
+
+class SensitivityRequest(BaseModel):
+    symbol: str
+    interval: str = "1h"
+    strategy: str = "momentum"
+    axis_x: str                          # "stop_loss" | "take_profit" | "position_size"
+    axis_y: str
+    values_x: List[float]
+    values_y: List[float]
+    chosen_x: float                      # the agent's current value on axis_x
+    chosen_y: float                      # ditto axis_y
+    candle_limit: int = 5000
+    agent_id: Optional[str] = None
+
+
+@router.post("/sensitivity")
+async def run_sensitivity_route(req: SensitivityRequest):
+    """Run a 2D sensitivity sweep and persist as a SensitivityRecord."""
+    try:
+        from app.services.backtest_sensitivity import run_sensitivity_analysis
+
+        result = await run_sensitivity_analysis(
+            symbol=req.symbol,
+            interval=req.interval,
+            strategy=req.strategy,
+            axis_x=req.axis_x,
+            axis_y=req.axis_y,
+            values_x=req.values_x,
+            values_y=req.values_y,
+            chosen_x=req.chosen_x,
+            chosen_y=req.chosen_y,
+            candle_limit=req.candle_limit,
+        )
+        record_id = await _persist_sensitivity(req, result)
+        out = result.to_dict()
+        out['id'] = record_id
+        return out
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Sensitivity error: {str(e)}")
+
+
+async def _persist_sensitivity(req: "SensitivityRequest", result) -> Optional[str]:
+    """Save sweep result. Returns record id."""
+    try:
+        from app.models import SensitivityRecord
+        async with get_async_session() as session:
+            # Sanitise stability_score for JSON / numeric column — NaN is invalid
+            # in JSON and Postgres will reject it for a Float column.
+            import math
+            score = result.stability_score
+            score_db = None if (score is None or math.isnan(score)) else float(score)
+
+            record = SensitivityRecord(
+                agent_id=req.agent_id,
+                symbol=req.symbol,
+                strategy=req.strategy,
+                interval=req.interval,
+                axis_x=req.axis_x,
+                axis_y=req.axis_y,
+                chosen_x_value=result.chosen_x_value,
+                chosen_y_value=result.chosen_y_value,
+                chosen_sharpe=result.chosen_sharpe,
+                chosen_net_pnl=result.chosen_net_pnl,
+                chosen_max_dd=result.chosen_max_dd,
+                stability_score=score_db,
+                stability_tier=result.stability_tier,
+                n_cells_total=result.n_cells_total,
+                n_cells_valid=result.n_cells_valid,
+                surface={
+                    'axis_x': result.axis_x,
+                    'axis_y': result.axis_y,
+                    'values_x': result.values_x,
+                    'values_y': result.values_y,
+                    'cells': result.cells,
+                },
+                source="manual",
+            )
+            session.add(record)
+            await session.commit()
+            return record.id
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Failed to persist sensitivity: {e}")
+        return None
+
+
+@router.get("/sensitivity/latest")
+async def get_latest_sensitivity(agent_id: Optional[str] = None, limit: int = 10):
+    """Recent sensitivity sweeps. Headline columns only — caller fetches the
+    full surface by id when ready to render the heatmap."""
+    try:
+        from sqlalchemy import select, desc
+        from app.models import SensitivityRecord
+        async with get_async_session() as session:
+            q = select(SensitivityRecord).order_by(desc(SensitivityRecord.created_at)).limit(limit)
+            if agent_id:
+                q = q.where(SensitivityRecord.agent_id == agent_id)
+            res = await session.execute(q)
+            rows = res.scalars().all()
+            return [
+                {
+                    'id': r.id,
+                    'agent_id': r.agent_id,
+                    'symbol': r.symbol,
+                    'strategy': r.strategy,
+                    'axis_x': r.axis_x,
+                    'axis_y': r.axis_y,
+                    'chosen_sharpe': r.chosen_sharpe,
+                    'stability_score': r.stability_score,
+                    'stability_tier': r.stability_tier,
+                    'created_at': r.created_at.isoformat() if r.created_at else None,
+                }
+                for r in rows
+            ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch sensitivity history: {str(e)}")
+
+
+@router.get("/sensitivity/{record_id}")
+async def get_sensitivity_detail(record_id: str):
+    """Full sweep including the surface grid."""
+    try:
+        from sqlalchemy import select
+        from app.models import SensitivityRecord
+        async with get_async_session() as session:
+            res = await session.execute(select(SensitivityRecord).where(SensitivityRecord.id == record_id))
+            r = res.scalar_one_or_none()
+            if not r:
+                raise HTTPException(status_code=404, detail="Sensitivity record not found")
+            return {
+                'id': r.id,
+                'agent_id': r.agent_id,
+                'symbol': r.symbol,
+                'strategy': r.strategy,
+                'interval': r.interval,
+                'axis_x': r.axis_x,
+                'axis_y': r.axis_y,
+                'chosen_x_value': r.chosen_x_value,
+                'chosen_y_value': r.chosen_y_value,
+                'chosen_sharpe': r.chosen_sharpe,
+                'chosen_net_pnl': r.chosen_net_pnl,
+                'chosen_max_dd': r.chosen_max_dd,
+                'stability_score': r.stability_score,
+                'stability_tier': r.stability_tier,
+                'n_cells_total': r.n_cells_total,
+                'n_cells_valid': r.n_cells_valid,
+                'surface': r.surface,
+                'source': r.source,
+                'created_at': r.created_at.isoformat() if r.created_at else None,
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch sensitivity detail: {str(e)}")
 
 
 @router.get("/strategies")
@@ -212,6 +499,7 @@ async def _persist_backtest(config: BacktestRequest, result, source: str = "manu
                 profit_factor=result.profit_factor,
                 equity_curve=result.equity_curve[-200:],  # keep last 200 points
                 trades_data=result.trades[-50:],  # keep last 50 trades
+                mc_summary=result.mc_summary,
                 source=source,
                 candle_count=len(result.equity_curve),
             )

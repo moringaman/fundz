@@ -242,6 +242,27 @@ class DailyReportService:
             if not report:
                 return {}
             regime = report.market_regime
+            # Phase 4 — surface the GMM statistical posterior alongside the
+            # LLM regime label, and flag divergence when the two disagree on
+            # macro direction. Both labels live in different vocabularies
+            # (LLM: trending_up/ranging/etc; GMM: risk_on/range/risk_off) so
+            # we map the LLM label to the same axis before comparing.
+            stat_label = getattr(regime, 'statistical_label', None)
+            stat_conf = getattr(regime, 'statistical_confidence', None)
+            stat_posteriors = getattr(regime, 'statistical_posteriors', None)
+            divergence = None
+            if stat_label is not None:
+                # LLM regime → expected GMM label
+                llm_to_gmm = {
+                    'trending_up': 'risk_on',
+                    'trending_down': 'risk_off',
+                    'ranging': 'range',
+                    'volatility_expansion': 'risk_off',  # vol expansion usually ≈ risk-off in crypto
+                }
+                expected = llm_to_gmm.get(regime.regime)
+                if expected and expected != stat_label:
+                    divergence = f"LLM says {regime.regime} but GMM says {stat_label} (p={stat_conf:.2f})"
+
             return {
                 "regime": regime.regime,
                 "sentiment": regime.sentiment,
@@ -249,6 +270,10 @@ class DailyReportService:
                 "correlation": regime.correlation_status,
                 "top_opportunity": report.opportunities[0].symbol if report.opportunities else None,
                 "analyst_recommendation": report.analyst_recommendation,
+                "statistical_label": stat_label,
+                "statistical_confidence": stat_conf,
+                "statistical_posteriors": stat_posteriors,
+                "regime_divergence": divergence,
             }
         except Exception as e:
             logger.debug(f"Daily report – market conditions failed: {e}")

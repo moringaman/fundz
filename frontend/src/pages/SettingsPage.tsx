@@ -413,7 +413,7 @@ export function SettingsPage() {
   const llmProviders = ['openrouter', 'openai', 'anthropic', 'azure'];
 
   return (
-    <div className="space-y-6">
+    <div className="page-content" style={{ paddingTop: '2rem', paddingBottom: '2rem' }}>
       {/* Toast notification */}
       {toast && (
         <div
@@ -433,44 +433,66 @@ export function SettingsPage() {
         </div>
       )}
 
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-        <h1 className="page-title" style={{ marginBottom: 0 }}>Settings</h1>
+      {/* Header */}
+      <div style={{ marginBottom: '1.5rem', display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between' }}>
+        <div>
+          <h1 style={{ fontSize: '1.5rem', fontWeight: 700, fontFamily: 'var(--sans)', margin: 0, color: 'var(--text)', letterSpacing: '-0.02em' }}>Settings</h1>
+          <p style={{ fontSize: '.8rem', color: 'var(--text-dim)', margin: '.4rem 0 0', fontFamily: 'var(--mono)' }}>
+            Configure API keys, risk limits, trading gates, and notifications
+          </p>
+        </div>
         <button
           type="button"
           className="settings-btn"
           onClick={() => refetchSettings()}
-          style={{ display: 'flex', alignItems: 'center', gap: '.35rem' }}
+          style={{ display: 'flex', alignItems: 'center', gap: '.35rem', marginTop: '.25rem' }}
         >
           <RefreshCw size={13} /> Refresh
         </button>
       </div>
 
-      {/* Tab navigation */}
-      <div style={{
-        display: 'flex', gap: '.35rem', padding: '.25rem',
-        background: 'var(--bg-panel)', borderRadius: 10,
-        border: '1px solid var(--border)',
-      }}>
-        {tabs.map(tab => (
-          <button
-            key={tab.id}
-            type="button"
-            onClick={() => setActiveTab(tab.id)}
-            style={{
-              flex: 1, padding: '.55rem .75rem', borderRadius: 7,
-              border: 'none', cursor: 'pointer',
-              display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '.4rem',
-              fontSize: '.78rem', fontWeight: 600,
-              fontFamily: 'var(--sans)',
-              background: activeTab === tab.id ? 'var(--accent-dim)' : 'transparent',
-              color: activeTab === tab.id ? 'var(--accent)' : 'var(--text-secondary)',
-              transition: 'all .15s',
-            }}
-          >
-            {tab.icon} {tab.label}
-          </button>
-        ))}
-      </div>
+      {/* Two-column layout: sidebar + content */}
+      <div style={{ display: 'flex', gap: '1rem', alignItems: 'flex-start' }}>
+
+        {/* Sidebar nav */}
+        <div style={{ width: 196, flexShrink: 0, position: 'sticky', top: '1rem', background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: 10, overflow: 'hidden' }}>
+          {[
+            { group: 'Core', items: tabs.filter(t => (['api', 'risk', 'trading'] as SettingsTab[]).includes(t.id)) },
+            { group: 'Intelligence', items: tabs.filter(t => (['gates', 'llm'] as SettingsTab[]).includes(t.id)) },
+            { group: 'Alerts', items: tabs.filter(t => (['email', 'notifications', 'telegram', 'sounds'] as SettingsTab[]).includes(t.id)) },
+          ].map(({ group, items }, gi) => (
+            <div key={group} style={{ borderTop: gi > 0 ? '1px solid var(--border)' : undefined }}>
+              <div style={{ padding: '.5rem .85rem .25rem', fontSize: '.55rem', fontWeight: 700, color: 'var(--text-dim)', textTransform: 'uppercase', letterSpacing: '.1em', fontFamily: 'var(--mono)' }}>
+                {group}
+              </div>
+              {items.map(tab => (
+                <button
+                  key={tab.id}
+                  type="button"
+                  onClick={() => setActiveTab(tab.id)}
+                  style={{
+                    width: '100%', padding: '.6rem .85rem',
+                    border: 'none', borderLeft: `2px solid ${activeTab === tab.id ? 'var(--accent)' : 'transparent'}`,
+                    cursor: 'pointer', textAlign: 'left',
+                    display: 'flex', alignItems: 'center', gap: '.5rem',
+                    fontSize: '.8rem', fontWeight: activeTab === tab.id ? 600 : 400,
+                    fontFamily: 'var(--sans)',
+                    background: activeTab === tab.id ? 'var(--accent-dim)' : 'transparent',
+                    color: activeTab === tab.id ? 'var(--accent)' : 'var(--text-secondary)',
+                    transition: 'all .15s',
+                  }}
+                  onMouseEnter={e => { if (activeTab !== tab.id) (e.currentTarget as HTMLElement).style.background = 'var(--bg-hover)'; }}
+                  onMouseLeave={e => { if (activeTab !== tab.id) (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
+                >
+                  {tab.icon} {tab.label}
+                </button>
+              ))}
+            </div>
+          ))}
+        </div>
+
+        {/* Content area */}
+        <div style={{ flex: 1, minWidth: 0 }}>
 
       {/* ── API Keys Tab ── */}
       {activeTab === 'api' && (
@@ -2202,6 +2224,9 @@ export function SettingsPage() {
       {activeTab === 'sounds' && (
         <SoundSettings />
       )}
+
+        </div>{/* end content */}
+      </div>{/* end two-column */}
     </div>
   );
 }

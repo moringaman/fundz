@@ -19,6 +19,11 @@ class TradingSignal:
     indicators: Dict[str, float]
     reasoning: str
     symbol: Optional[str] = None
+    # Wyckoff session state written by _wyckoff_signals — persisted by agent_scheduler
+    # so the Initial Balance survives restarts and scheduler cycles.
+    # Shape: {"ib_high": float, "ib_low": float, "ib_established": bool,
+    #         "session_date": str, "sweep_detected": bool, "sweep_direction": str|None}
+    wyckoff_state: Optional[Dict] = None
 
 
 class IndicatorService:
@@ -679,36 +684,31 @@ class IndicatorService:
             "resistance_strength": resistance_strength,
         }
 
-    def calculate_adx(self, high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-        """Average Directional Index (ADX) — measures trend strength, not direction.
+    def calculate_directional_movement(
+        self, high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14
+    ) -> tuple:
+        """Compute ADX, +DI, and -DI using Wilder's smoothing.
 
-        ADX < 20: weak / ranging market
-        ADX 20–25: developing trend
-        ADX > 25: confirmed trend
-        ADX > 40: strong trend
-
-        Uses Wilder's smoothing (same as ATR/RSI) for consistency.
-        Returns the ADX series. Does NOT indicate trend direction.
+        Returns (adx, plus_di, minus_di) as a tuple of pd.Series.
+        ADX measures trend strength (not direction).
+        +DI > -DI indicates bullish directional pressure; -DI > +DI indicates bearish.
         """
-        high = high.reset_index(drop=True)
-        low  = low.reset_index(drop=True)
+        high  = high.reset_index(drop=True)
+        low   = low.reset_index(drop=True)
         close = close.reset_index(drop=True)
 
-        # Directional movement
         up_move   = high.diff()
         down_move = -low.diff()
 
         plus_dm  = np.where((up_move > down_move) & (up_move > 0), up_move,  0.0)
         minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
 
-        # True Range (reuse ATR formula)
         tr = pd.concat([
             high - low,
             (high - close.shift()).abs(),
             (low  - close.shift()).abs(),
         ], axis=1).max(axis=1)
 
-        # Wilder's smoothed series
         alpha = 1.0 / period
         atr_s    = pd.Series(tr).ewm(alpha=alpha, min_periods=period, adjust=False).mean()
         plus_di  = pd.Series(plus_dm).ewm(alpha=alpha, min_periods=period, adjust=False).mean() / atr_s * 100
@@ -717,6 +717,19 @@ class IndicatorService:
         dx_denom = (plus_di + minus_di).replace(0, np.nan)
         dx  = ((plus_di - minus_di).abs() / dx_denom * 100).fillna(0)
         adx = dx.ewm(alpha=alpha, min_periods=period, adjust=False).mean()
+        return adx, plus_di, minus_di
+
+    def calculate_adx(self, high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+        """Average Directional Index (ADX) — measures trend strength, not direction.
+
+        ADX < 20: weak / ranging market
+        ADX 20–25: developing trend
+        ADX > 25: confirmed trend
+        ADX > 40: strong trend
+
+        Returns the ADX series only. Use calculate_directional_movement() when +DI/-DI are also needed.
+        """
+        adx, _, _ = self.calculate_directional_movement(high, low, close, period)
         return adx
 
     def calculate_all(self, df: pd.DataFrame) -> Dict[str, Any]:
@@ -733,7 +746,10 @@ class IndicatorService:
         macd = self.calculate_macd(close)
         atr = self.calculate_atr(high, low, close)
         volume_sma = self.calculate_volume_sma(volume)
-        adx = self.calculate_adx(high, low, close) if len(df) >= 28 else None
+        _dm  = self.calculate_directional_movement(high, low, close) if len(df) >= 28 else None
+        adx      = _dm[0] if _dm is not None else None
+        plus_di  = _dm[1] if _dm is not None else None
+        minus_di = _dm[2] if _dm is not None else None
         sr  = self.calculate_support_resistance(high, low, close) if len(df) >= 10 else None
         # Fractals need at least 5 bars (2n+1 with n=2); use last 200 bars for speed
         frac_slice = min(len(df), 200)
@@ -763,6 +779,8 @@ class IndicatorService:
             "atr": float(atr.iloc[-1]) if len(atr) > 0 and not pd.isna(atr.iloc[-1]) else None,
             "volume_sma": float(volume_sma.iloc[-1]) if len(volume_sma) > 0 and not pd.isna(volume_sma.iloc[-1]) else None,
             "adx": float(adx.iloc[-1]) if adx is not None and len(adx) > 0 and not pd.isna(adx.iloc[-1]) else None,
+            "plus_di":  float(plus_di.iloc[-1])  if plus_di  is not None and not pd.isna(plus_di.iloc[-1])  else None,
+            "minus_di": float(minus_di.iloc[-1]) if minus_di is not None and not pd.isna(minus_di.iloc[-1]) else None,
             "at_support":         sr["at_support"]         if sr else False,
             "at_resistance":      sr["at_resistance"]      if sr else False,
             "nearest_support":    sr["nearest_support"]    if sr else None,
@@ -891,6 +909,7 @@ class IndicatorService:
                     prev_ema_slow = float(_ema_s.iloc[-2]) if not pd.isna(_ema_s.iloc[-2]) else None
 
         signals: List[tuple] = []  # (Signal, weight, reasoning)
+        _wyckoff_state_out: Optional[Dict] = None  # populated only for wyckoff strategy
 
         # Compute divergence before signal functions — used as a modifier after.
         # When precomputed, divergence is already in the dict (computed per-bar on
@@ -951,10 +970,21 @@ class IndicatorService:
         elif strategy == "wyckoff":
             # Wyckoff needs the full df (time + OHLCV) — pass it directly rather than
             # pre-computed scalar indicators, since IB detection is a time-series operation.
-            signals = self._wyckoff_signals(df, volume_ratio)
+            # wyckoff_state comes from Agent.config JSON (persisted by agent_scheduler);
+            # None on cold start or backtest, which replicates the old stateless behaviour.
+            _wyckoff_state_in = config.get("wyckoff_state")
+            signals, _wyckoff_state_out = self._wyckoff_signals(df, volume_ratio, _wyckoff_state_in)
         elif strategy == "fractal":
             # Fractal breakout — needs raw OHLCV df plus pre-computed ADX and volume ratio
             signals = self._fractal_signals(df, indicators.get("adx"), volume_ratio)
+        elif strategy == "volatility_regime_switch":
+            _bb_width_pct = (_precomputed_indicators.get("_bb_width_pct")
+                             if _precomputed_indicators is not None else None)
+            signals = self._volatility_regime_switch_signals(
+                df, price, bb_upper, bb_lower, bb_middle, atr,
+                adx, indicators.get("plus_di"), indicators.get("minus_di"),
+                volume_ratio, bb_width_pct=_bb_width_pct,
+            )
         else:
             signals = self._default_signals(
                 rsi, price, bb_lower, bb_upper, sma_20, sma_50, macd, macd_signal_val, volume_ratio
@@ -1314,6 +1344,67 @@ class IndicatorService:
                 confidence *= 0.8
                 adjustments.append(f"reduced — low win rate ({win_rate:.0%})")
 
+            # ── Fear & Greed sentiment multiplier ──────────────────────────
+            # Extreme Fear (< 20): retail is panic-selling — ideal entry zone for
+            # mean-reversion and Wyckoff spring strategies.  Extreme Greed (> 80):
+            # same logic inverted for shorts / fading breakouts.
+            # Only fires on reversal strategies to avoid over-boosting trend-followers.
+            _sentiment_score = market_context.get("sentiment_score")
+            if _sentiment_score is not None and final_signal != Signal.HOLD:
+                _reversal_strategies = ("mean_reversion", "wyckoff")
+                if strategy in _reversal_strategies:
+                    if _sentiment_score < 20 and final_signal == Signal.BUY:
+                        confidence = min(confidence * 1.15, 1.0)
+                        adjustments.append(
+                            f"F&G Extreme Fear ({_sentiment_score}) \u2014 behavioural long bias +15%"
+                        )
+                    elif _sentiment_score > 80 and final_signal == Signal.SELL:
+                        confidence = min(confidence * 1.15, 1.0)
+                        adjustments.append(
+                            f"F&G Extreme Greed ({_sentiment_score}) \u2014 behavioural short bias +15%"
+                        )
+                    elif _sentiment_score < 40 and final_signal == Signal.BUY:
+                        confidence = min(confidence * 1.05, 1.0)
+                        adjustments.append(f"F&G Fear ({_sentiment_score}) \u2014 mild long bias +5%")
+                    elif _sentiment_score > 60 and final_signal == Signal.SELL:
+                        confidence = min(confidence * 1.05, 1.0)
+                        adjustments.append(f"F&G Greed ({_sentiment_score}) \u2014 mild short bias +5%")
+
+            # ── Round-number proximity modifier ────────────────────────────
+            # Retail anchors orders at psychologically round prices ($100k, $50k \u2026).
+            # Buying into a round-number resistance is a low R/R entry; selling at one
+            # is high R/R.  Mirror logic applies to support.
+            _rn = market_context.get("round_number_proximity")
+            if _rn and final_signal != Signal.HOLD:
+                _rn_dist = float(_rn.get("distance_pct", 1.0))
+                _rn_dir = _rn.get("direction", "")
+                if _rn_dist < 0.01:  # within 1% of the round number
+                    _rn_level = _rn.get("level", 0)
+                    if final_signal == Signal.BUY and _rn_dir == "above":
+                        # Buying into round-number resistance — dampen
+                        confidence = max(confidence * 0.90, 0.01)
+                        adjustments.append(
+                            f"Round-number resistance ${_rn_level:,.0f} within {_rn_dist:.1%} \u2014 -10%"
+                        )
+                    elif final_signal == Signal.BUY and _rn_dir == "below":
+                        # Buying off round-number support — boost
+                        confidence = min(confidence * 1.08, 1.0)
+                        adjustments.append(
+                            f"Round-number support ${_rn_level:,.0f} within {_rn_dist:.1%} +8%"
+                        )
+                    elif final_signal == Signal.SELL and _rn_dir == "above":
+                        # Selling at round-number resistance — boost
+                        confidence = min(confidence * 1.08, 1.0)
+                        adjustments.append(
+                            f"Round-number resistance ${_rn_level:,.0f} within {_rn_dist:.1%} +8%"
+                        )
+                    elif final_signal == Signal.SELL and _rn_dir == "below":
+                        # Selling into round-number support — dampen
+                        confidence = max(confidence * 0.90, 0.01)
+                        adjustments.append(
+                            f"Round-number support ${_rn_level:,.0f} within {_rn_dist:.1%} \u2014 -10%"
+                        )
+
             if adjustments:
                 reasoning += " | Context: " + ", ".join(adjustments)
 
@@ -1322,7 +1413,8 @@ class IndicatorService:
             confidence=round(confidence, 3),
             price=price,
             indicators=indicators,
-            reasoning=reasoning
+            reasoning=reasoning,
+            wyckoff_state=_wyckoff_state_out if strategy == "wyckoff" else None,
         )
 
     def _momentum_signals(self, rsi, price, sma_20, sma_50, sma_200, macd, macd_signal_val, atr, volume_ratio=None):
@@ -1439,12 +1531,34 @@ class IndicatorService:
         # Volume: low volume at extremes = exhaustion (good reversal); high volume = possible breakout
         if volume_ratio is not None and signals:
             if volume_ratio > 2.0:
-                signals = [(s, w * 0.75, r + f" [high-vol caution: {volume_ratio:.1f}×]") for s, w, r in signals]
+                # Normally high volume at an extreme signals a potential breakout, not reversion.
+                # EXCEPTION: RSI < 25 at a volume spike is a capitulation pattern — retail panic
+                # selling at the bottom that institutions absorb.  This is the highest-conviction
+                # mean-reversion entry; boost rather than dampen.
+                _has_buy_signal = any(s == Signal.BUY for s, _, _ in signals)
+                _has_sell_signal = any(s == Signal.SELL for s, _, _ in signals)
+                if rsi is not None and rsi < 25 and _has_buy_signal and not _in_downtrend:
+                    # Capitulation: panic-volume spike at RSI extreme with no trend confirmation below.
+                    # Arrr \u2014 the Composite Man absorbs the fear here. This is the Spring we\u2019re hunting.
+                    signals.append((
+                        Signal.BUY, 0.40,
+                        f"Volume capitulation: {volume_ratio:.1f}\u00d7 spike at RSI {rsi:.1f} \u2014 "
+                        f"exhaustion reversal, institutional absorption likely"
+                    ))
+                elif rsi is not None and rsi > 75 and _has_sell_signal and not _in_uptrend:
+                    # Blow-off top capitulation: euphoria volume spike at overbought extreme.
+                    signals.append((
+                        Signal.SELL, 0.40,
+                        f"Blow-off capitulation: {volume_ratio:.1f}\u00d7 spike at RSI {rsi:.1f} \u2014 "
+                        f"exhaustion top, distribution likely"
+                    ))
+                else:
+                    signals = [(s, w * 0.75, r + f" [high-vol caution: {volume_ratio:.1f}\u00d7]") for s, w, r in signals]
             elif volume_ratio < 0.8:
                 buy_w = sum(w for s, w, _ in signals if s == Signal.BUY)
                 sell_w = sum(w for s, w, _ in signals if s == Signal.SELL)
                 dom = Signal.BUY if buy_w >= sell_w else Signal.SELL
-                signals.append((dom, 0.10, f"Low volume ({volume_ratio:.1f}×) at extreme — exhaustion reversal"))
+                signals.append((dom, 0.10, f"Low volume ({volume_ratio:.1f}\u00d7) at extreme \u2014 exhaustion reversal"))
 
         return signals
 
@@ -1692,42 +1806,30 @@ class IndicatorService:
 
         return signals
 
-    def _wyckoff_signals(self, df: pd.DataFrame, volume_ratio=None) -> List[tuple]:
-        """Intraday Wyckoff — Phase C liquidity sweep detection against the session Initial Balance.
+    def _wyckoff_signals(
+        self,
+        df: pd.DataFrame,
+        volume_ratio=None,
+        wyckoff_state: Optional[Dict] = None,
+    ) -> tuple:
+        """Intraday Wyckoff \u2014 Phase C liquidity sweep detection against the session Initial Balance.
 
-        APPROACH: Option 3 — stateless recalculation on every call.
-        Each tick we re-derive the IB from the df that was fetched upstream.
-        No state is kept between calls — the IB is recalculated from today's candles.
-        This is correct but has one weakness: if the agent is called at exactly the
-        moment of reclaim (before the candle closes), it may miss the entry.
-        Good enough for a sanity test. Upgrade to stateful when confirmed profitable.
+        APPROACH: Stateful via caller-supplied wyckoff_state dict (stored in Agent.config JSON).
+        When state is provided and the session date matches today UTC, the stored IB values
+        are reused directly \u2014 avoiding 200-candle recalculation and catching the exact
+        sweep-and-reclaim moment rather than waiting for end-of-candle confirmation.
 
-        ROADMAP — Stateful approach (proper production implementation):
-          Store per-agent: ib_high, ib_low, ib_established (bool), session_date (str),
-          sweep_detected (bool), sweep_direction ('long'|'short'), sweep_price (float).
-          State storage options (in order of preference):
-            1. Agent DB JSON column `wyckoff_state` — survives restarts, zero infra cost.
-               Requires one migration. Scheduler writes on sweep detection.
-            2. In-memory dict `{agent_id: {...}}` in scheduler — fast, lost on restart.
-               Acceptable if the scheduler restart rate is low.
-            3. Redis key with 24h TTL — only worth it if you have Redis already serving
-               other real-time needs (you do via the cache, so this is viable).
-          Stateful benefits:
-            - Phase B tracking: suppress trading while in accumulation/distribution mid-range
-            - Second-attempt spring detection (2nd sweep after a failed Phase C is higher conviction)
-            - Entry on tick of reclaim (not end-of-candle confirmation lag)
-            - Phase D exit management: take partial profits at range midpoint, full at opposite IB boundary
-            - Session reset at UTC midnight without re-reading 200 candles
+        Returns a (signals, new_state) tuple so callers can persist the updated state.
+        Passing wyckoff_state=None falls back to the previous stateless behaviour \u2014
+        backtest engine and any non-stateful caller continue to work unchanged.
         """
         signals: List[tuple] = []
+        new_state: Optional[Dict] = None  # populated when IB is established or sweep detected
 
         if "time" not in df.columns or len(df) < 10:
-            return signals
+            return signals, new_state
 
-        # ── 1. Session boundaries (UTC midnight) ───────────────────────────────
-        # Crypto is 24/7 — UTC midnight is a useful-enough session boundary.
-        # The first 2h typically sees the Composite Man establishing the day's range
-        # (news-driven gaps + Asian/London handoff flow sets the extremes).
+        # \u2500\u2500 1. Session boundaries (UTC midnight) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
         import datetime
         times = df["time"].astype(float)
         latest_ts  = float(times.iloc[-1])
@@ -1735,60 +1837,73 @@ class IndicatorService:
         session_start_dt = latest_dt.replace(hour=0, minute=0, second=0, microsecond=0)
         session_start_ts = session_start_dt.timestamp()
         ib_end_ts        = session_start_ts + (120 * 60)  # first 2 hours
+        today_str        = session_start_dt.strftime("%Y-%m-%d")
 
-        # ── 2. Initial Balance candles ─────────────────────────────────────────
-        ib_mask = (times >= session_start_ts) & (times < ib_end_ts)
-        ib_df   = df[ib_mask]
+        # \u2500\u2500 2. Resolve Initial Balance \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        # Use stored IB when session date matches AND IB was already established.
+        # This is the whole point of persistence \u2014 the IB calculated at session open
+        # stays fixed all day, not re-derived from a sliding 200-candle window each call.
+        _using_stored_ib = False
+        if (
+            wyckoff_state is not None
+            and wyckoff_state.get("ib_established")
+            and wyckoff_state.get("session_date") == today_str
+        ):
+            ib_high = float(wyckoff_state["ib_high"])
+            ib_low  = float(wyckoff_state["ib_low"])
+            _using_stored_ib = True
+        else:
+            # Fresh calculation \u2014 either first call today or crossing midnight.
+            ib_mask = (times >= session_start_ts) & (times < ib_end_ts)
+            ib_df   = df[ib_mask]
 
-        # Require at least 4 IB candles (20 minutes on 5m, 60 minutes on 15m)
-        if len(ib_df) < 4:
-            signals.append((Signal.HOLD, 0.0,
-                f"Wyckoff: IB forming ({len(ib_df)} candles of ~24 required) — Phase A, hold"))
-            return signals
+            if len(ib_df) < 4:
+                signals.append((Signal.HOLD, 0.0,
+                    f"Wyckoff: IB forming ({len(ib_df)} candles of ~24 required) \u2014 Phase A, hold"))
+                return signals, new_state
 
-        ib_high = float(ib_df["high"].max())
-        ib_low  = float(ib_df["low"].min())
+            ib_high = float(ib_df["high"].max())
+            ib_low  = float(ib_df["low"].min())
+            _ib_complete = len(ib_df) >= 24  # approx 2h on 5-min candles
+            new_state = {
+                "ib_high": ib_high,
+                "ib_low":  ib_low,
+                "ib_established": _ib_complete,
+                "session_date": today_str,
+                "sweep_detected": False,
+                "sweep_direction": None,
+            }
+
         ib_range     = ib_high - ib_low
         ib_range_pct = ib_range / ib_low if ib_low > 0 else 0
 
-        # A flat IB (< 0.3%) means no tradeable range has been established
         if ib_range_pct < 0.003:
             signals.append((Signal.HOLD, 0.0,
-                f"Wyckoff: IB range too narrow ({ib_range_pct:.2%}) — no setup"))
-            return signals
+                f"Wyckoff: IB range too narrow ({ib_range_pct:.2%}) \u2014 no setup"))
+            return signals, new_state
 
         price        = float(df["close"].iloc[-1])
         post_ib_mask = times >= ib_end_ts
         post_ib_df   = df[post_ib_mask]
 
-        # Still inside the IB window — Phase B wait mode
         if len(post_ib_df) < 2:
             _pos = (price - ib_low) / ib_range if ib_range > 0 else 0.5
             signals.append((Signal.HOLD, 0.0,
-                f"Wyckoff Phase B: {_pos:.0%} through IB [{ib_low:.4f}–{ib_high:.4f}] — waiting for Phase C"))
-            return signals
+                f"Wyckoff Phase B: {_pos:.0%} through IB [{ib_low:.4f}\u2013{ib_high:.4f}] \u2014 waiting for Phase C"))
+            return signals, new_state
 
-        # ── 3. Scan last 3 post-IB candles for a sweep-and-reclaim ────────────
-        # We need the sweep candle (the one that pierced the IB boundary) and the
-        # reclaim candle (the current candle that closed back inside the range).
-        # Three candles gives us enough lookback without going stale.
+        # \u2500\u2500 3. Scan last 3 post-IB candles for a sweep-and-reclaim \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
         lookback     = post_ib_df.iloc[-3:] if len(post_ib_df) >= 3 else post_ib_df
         sweep_low    = float(lookback["low"].min())
         sweep_high   = float(lookback["high"].max())
 
-        # ── Phase C Spring (long) ──────────────────────────────────────────────
-        # The sweep must be shallow (< 1% below IB low) — a genuine stop-run, not
-        # a breakdown. The reclaim must happen within 3 candles — stale reclaims
-        # are phase D continuations, not Phase C entries.
+        # \u2500\u2500 Phase C Spring (long) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
         _swept_low    = sweep_low < ib_low
         _reclaimed_low = price > ib_low
         _sweep_depth  = (ib_low - sweep_low) / ib_low if _swept_low and ib_low > 0 else 0
         _is_spring    = _swept_low and _reclaimed_low and _sweep_depth < 0.01
 
         if _is_spring:
-            # Effort vs. Result: reversal volume should match or exceed sweep volume.
-            # Heavy volume into the sweep with no sustained breakdown = institutional absorption.
-            # Low reversal volume = weak hands covering, not institutions buying.
             _sweep_idx   = lookback["low"].idxmin()
             _sweep_vol   = float(df.loc[_sweep_idx, "volume"]) if "volume" in df.columns else None
             _reclaim_vol = float(df["volume"].iloc[-1])        if "volume" in df.columns else None
@@ -1796,8 +1911,8 @@ class IndicatorService:
             _vol_confirms = _vol_ratio is not None and _vol_ratio >= 0.8
             _weight       = 0.65 if _vol_confirms else 0.40
             _vol_note     = (
-                f", vol {_vol_ratio:.1f}× (absorption confirmed)" if _vol_confirms
-                else f", vol {_vol_ratio:.1f}× (weak — caution)"  if _vol_ratio is not None
+                f", vol {_vol_ratio:.1f}\u00d7 (absorption confirmed)" if _vol_confirms
+                else f", vol {_vol_ratio:.1f}\u00d7 (weak \u2014 caution)"  if _vol_ratio is not None
                 else ""
             )
             signals.append((
@@ -1806,8 +1921,14 @@ class IndicatorService:
                 f"({_sweep_depth:.2%}), reclaimed at {price:.4f}"
                 f"{_vol_note} | TP target: IB high {ib_high:.4f}"
             ))
+            # Record sweep detection in state so second-attempt Springs get extra weight
+            if new_state is not None:
+                new_state["sweep_detected"] = True
+                new_state["sweep_direction"] = "long"
+            elif _using_stored_ib and wyckoff_state is not None:
+                new_state = {**wyckoff_state, "sweep_detected": True, "sweep_direction": "long"}
 
-        # ── Phase C Upthrust (short) ───────────────────────────────────────────
+        # \u2500\u2500 Phase C Upthrust (short) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
         _swept_high    = sweep_high > ib_high
         _reclaimed_high = price < ib_high
         _sweep_height  = (sweep_high - ib_high) / ib_high if _swept_high and ib_high > 0 else 0
@@ -1821,8 +1942,8 @@ class IndicatorService:
             _vol_confirms = _vol_ratio is not None and _vol_ratio >= 0.8
             _weight       = 0.65 if _vol_confirms else 0.40
             _vol_note     = (
-                f", vol {_vol_ratio:.1f}× (distribution confirmed)" if _vol_confirms
-                else f", vol {_vol_ratio:.1f}× (weak — caution)"    if _vol_ratio is not None
+                f", vol {_vol_ratio:.1f}\u00d7 (distribution confirmed)" if _vol_confirms
+                else f", vol {_vol_ratio:.1f}\u00d7 (weak \u2014 caution)"    if _vol_ratio is not None
                 else ""
             )
             signals.append((
@@ -1831,17 +1952,19 @@ class IndicatorService:
                 f"({_sweep_height:.2%}), rejected to {price:.4f}"
                 f"{_vol_note} | TP target: IB low {ib_low:.4f}"
             ))
+            if new_state is not None:
+                new_state["sweep_detected"] = True
+                new_state["sweep_direction"] = "short"
+            elif _using_stored_ib and wyckoff_state is not None:
+                new_state = {**wyckoff_state, "sweep_detected": True, "sweep_direction": "short"}
 
-        # ── Phase B: price inside IB — wait ───────────────────────────────────
-        # Never trade the mid-range on Wyckoff. The Composite Man uses the middle
-        # of the range to accumulate or distribute against retail orders.
-        # , this be the discipline that separates Wyckoff from gambling.
+        # \u2500\u2500 Phase B: price inside IB \u2014 wait \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
         if not signals:
             _pos = (price - ib_low) / ib_range if ib_range > 0 else 0.5
             signals.append((Signal.HOLD, 0.0,
-                f"Wyckoff Phase B: {_pos:.0%} through IB [{ib_low:.4f}–{ib_high:.4f}] — no sweep yet"))
+                f"Wyckoff Phase B: {_pos:.0%} through IB [{ib_low:.4f}\u2013{ib_high:.4f}] \u2014 no sweep yet"))
 
-        return signals
+        return signals, new_state
 
     def _default_signals(self, rsi, price, bb_lower, bb_upper, sma_20, sma_50, macd, macd_signal_val, volume_ratio=None):
         """Balanced default strategy — require strong confluence."""
@@ -1992,5 +2115,150 @@ class IndicatorService:
                 if dist_pct <= 0.003:
                     signals.append((Signal.SELL, 0.25,
                         f"Approaching bullish fractal support ${last_up:.4f} (dist {dist_pct*100:.2f}%)"))
+
+        return signals
+
+    def _volatility_regime_switch_signals(
+        self,
+        df: pd.DataFrame,
+        price: float,
+        bb_upper: Optional[float],
+        bb_lower: Optional[float],
+        bb_middle: Optional[float],
+        atr: Optional[float],
+        adx: Optional[float],
+        plus_di: Optional[float],
+        minus_di: Optional[float],
+        volume_ratio: Optional[float],
+        bb_width_pct: Optional[float] = None,
+    ) -> List[tuple]:
+        """Volatility Regime Switch: adaptive 3-mode strategy.
+
+        Regime is determined by the percentile rank of the current Bollinger Band
+        width within the trailing 120-bar history:
+          COMPRESSION (< 10th pct)  → breakout entry on band breach + volume surge
+          RANGING     (10–40th pct) → mean reversion at band extremes (ADX < 20 gated)
+          TRENDING    (> 40th pct, ADX > 25) → momentum entry on pullback to EMA
+
+        When bb_width_pct is pre-computed (backtest path), it is used directly.
+        Otherwise it is derived from the df.
+        """
+        signals: List[tuple] = []
+
+        # ── Derive BB width percentile if not precomputed ─────────────────────
+        if bb_width_pct is None and bb_upper is not None and bb_lower is not None \
+                and bb_middle is not None and bb_middle > 0 and len(df) >= 20:
+            close_s = df["close"].astype(float)
+            _bb = self.calculate_bollinger_bands(close_s)
+            _bb_widths = (_bb["upper"] - _bb["lower"]) / _bb["middle"].replace(0, float("nan"))
+            _bb_widths = _bb_widths.dropna()
+            if len(_bb_widths) >= 20:
+                _lookback = min(len(_bb_widths), 120)
+                _window = _bb_widths.iloc[-_lookback:]
+                _cur = float(_bb_widths.iloc[-1])
+                bb_width_pct = float((_window < _cur).sum()) / max(len(_window) - 1, 1)
+
+        if bb_width_pct is None:
+            return signals  # insufficient history to classify regime
+
+        # ── Classify regime ───────────────────────────────────────────────────
+        if bb_width_pct < 0.10:
+            regime = "compression"
+        elif bb_width_pct <= 0.40:
+            regime = "ranging"
+        elif adx is not None and adx > 25:
+            regime = "trending"
+        else:
+            # Wide bands but no confirmed trend — treat as ranging (ADX building)
+            regime = "ranging"
+
+        regime_label = (f"BB-width pct {bb_width_pct:.1%}, ADX {adx:.1f}" if adx is not None
+                        else f"BB-width pct {bb_width_pct:.1%}")
+
+        # ── MODE 1: COMPRESSION → Breakout ───────────────────────────────────
+        if regime == "compression":
+            # Gate: skip if ADX shows an existing trend (avoid chasing late moves)
+            _adx_ok = adx is None or adx < 20
+            if _adx_ok and bb_upper is not None and price > bb_upper:
+                base = 0.60
+                reason = f"COMPRESSION BREAKOUT LONG: squeeze ({regime_label}), price breaks upper BB"
+                if volume_ratio is not None:
+                    if volume_ratio >= 1.5:
+                        base += 0.15
+                        reason += f" | vol {volume_ratio:.1f}× confirms explosive move"
+                    elif volume_ratio < 1.0:
+                        base *= 0.55
+                        reason += f" | low vol {volume_ratio:.1f}× — fakeout risk"
+                if atr:
+                    reason += f" | structural stop: {price - 2 * atr:.4f} (2×ATR)"
+                signals.append((Signal.BUY, round(base, 3), reason))
+            elif _adx_ok and bb_lower is not None and price < bb_lower:
+                base = 0.60
+                reason = f"COMPRESSION BREAKOUT SHORT: squeeze ({regime_label}), price breaks lower BB"
+                if volume_ratio is not None:
+                    if volume_ratio >= 1.5:
+                        base += 0.15
+                        reason += f" | vol {volume_ratio:.1f}× confirms explosive move"
+                    elif volume_ratio < 1.0:
+                        base *= 0.55
+                        reason += f" | low vol {volume_ratio:.1f}× — fakeout risk"
+                if atr:
+                    reason += f" | structural stop: {price + 2 * atr:.4f} (2×ATR)"
+                signals.append((Signal.SELL, round(base, 3), reason))
+            # Price inside bands during compression = awaiting direction → no signal
+
+        # ── MODE 2: RANGING → Mean Reversion ─────────────────────────────────
+        elif regime == "ranging":
+            # Skip if trend is beginning to develop
+            _adx_ranging = adx is None or adx < 20
+            if _adx_ranging:
+                if bb_lower is not None and price <= bb_lower * 1.005:
+                    base = 0.55
+                    reason = f"RANGING MEAN REVERSION LONG: price at/near lower BB ({regime_label})"
+                    if atr:
+                        reason += f" | stop: {price - 0.5 * atr:.4f} (0.5×ATR)"
+                    if bb_middle:
+                        reason += f" | TP: {bb_middle:.4f} (BB middle)"
+                    signals.append((Signal.BUY, round(base, 3), reason))
+                elif bb_upper is not None and price >= bb_upper * 0.995:
+                    base = 0.55
+                    reason = f"RANGING MEAN REVERSION SHORT: price at/near upper BB ({regime_label})"
+                    if atr:
+                        reason += f" | stop: {price + 0.5 * atr:.4f} (0.5×ATR)"
+                    if bb_middle:
+                        reason += f" | TP: {bb_middle:.4f} (BB middle)"
+                    signals.append((Signal.SELL, round(base, 3), reason))
+
+        # ── MODE 3: TRENDING → Momentum (pullback entry) ─────────────────────
+        elif regime == "trending":
+            _di_bull = plus_di is not None and minus_di is not None and plus_di > minus_di
+            _di_bear = plus_di is not None and minus_di is not None and minus_di > plus_di
+            _di_info = (f" | +DI {plus_di:.1f} > -DI {minus_di:.1f}" if _di_bull
+                        else (f" | -DI {minus_di:.1f} > +DI {plus_di:.1f}" if _di_bear else ""))
+
+            if _di_bull or (plus_di is None and bb_middle and price > bb_middle):
+                # Ideal entry: pullback to EMA (BB middle ≈ SMA20)
+                if bb_middle and price <= bb_middle * 1.012:
+                    base = 0.62
+                    reason = f"TRENDING MOMENTUM LONG: pullback to EMA ({regime_label}){_di_info}"
+                    if atr:
+                        reason += f" | stop: {price - 2.5 * atr:.4f} (2.5×ATR)"
+                    signals.append((Signal.BUY, round(base, 3), reason))
+                elif bb_middle and price > bb_middle:
+                    # Price extended above EMA — lower conviction
+                    base = 0.40
+                    reason = f"TRENDING LONG (above EMA, no pullback): ADX {adx:.1f}{_di_info}"
+                    signals.append((Signal.BUY, round(base, 3), reason))
+            elif _di_bear or (minus_di is None and bb_middle and price < bb_middle):
+                if bb_middle and price >= bb_middle * 0.988:
+                    base = 0.62
+                    reason = f"TRENDING MOMENTUM SHORT: pullback to EMA ({regime_label}){_di_info}"
+                    if atr:
+                        reason += f" | stop: {price + 2.5 * atr:.4f} (2.5×ATR)"
+                    signals.append((Signal.SELL, round(base, 3), reason))
+                elif bb_middle and price < bb_middle:
+                    base = 0.40
+                    reason = f"TRENDING SHORT (below EMA, no pullback): ADX {adx:.1f}{_di_info}"
+                    signals.append((Signal.SELL, round(base, 3), reason))
 
         return signals

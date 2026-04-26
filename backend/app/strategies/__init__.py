@@ -91,6 +91,7 @@ def strategy_profiles(risk_defaults: dict | None = None) -> dict[str, dict]:
             "stop_loss_pct": sl,
             "take_profit_pct": tp,
             "trailing_stop_pct": risk.get("trailing_stop_pct"),
+            "max_portfolio_risk_pct": risk.get("max_portfolio_risk_pct"),
             "indicators_config": strat.get("indicators", {}),
             "market_conditions": strat.get("market_conditions", []),
             "avoid_conditions": strat.get("avoid_conditions", []),

@@ -116,10 +116,10 @@ export function FundTeamPage() {
       </div>
 
       {/* Main Grid */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))', gap: '1.5rem' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '1.5rem' }}>
 
         {/* === Trader Leaderboard === */}
-        <div className="panel" style={{ gridColumn: 'span 2' }}>
+        <div className="panel" style={{ gridColumn: 'span 3' }}>
           <div className="panel-header">
             <div style={{ display: 'flex', alignItems: 'center', gap: '.5rem' }}>
               <span style={{ fontSize: '1.2rem' }}>🏆</span>
@@ -135,7 +135,7 @@ export function FundTeamPage() {
                 No traders configured. Start the scheduler to seed defaults.
               </p>
             ) : (
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: '.75rem' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 320px))', gap: '.75rem', justifyContent: 'start' }}>
                 {(traderLeaderboard as any[]).map((t: any, i: number) => (
                   <div key={t.id} style={{
                     padding: '.75rem',
@@ -204,7 +204,7 @@ export function FundTeamPage() {
         </div>
 
         {/* === Research Analyst === */}
-        <div className="panel" style={{ gridColumn: 'span 2' }}>
+        <div className="panel" style={{ gridColumn: 'span 2', minWidth: 0 }}>
           <div className="panel-header">
             <div className="panel-title">
               <img src={getTeamMember('research_analyst').avatar} alt={getTeamMember('research_analyst').name} style={{ width: '36px', height: '36px', borderRadius: '50%', objectFit: 'cover' }} />
@@ -293,7 +293,7 @@ export function FundTeamPage() {
         </div>
 
         {/* === Technical Analyst === */}
-        <div className="panel">
+        <div className="panel" style={{ minWidth: 0 }}>
           <div className="panel-header">
             <div className="panel-title">
               <img src={getTeamMember('technical_analyst').avatar} alt={getTeamMember('technical_analyst').name} style={{ width: '36px', height: '36px', borderRadius: '50%', objectFit: 'cover' }} />
@@ -479,7 +479,7 @@ export function FundTeamPage() {
         </div>
 
         {/* === Risk Manager === */}
-        <div className="panel">
+        <div className="panel" style={{ minWidth: 0 }}>
           <div className="panel-header">
             <div className="panel-title">
               <img src={getTeamMember('risk_manager').avatar} alt={getTeamMember('risk_manager').name} style={{ width: '36px', height: '36px', borderRadius: '50%', objectFit: 'cover' }} />
@@ -565,7 +565,7 @@ export function FundTeamPage() {
         </div>
 
         {/* === CIO Report === */}
-        <div className="panel">
+        <div className="panel" style={{ gridColumn: 'span 2', minWidth: 0 }}>
           <div className="panel-header">
             <div className="panel-title">
               <img src={getTeamMember('cio_agent').avatar} alt={getTeamMember('cio_agent').name} style={{ width: '36px', height: '36px', borderRadius: '50%', objectFit: 'cover' }} />
@@ -628,7 +628,7 @@ export function FundTeamPage() {
         </div>
 
         {/* === Performance Attribution === */}
-        <div className="panel">
+        <div className="panel" style={{ minWidth: 0 }}>
           <div className="panel-header">
             <div className="panel-title">
               <BarChart3 size={14} />
@@ -698,7 +698,7 @@ export function FundTeamPage() {
         </div>
 
         {/* === Strategy Leaderboard (from CIO) === */}
-        <div className="panel">
+        <div className="panel" style={{ gridColumn: 'span 2', minWidth: 0 }}>
           <div className="panel-header">
             <div className="panel-title">
               <Users size={14} />

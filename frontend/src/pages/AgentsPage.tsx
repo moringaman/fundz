@@ -32,6 +32,17 @@ export function AgentsPage() {
   const [backtestLoading, setBacktestLoading] = useState<string | null>(null);
   const [backtestProgress, setBacktestProgress] = useState<{ phase: string; pct: number } | null>(null);
   const backtestTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Phase 2 — walk-forward analysis state. Separate from MC backtest so the two
+  // panels can coexist and one runner doesn't block the other.
+  const [walkForwardResults, setWalkForwardResults] = useState<Record<string, any>>({});
+  const [walkForwardLoading, setWalkForwardLoading] = useState<string | null>(null);
+  const [walkForwardError, setWalkForwardError] = useState<Record<string, string>>({});
+  const [walkForwardProgress, setWalkForwardProgress] = useState<Record<string, { current: number; total: number }>>({});
+  // Phase 3 — sensitivity sweep state. Same per-agent keying pattern as walk-forward.
+  const [sensitivityResults, setSensitivityResults] = useState<Record<string, any>>({});
+  const [sensitivityLoading, setSensitivityLoading] = useState<string | null>(null);
+  const [sensitivityError, setSensitivityError] = useState<Record<string, string>>({});
+  const [sensitivityProgress, setSensitivityProgress] = useState<Record<string, { current: number; total: number }>>({});
   const [gridSummaries, setGridSummaries] = useState<Record<string, any>>({});
   const [cancellingGrid, setCancellingGrid] = useState<string | null>(null);
 
@@ -215,6 +226,122 @@ export function AgentsPage() {
     }
   };
 
+  // Phase 2 — walk-forward runner.
+  const runWalkForward = async (
+    agentId: string,
+    symbol: string = 'BTCUSDT',
+    timeframe: string = '1h',
+    strategy: string = 'momentum',
+  ) => {
+    setWalkForwardLoading(agentId);
+    setWalkForwardError({});
+    setWalkForwardProgress(prev => ({ ...prev, [agentId]: { current: 0, total: 12 } }));
+    try {
+      const res = await fetch('/api/backtest/walk-forward', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          symbol,
+          interval: timeframe,
+          strategy,
+          n_windows: 6,
+          mode: 'anchored',
+          candle_limit: 5000,
+          agent_id: agentId,
+        }),
+      });
+      
+      setWalkForwardProgress(prev => ({ ...prev, [agentId]: { current: 4, total: 12 } }));
+      
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        const errorMsg = err.detail || err.message || 'Walk-forward analysis';
+        console.error('Walk-forward failed:', err);
+        setWalkForwardError(prev => ({ ...prev, [agentId]: errorMsg }));
+        return;
+      }
+      
+      setWalkForwardProgress(prev => ({ ...prev, [agentId]: { current: 10, total: 12 } }));
+      const data = await res.json();
+      setWalkForwardResults((prev) => ({ ...prev, [agentId]: data.walk_forward }));
+      setWalkForwardProgress(prev => ({ ...prev, [agentId]: { current: 12, total: 12 } }));
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : 'Failed to run walk-forward';
+      console.error('Failed to run walk-forward:', error);
+      setWalkForwardError(prev => ({ ...prev, [agentId]: msg }));
+    } finally {
+      setWalkForwardLoading(null);
+      setTimeout(() => {
+        setWalkForwardProgress(prev => {
+          const next = { ...prev };
+          delete next[agentId];
+          return next;
+        });
+      }, 1500);
+    }
+  };
+
+  // Phase 3 — sensitivity sweep runner.
+  const runSensitivity = async (
+    agentId: string,
+    symbol: string = 'BTCUSDT',
+    timeframe: string = '1h',
+    strategy: string = 'momentum',
+    chosenStopLoss: number = 0.02,
+    chosenTakeProfit: number = 0.05,
+  ) => {
+    setSensitivityLoading(agentId);
+    setSensitivityError({});
+    setSensitivityProgress(prev => ({ ...prev, [agentId]: { current: 0, total: 25 } }));
+    try {
+      const res = await fetch('/api/backtest/sensitivity', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          symbol,
+          interval: timeframe,
+          strategy,
+          axis_x: 'stop_loss',
+          axis_y: 'take_profit',
+          values_x: [0.01, 0.015, 0.02, 0.025, 0.03],
+          values_y: [0.04, 0.05, 0.06, 0.075, 0.10],
+          chosen_x: chosenStopLoss,
+          chosen_y: chosenTakeProfit,
+          candle_limit: 5000,
+          agent_id: agentId,
+        }),
+      });
+      
+      setSensitivityProgress(prev => ({ ...prev, [agentId]: { current: 10, total: 25 } }));
+      
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        const errorMsg = err.detail || err.message || 'Sensitivity analysis';
+        console.error('Sensitivity failed:', err);
+        setSensitivityError(prev => ({ ...prev, [agentId]: errorMsg }));
+        return;
+      }
+      
+      setSensitivityProgress(prev => ({ ...prev, [agentId]: { current: 20, total: 25 } }));
+      const data = await res.json();
+      setSensitivityResults((prev) => ({ ...prev, [agentId]: data }));
+      setSensitivityProgress(prev => ({ ...prev, [agentId]: { current: 25, total: 25 } }));
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : 'Failed to run sensitivity';
+      console.error('Failed to run sensitivity:', error);
+      setSensitivityError(prev => ({ ...prev, [agentId]: msg }));
+    } finally {
+      setSensitivityLoading(null);
+      setTimeout(() => {
+        setSensitivityProgress(prev => {
+          const next = { ...prev };
+          delete next[agentId];
+          return next;
+        });
+      }, 1500);
+    }
+  };
+
   const startEdit = (agent: any) => {
     setFormData({
       name: agent.name,
@@ -265,26 +392,24 @@ export function AgentsPage() {
   ];
 
   return (
-    <div className="space-y-6" style={{ padding: '1.5rem 1.5rem 2rem' }}>
+    <div className="page-content" style={{ paddingTop: '2rem', paddingBottom: '2rem' }}>
+
+      {/* Page header */}
+      <div style={{ marginBottom: '1.25rem' }}>
+        <h1 style={{ fontSize: '1.5rem', fontWeight: 700, fontFamily: 'var(--sans)', margin: 0, color: 'var(--text)', letterSpacing: '-0.02em' }}>
+          Agents
+        </h1>
+        <p style={{ fontSize: '.8rem', color: 'var(--text-dim)', margin: '.4rem 0 0', fontFamily: 'var(--mono)' }}>
+          {agents.length > 0
+            ? `${agents.filter(a => a.is_enabled).length} active · ${agents.length} total`
+            : 'Automated trading strategies'}
+        </p>
+      </div>
+
       {/* Tab bar */}
-      <div style={{ display: 'flex', gap: '0.25rem', borderBottom: '1px solid var(--border)', paddingBottom: '0', marginBottom: '0' }}>
+      <div className="tab-row" style={{ marginBottom: '.85rem' }}>
         {([['agents', 'Agents'], ['registry', 'Strategy Registry']] as const).map(([tab, label]) => (
-          <button
-            key={tab}
-            onClick={() => setActiveTab(tab)}
-            style={{
-              padding: '0.45rem 1rem',
-              fontSize: '0.82rem',
-              fontWeight: activeTab === tab ? 600 : 400,
-              background: 'transparent',
-              border: 'none',
-              borderBottom: activeTab === tab ? '2px solid var(--accent)' : '2px solid transparent',
-              color: activeTab === tab ? 'var(--accent)' : 'var(--text-muted)',
-              cursor: 'pointer',
-              marginBottom: '-1px',
-              transition: 'color 0.15s',
-            }}
-          >
+          <button key={tab} onClick={() => setActiveTab(tab)} className={`tab-btn ${activeTab === tab ? 'active' : ''}`}>
             {label}
           </button>
         ))}
@@ -307,57 +432,52 @@ export function AgentsPage() {
           </div>
         </div>
       ) : (<>
-      <div className="agent-header">
-        <h1 className="page-title" style={{ marginBottom: 0 }}>Agents</h1>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '.6rem', flexWrap: 'wrap' }}>
-          {/* Search */}
-          <div style={{ position: 'relative' }}>
-            <span style={{ position: 'absolute', left: '.55rem', top: '50%', transform: 'translateY(-50%)', fontSize: '.8rem', color: 'var(--text-muted)', pointerEvents: 'none' }}>🔍</span>
-            <input
-              type="text"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search agents…"
-              style={{
-                paddingLeft: '1.8rem', paddingRight: '.6rem', paddingTop: '.3rem', paddingBottom: '.3rem',
-                borderRadius: 6, border: '1px solid var(--border)', background: 'var(--bg-elevated)',
-                color: 'var(--text)', fontSize: '.8rem', width: 180, outline: 'none',
-              }}
-            />
-          </div>
-          {/* Status filter */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '.6rem', flexWrap: 'wrap', marginBottom: '.75rem' }}>
+        {/* Search */}
+        <input
+          type="text"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="Search agents…"
+          style={{
+            padding: '.35rem .7rem', borderRadius: 7,
+            border: '1px solid var(--border)', background: 'var(--bg-elevated)',
+            color: 'var(--text)', fontSize: '.8rem', width: 200, outline: 'none',
+            fontFamily: 'var(--sans)',
+          }}
+        />
+        {/* Status filter pills */}
+        <div style={{ display: 'flex', gap: '.3rem' }}>
           {(['all', 'enabled', 'disabled'] as const).map((s) => (
             <button
               key={s}
               type="button"
               onClick={() => setFilterStatus(s)}
               style={{
-                padding: '.25rem .65rem', borderRadius: 20, fontSize: '.75rem', fontWeight: 600,
+                padding: '.28rem .65rem', borderRadius: 20, fontSize: '.72rem', fontWeight: 600,
                 border: '1px solid',
                 borderColor: filterStatus === s
                   ? s === 'enabled' ? 'var(--green)' : s === 'disabled' ? 'var(--red)' : 'var(--accent)'
                   : 'var(--border)',
                 background: filterStatus === s
-                  ? s === 'enabled' ? 'rgba(0,230,118,.12)' : s === 'disabled' ? 'rgba(231,76,60,.12)' : 'rgba(100,130,255,.12)'
+                  ? s === 'enabled' ? 'rgba(0,230,118,.1)' : s === 'disabled' ? 'rgba(231,76,60,.1)' : 'var(--accent-dim)'
                   : 'transparent',
                 color: filterStatus === s
                   ? s === 'enabled' ? 'var(--green)' : s === 'disabled' ? 'var(--red)' : 'var(--accent)'
-                  : 'var(--text-muted)',
+                  : 'var(--text-dim)',
                 cursor: 'pointer',
-                textTransform: 'capitalize',
               }}
             >
-              {s === 'all'
-                ? `All (${agents.length})`
-                : s === 'enabled'
-                ? `✓ Enabled (${agents.filter(a => a.is_enabled).length})`
-                : `✕ Disabled (${agents.filter(a => !a.is_enabled).length})`}
+              {s === 'all' ? `All · ${agents.length}`
+                : s === 'enabled' ? `Active · ${agents.filter(a => a.is_enabled).length}`
+                : `Inactive · ${agents.filter(a => !a.is_enabled).length}`}
             </button>
           ))}
-          <button type="button" className="agent-btn" onClick={() => { setShowForm(!showForm); setEditingId(null); }}>
-            {showForm ? 'Cancel' : '+ New Agent'}
-          </button>
         </div>
+        <div style={{ flex: 1 }} />
+        <button type="button" className="agent-btn" onClick={() => { setShowForm(!showForm); setEditingId(null); }}>
+          {showForm ? 'Cancel' : '+ New Agent'}
+        </button>
       </div>
 
       {showForm && (
@@ -557,29 +677,31 @@ export function AgentsPage() {
                 <div key={trader.id} style={{ marginBottom: '1.5rem' }}>
                   {/* Trader section header */}
                   <div style={{
-                    display: 'flex', alignItems: 'center', gap: '0.75rem',
-                    marginBottom: '0.75rem', paddingBottom: '0.5rem',
+                    display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                    marginBottom: '0.65rem', paddingBottom: '0.55rem',
                     borderBottom: '1px solid var(--border)',
                   }}>
-                    <div style={{
-                      width: 32, height: 32, borderRadius: '50%',
-                      background: 'linear-gradient(135deg, var(--accent), #7c3aed)',
-                      display: 'flex', alignItems: 'center', justifyContent: 'center',
-                      fontSize: '0.75rem', fontWeight: 700, color: 'white', flexShrink: 0,
-                    }}>
-                      {(trader.name ?? 'U').charAt(0).toUpperCase()}
-                    </div>
-                    <div style={{ flex: 1 }}>
-                      <div style={{ fontSize: '0.88rem', fontWeight: 600, color: 'var(--text)' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+                      <div style={{
+                        width: 28, height: 28, borderRadius: '50%',
+                        background: 'linear-gradient(135deg, var(--accent) 0%, #7c3aed 100%)',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        fontSize: '0.7rem', fontWeight: 700, color: 'white', flexShrink: 0,
+                        boxShadow: '0 1px 4px rgba(0,0,0,.3)',
+                      }}>
+                        {(trader.name ?? 'U').charAt(0).toUpperCase()}
+                      </div>
+                      <span style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-primary)' }}>
                         {trader.name ?? 'Unassigned'}
-                      </div>
-                      <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', display: 'flex', gap: '0.75rem' }}>
-                        <span>{enabledCount}/{groupAgents.length} active</span>
-                        <span style={{ color: groupPnl >= 0 ? 'var(--green)' : 'var(--red)' }}>
-                          {groupPnl >= 0 ? '+' : ''}{groupPnl.toFixed(2)} USDT
-                        </span>
-
-                      </div>
+                      </span>
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', fontFamily: 'var(--mono)', fontSize: '.7rem' }}>
+                      <span style={{ color: 'var(--text-dim)' }}>
+                        {enabledCount}<span style={{ color: 'var(--text-dim)', fontFamily: 'var(--sans)' }}>/{groupAgents.length}</span> active
+                      </span>
+                      <span style={{ color: groupPnl >= 0 ? 'var(--green)' : 'var(--red)', fontWeight: 600 }}>
+                        {groupPnl >= 0 ? '+' : ''}{groupPnl.toFixed(2)} USDT
+                      </span>
                     </div>
                   </div>
                   <div className="agents-grid">
@@ -785,53 +907,39 @@ export function AgentsPage() {
                     </label>
                   </div>
                   <div className="agent-details">
-                    <div className="detail-row">
-                      <span className="detail-label">Traded Pairs</span>
-                      <span className="detail-value" style={{ color: (agent.trading_pairs ?? []).length === 0 ? 'var(--text-muted)' : undefined }}>
-                        {(agent.trading_pairs ?? []).length > 0 ? agent.trading_pairs.map((p: string) => p.replace('USDT', '')).join(', ') : 'None yet'}
+                    {/* Pairs */}
+                    <div style={{ fontFamily: 'var(--mono)', fontSize: '.68rem', color: 'var(--text-dim)', marginBottom: '.5rem', minHeight: '1rem' }}>
+                      {(agent.trading_pairs ?? []).length > 0
+                        ? agent.trading_pairs.map((p: string) => p.replace('USDT', '')).join(' · ')
+                        : <span style={{ fontStyle: 'italic' }}>No pairs assigned</span>}
+                    </div>
+                    {/* Allocation bar */}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '.5rem', marginBottom: '.55rem' }}>
+                      <div style={{ flex: 1, height: 5, background: 'var(--bg-hover)', borderRadius: 3, overflow: 'hidden' }}>
+                        <div style={{
+                          height: '100%', borderRadius: 3,
+                          width: `${Math.min(agent.allocation_percentage, 100)}%`,
+                          background: agent.allocation_percentage >= 30 ? 'var(--green)' : agent.allocation_percentage >= 15 ? 'var(--amber)' : 'var(--accent)',
+                          transition: 'width .3s',
+                        }} />
+                      </div>
+                      <span style={{ fontFamily: 'var(--mono)', fontSize: '.72rem', fontWeight: 700, color: 'var(--text-primary)', minWidth: 28 }}>
+                        {agent.allocation_percentage}%
                       </span>
                     </div>
-                    <div className="detail-row">
-                      <span className="detail-label">Allocation</span>
-                      <div className="detail-progress">
-                        <div className="progress-track">
-                          <div
-                            className="progress-fill"
-                            style={{
-                              width: `${Math.min(agent.allocation_percentage, 100)}%`,
-                              background: agent.allocation_percentage >= 30 ? 'var(--green)' : agent.allocation_percentage >= 15 ? 'var(--amber)' : 'var(--text-secondary)',
-                            }}
-                          />
-                        </div>
-                        <span className="progress-pct">{agent.allocation_percentage}%</span>
-                      </div>
-                    </div>
-                    <div className="detail-row">
-                      <span className="detail-label">Max Position</span>
-                      <span className="detail-value">{agent.max_position_size}</span>
-                    </div>
-                    <div className="detail-row">
-                      <span className="detail-label">Interval</span>
-                      <span className="detail-value">{agent.run_interval_seconds / 3600}h</span>
-                    </div>
-                    <div className="detail-row risk-row">
-                      <span className="detail-label">Risk Settings</span>
-                      <div className="risk-values">
-                        <span className="risk-item">
-                          <span className="risk-label">SL:</span>
-                          <span className="risk-value negative">-{agent.stop_loss_pct || 2}%</span>
+                    {/* Compact key params */}
+                    <div style={{ display: 'flex', gap: '.6rem', flexWrap: 'wrap', marginBottom: '.25rem' }}>
+                      {[
+                        { l: 'SL', v: `-${agent.stop_loss_pct || 2}%`, c: 'var(--red)' },
+                        { l: 'TP', v: `+${agent.take_profit_pct || 4}%`, c: 'var(--green)' },
+                        ...(agent.trailing_stop_pct ? [{ l: 'TS', v: `${agent.trailing_stop_pct}%`, c: 'var(--amber)' }] : []),
+                        { l: 'Size', v: `${agent.max_position_size}×`, c: undefined },
+                        { l: 'Run', v: agent.run_interval_seconds >= 3600 ? `${agent.run_interval_seconds / 3600}h` : `${agent.run_interval_seconds / 60}m`, c: undefined },
+                      ].map(({ l, v, c }) => (
+                        <span key={l} style={{ fontSize: '.65rem', fontFamily: 'var(--mono)', color: 'var(--text-dim)', display: 'flex', gap: '.18rem' }}>
+                          {l}:<span style={{ color: c ?? 'var(--text-secondary)', fontWeight: 600 }}>{v}</span>
                         </span>
-                        <span className="risk-item">
-                          <span className="risk-label">TP:</span>
-                          <span className="risk-value positive">+{agent.take_profit_pct || 4}%</span>
-                        </span>
-                        {agent.trailing_stop_pct ? (
-                          <span className="risk-item">
-                            <span className="risk-label">TS:</span>
-                            <span className="risk-value">{agent.trailing_stop_pct}%</span>
-                          </span>
-                        ) : null}
-                      </div>
+                      ))}
                     </div>
                     {backtestLoading === agent.id && backtestProgress && (
                       <div className="backtest-progress-card">
@@ -861,21 +969,71 @@ export function AgentsPage() {
                           <span>Max DD: {(backtestResults[agent.id].metrics.max_drawdown * 100)?.toFixed(1)}%</span>
                           <span>Sharpe: {backtestResults[agent.id].metrics.sharpe_ratio?.toFixed(2)}</span>
                         </div>
+                        {/* Phase 1 — Monte Carlo bootstrap percentiles. Only render when present;
+                            old runs persisted before MC shipped won't have it. */}
+                        {backtestResults[agent.id].mc_summary && (
+                          <div className="backtest-mc-strip" title={`Bootstrap of ${backtestResults[agent.id].mc_summary.n_simulations} resampled paths over ${backtestResults[agent.id].mc_summary.n_trades} trades`}>
+                            <span className="mc-label">MC p5 / p50 / p95:</span>
+                            <span>
+                              PnL ${backtestResults[agent.id].mc_summary.final_pnl.p5?.toFixed(0)} / ${backtestResults[agent.id].mc_summary.final_pnl.p50?.toFixed(0)} / ${backtestResults[agent.id].mc_summary.final_pnl.p95?.toFixed(0)}
+                            </span>
+                            <span>
+                              DD {(backtestResults[agent.id].mc_summary.max_drawdown.p5 * 100)?.toFixed(1)}% / {(backtestResults[agent.id].mc_summary.max_drawdown.p50 * 100)?.toFixed(1)}% / {(backtestResults[agent.id].mc_summary.max_drawdown.p95 * 100)?.toFixed(1)}%
+                            </span>
+                          </div>
+                        )}
                         {backtestResults[agent.id].equity_curve && backtestResults[agent.id].equity_curve.length > 0 && (
                           <div className="equity-curve-mini">
-                            <svg viewBox={`0 0 ${backtestResults[agent.id].equity_curve.length} 40`} preserveAspectRatio="none" className="equity-sparkline">
-                              {(() => {
-                                const curve = backtestResults[agent.id].equity_curve;
-                                const min = Math.min(...curve);
-                                const max = Math.max(...curve);
-                                const range = max - min || 1;
-                                const points = curve.map((v: number, i: number) =>
-                                  `${i},${40 - ((v - min) / range) * 38}`
-                                ).join(' ');
-                                const isPositive = curve[curve.length - 1] >= curve[0];
-                                return <polyline points={points} fill="none" stroke={isPositive ? '#22c55e' : '#ef4444'} strokeWidth="1.5" />;
-                              })()}
-                            </svg>
+                            {(() => {
+                              const curve = backtestResults[agent.id].equity_curve;
+                              const mc = backtestResults[agent.id].mc_summary;
+                              // Combine MC band extremes with deterministic curve so the
+                              // y-axis fits both. Without this, a deterministic peak above
+                              // the p95 band gets clipped — which would look like a bug.
+                              const allValues: number[] = [...curve];
+                              if (mc?.equity_bands) {
+                                allValues.push(...mc.equity_bands.p5, ...mc.equity_bands.p95);
+                              }
+                              const min = Math.min(...allValues);
+                              const max = Math.max(...allValues);
+                              const range = max - min || 1;
+                              const width = curve.length;
+                              const yScale = (v: number) => 40 - ((v - min) / range) * 38;
+                              const points = curve.map((v: number, i: number) => `${i},${yScale(v)}`).join(' ');
+                              const isPositive = curve[curve.length - 1] >= curve[0];
+
+                              // Build the p5–p95 confidence band as a closed polygon.
+                              // Trade-axis indices come back in `trade_index` (0..n_trades);
+                              // remap to 0..(curve.length-1) so the band aligns with the
+                              // bar-indexed equity curve drawn behind it.
+                              let bandPoly: string | null = null;
+                              if (mc?.equity_bands && mc.equity_bands.p5.length > 1) {
+                                const tradeIdx: number[] = mc.equity_bands.trade_index;
+                                const maxTradeIdx = tradeIdx[tradeIdx.length - 1] || 1;
+                                const xRemap = (ti: number) => (ti / maxTradeIdx) * (width - 1);
+                                const upper = mc.equity_bands.p95.map((v: number, i: number) => `${xRemap(tradeIdx[i])},${yScale(v)}`);
+                                const lower = mc.equity_bands.p5.map((v: number, i: number) => `${xRemap(tradeIdx[i])},${yScale(v)}`).reverse();
+                                bandPoly = [...upper, ...lower].join(' ');
+                              }
+
+                              return (
+                                <svg viewBox={`0 0 ${width} 40`} preserveAspectRatio="none" className="equity-sparkline">
+                                  {bandPoly && (
+                                    <polygon
+                                      points={bandPoly}
+                                      fill={isPositive ? 'rgba(34, 197, 94, 0.18)' : 'rgba(239, 68, 68, 0.18)'}
+                                      stroke="none"
+                                    />
+                                  )}
+                                  <polyline
+                                    points={points}
+                                    fill="none"
+                                    stroke={isPositive ? '#22c55e' : '#ef4444'}
+                                    strokeWidth="1.5"
+                                  />
+                                </svg>
+                              );
+                            })()}
                           </div>
                         )}
                         {backtestResults[agent.id].trades && backtestResults[agent.id].trades.length > 0 && (
@@ -889,6 +1047,269 @@ export function AgentsPage() {
                         )}
                       </div>
                     )}
+                    {walkForwardError[agent.id] && (
+                      <div className="wf-error">
+                        <span className="wf-error-icon">⚠️</span>
+                        <span>{walkForwardError[agent.id]}</span>
+                        <button type="button" onClick={() => setWalkForwardError(prev => ({ ...prev, [agent.id]: undefined }))} className="wf-error-dismiss">✕</button>
+                      </div>
+                    )}
+                    {(walkForwardLoading === agent.id || walkForwardProgress[agent.id]) && (
+                      <div className="wf-loading">
+                        <div className="wf-loading-spinner" />
+                        <span>Running walk-forward analysis...</span>
+                        {walkForwardProgress[agent.id] && (
+                          <div className="wf-progress-bar">
+                            <div 
+                              className="wf-progress-fill" 
+                              style={{ width: `${(walkForwardProgress[agent.id].current / walkForwardProgress[agent.id].total) * 100}%` }}
+                            />
+                          </div>
+                        )}
+                      </div>
+                    )}
+                    {walkForwardResults[agent.id] && (() => {
+                      const wf = walkForwardResults[agent.id];
+                      const deg = wf.degradation_ratio;
+                      const degClass = (() => {
+                        if (deg == null || Number.isNaN(deg)) return 'neutral';
+                        if (deg >= 0.7) return 'positive';
+                        if (deg >= 0.4) return 'neutral';
+                        return 'negative';
+                      })();
+                      const degLabel = (deg == null || Number.isNaN(deg))
+                        ? 'N/A'
+                        : deg.toFixed(2);
+                      // Per-window IS/OOS Sharpe bar pair — minimal SVG to keep this
+                      // component self-contained, no recharts dep needed.
+                      const windows = wf.windows || [];
+                      const allSharpes = windows.flatMap((w: any) => [w.is_sharpe, w.oos_sharpe]);
+                      const maxAbs = Math.max(...allSharpes.map((s: number) => Math.abs(s)), 0.5);
+                      return (
+                        <div className="walk-forward-panel">
+                          <div className="walk-forward-header">
+                            <span className="wf-title">Walk-forward ({wf.mode}, {wf.n_windows} windows)</span>
+                            <span className={`wf-degradation ${degClass}`}>
+                              OOS/IS Sharpe: {degLabel}
+                            </span>
+                            <span className="wf-meta">
+                              IS μ {wf.mean_is_sharpe?.toFixed(2)} → OOS μ {wf.mean_oos_sharpe?.toFixed(2)}
+                            </span>
+                            <span className="wf-meta">
+                              OOS DD {(wf.oos_max_drawdown * 100).toFixed(1)}%
+                            </span>
+                          </div>
+                          {windows.length > 0 && (
+                            <div className="walk-forward-bars">
+                              {windows.map((w: any, i: number) => {
+                                const isHeight = (Math.abs(w.is_sharpe) / maxAbs) * 28;
+                                const oosHeight = (Math.abs(w.oos_sharpe) / maxAbs) * 28;
+                                return (
+                                  <div key={i} className="wf-window">
+                                    <svg viewBox="0 0 20 32" className="wf-bar-pair" preserveAspectRatio="none">
+                                      <rect
+                                        x="2" y={w.is_sharpe >= 0 ? 30 - isHeight : 30}
+                                        width="7" height={isHeight}
+                                        fill="rgba(140, 140, 200, 0.7)"
+                                      />
+                                      <rect
+                                        x="11" y={w.oos_sharpe >= 0 ? 30 - oosHeight : 30}
+                                        width="7" height={oosHeight}
+                                        fill={w.oos_sharpe >= 0 ? '#22c55e' : '#ef4444'}
+                                      />
+                                      <line x1="0" y1="30" x2="20" y2="30" stroke="rgba(255,255,255,0.15)" strokeWidth="0.5" />
+                                    </svg>
+                                    <span className="wf-window-label">W{i + 1}</span>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+                          <div className="wf-legend">
+                            <span><span className="wf-swatch is" /> IS</span>
+                            <span><span className="wf-swatch oos-pos" /> OOS+</span>
+                            <span><span className="wf-swatch oos-neg" /> OOS−</span>
+                          </div>
+                        </div>
+);
+                    })}
+                    {sensitivityError[agent.id] && (
+                      <div className="sens-error">
+                        <span className="sens-error-icon">⚠️</span>
+                        <span>{sensitivityError[agent.id]}</span>
+                        <button type="button" onClick={() => setSensitivityError(prev => ({ ...prev, [agent.id]: undefined }))} className="sens-error-dismiss">✕</button>
+                      </div>
+                    )}
+                    {(sensitivityLoading === agent.id || sensitivityProgress[agent.id]) && (
+                      <div className="sens-loading">
+                        <div className="sens-loading-spinner" />
+                        <span>Running sensitivity sweep...</span>
+                        {sensitivityProgress[agent.id] && (
+                          <div className="sens-progress-bar">
+                            <div 
+                              className="sens-progress-fill" 
+                              style={{ width: `${(sensitivityProgress[agent.id].current / sensitivityProgress[agent.id].total) * 100}%` }}
+                            />
+                          </div>
+                        )}
+                      </div>
+                    )}
+                    {sensitivityResults[agent.id] && (() => {
+                      const sr = sensitivityResults[agent.id];
+                      const cells = sr.cells || [];
+                      const valuesX = sr.values_x || [];
+                      const valuesY = sr.values_y || [];
+                      // Colour-map across the full Sharpe range. Pick the
+                      // absolute max so the diverging scale (red→white→green)
+                      // pivots at zero.
+                      const allSharpes = cells
+                        .flat()
+                        .filter((c: any) => c)
+                        .map((c: any) => c.sharpe);
+                      const maxAbs = Math.max(...allSharpes.map((s: number) => Math.abs(s)), 0.5);
+                      // Diverging colour ramp; clamp to [-1, 1] of the normalized
+                      // Sharpe so extreme cells don't wash out the centre.
+                      const cellColour = (sharpe: number | undefined): string => {
+                        if (sharpe == null || Number.isNaN(sharpe)) return 'rgba(80,80,80,0.4)';
+                        const t = Math.max(-1, Math.min(1, sharpe / maxAbs));
+                        if (t >= 0) {
+                          // 0 (neutral) → 1 (deep green). Lerp from #2a2a3a → #22c55e
+                          const r = Math.round(42 + (34 - 42) * t);
+                          const g = Math.round(42 + (197 - 42) * t);
+                          const b = Math.round(58 + (94 - 58) * t);
+                          return `rgb(${r}, ${g}, ${b})`;
+                        }
+                        // -1 (deep red) → 0 (neutral). Lerp from #ef4444 → #2a2a3a
+                        const u = -t; // 0..1
+                        const r = Math.round(42 + (239 - 42) * u);
+                        const g = Math.round(42 + (68 - 42) * u);
+                        const b = Math.round(58 + (68 - 58) * u);
+                        return `rgb(${r}, ${g}, ${b})`;
+                      };
+                      const tierClass = (() => {
+                        if (sr.stability_tier === 'plateau') return 'positive';
+                        if (sr.stability_tier === 'moderate') return 'neutral';
+                        if (sr.stability_tier === 'knife_edge') return 'negative';
+                        return 'neutral';
+                      })();
+                      // Cell box geometry — square cells, fixed pixel size.
+                      const CELL = 36;
+                      const PAD_L = 50; // left axis labels
+                      const PAD_T = 22; // top axis labels
+                      const gridW = valuesX.length * CELL;
+                      const gridH = valuesY.length * CELL;
+                      return (
+                        <div className="sensitivity-panel">
+                          <div className="sensitivity-header">
+                            <span className="sens-title">
+                              Sensitivity ({sr.axis_x} × {sr.axis_y})
+                            </span>
+                            <span className={`sens-tier ${tierClass}`}>
+                              {sr.stability_tier}
+                              {sr.stability_score != null && !Number.isNaN(sr.stability_score) && (
+                                <> · σ {sr.stability_score.toFixed(2)}</>
+                              )}
+                            </span>
+                            <span className="sens-meta">
+                              chosen Sharpe {sr.chosen_sharpe?.toFixed(2)} · PnL ${sr.chosen_net_pnl?.toFixed(0)}
+                            </span>
+                            <span className="sens-meta">
+                              {sr.n_cells_valid}/{sr.n_cells_total} cells
+                            </span>
+                          </div>
+                          <svg
+                            viewBox={`0 0 ${PAD_L + gridW + 8} ${PAD_T + gridH + 18}`}
+                            className="sensitivity-heatmap"
+                            preserveAspectRatio="xMidYMid meet"
+                          >
+                            {/* X axis labels (top) */}
+                            {valuesX.map((v: number, xi: number) => (
+                              <text
+                                key={`xl-${xi}`}
+                                x={PAD_L + xi * CELL + CELL / 2}
+                                y={PAD_T - 6}
+                                textAnchor="middle"
+                                fontSize="9"
+                                fill="rgba(255,255,255,0.6)"
+                              >
+                                {(v * 100).toFixed(1)}%
+                              </text>
+                            ))}
+                            {/* Y axis labels (left) */}
+                            {valuesY.map((v: number, yi: number) => (
+                              <text
+                                key={`yl-${yi}`}
+                                x={PAD_L - 4}
+                                y={PAD_T + yi * CELL + CELL / 2 + 3}
+                                textAnchor="end"
+                                fontSize="9"
+                                fill="rgba(255,255,255,0.6)"
+                              >
+                                {(v * 100).toFixed(1)}%
+                              </text>
+                            ))}
+                            {/* Cells */}
+                            {cells.map((row: any[], yi: number) =>
+                              row.map((cell: any, xi: number) => {
+                                const isChosen = yi === sr.chosen_y_idx && xi === sr.chosen_x_idx;
+                                const sharpe = cell?.sharpe;
+                                return (
+                                  <g key={`c-${yi}-${xi}`}>
+                                    <rect
+                                      x={PAD_L + xi * CELL + 1}
+                                      y={PAD_T + yi * CELL + 1}
+                                      width={CELL - 2}
+                                      height={CELL - 2}
+                                      fill={cellColour(sharpe)}
+                                      stroke={isChosen ? '#fbbf24' : 'rgba(0,0,0,0.3)'}
+                                      strokeWidth={isChosen ? 2 : 0.5}
+                                    >
+                                      <title>
+                                        {`${sr.axis_x}=${(valuesX[xi] * 100).toFixed(2)}% ${sr.axis_y}=${(valuesY[yi] * 100).toFixed(2)}%\n${cell ? `Sharpe ${cell.sharpe.toFixed(2)} · PnL $${cell.net_pnl.toFixed(0)} · WR ${(cell.win_rate * 100).toFixed(0)}% · trades ${cell.trades}` : 'no data'}`}
+                                      </title>
+                                    </rect>
+                                    {cell && (
+                                      <text
+                                        x={PAD_L + xi * CELL + CELL / 2}
+                                        y={PAD_T + yi * CELL + CELL / 2 + 3}
+                                        textAnchor="middle"
+                                        fontSize="9"
+                                        fill="rgba(255,255,255,0.85)"
+                                        pointerEvents="none"
+                                      >
+                                        {sharpe?.toFixed(1)}
+                                      </text>
+                                    )}
+                                    {isChosen && (
+                                      <text
+                                        x={PAD_L + xi * CELL + CELL - 5}
+                                        y={PAD_T + yi * CELL + 9}
+                                        textAnchor="middle"
+                                        fontSize="9"
+                                        fill="#fbbf24"
+                                        pointerEvents="none"
+                                      >
+                                        ★
+                                      </text>
+                                    )}
+                                  </g>
+                                );
+                              })
+                            )}
+                            {/* Axis labels */}
+                            <text
+                              x={PAD_L + gridW / 2}
+                              y={PAD_T + gridH + 14}
+                              textAnchor="middle"
+                              fontSize="9"
+                              fill="rgba(255,255,255,0.5)"
+                            >
+                              {sr.axis_x}
+                            </text>
+                          </svg>
+                        </div>
+                      );
+                    })()}
                   </div>
                   {agentMetrics[agent.id] && (() => {
                     const m = agentMetrics[agent.id];
@@ -1041,6 +1462,36 @@ export function AgentsPage() {
                       disabled={backtestLoading === agent.id}
                     >
                       {backtestLoading === agent.id ? backtestProgress?.phase.replace('…', '') || 'Running…' : 'Backtest'}
+                    </button>
+                    <button
+                      type="button"
+                      className="backtest-btn"
+                      onClick={() => runWalkForward(
+                        agent.id,
+                        (agent.trading_pairs ?? [])[0] || 'BTCUSDT',
+                        agent.timeframe || '1h',
+                        agent.strategy_type || 'momentum',
+                      )}
+                      disabled={walkForwardLoading === agent.id}
+                      title="6-window walk-forward analysis (slow — runs ~12 backtests)"
+                    >
+                      {walkForwardLoading === agent.id ? 'Walk-fwd…' : 'Walk-fwd'}
+                    </button>
+                    <button
+                      type="button"
+                      className="backtest-btn"
+                      onClick={() => runSensitivity(
+                        agent.id,
+                        (agent.trading_pairs ?? [])[0] || 'BTCUSDT',
+                        agent.timeframe || '1h',
+                        agent.strategy_type || 'momentum',
+                        Number(agent.stop_loss_pct ?? 0.02),
+                        Number(agent.take_profit_pct ?? 0.05),
+                      )}
+                      disabled={sensitivityLoading === agent.id}
+                      title="5×5 SL × TP sensitivity sweep (very slow — runs 25 backtests)"
+                    >
+                      {sensitivityLoading === agent.id ? 'Sensitivity…' : 'Sensitivity'}
                     </button>
                     <button type="button" className="edit-btn" onClick={() => startEdit(agent)}>Edit</button>
                     <button type="button" className="delete-btn" onClick={() => deleteAgent(agent.id)}>Delete</button>

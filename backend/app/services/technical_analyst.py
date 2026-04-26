@@ -40,6 +40,10 @@ class PriceLevels:
     pivot_points: Dict[str, float]
     fibonacci_retracements: Dict[str, float]
     fibonacci_extensions: Dict[str, float]
+    # Nearest psychologically significant round number — acts as a price magnet.
+    # Retail anchors orders to these levels; institutions use them for stop-runs.
+    # Shape: {"level": float, "distance_pct": float, "direction": "above"|"below"|"at"}
+    round_number_proximity: Optional[Dict] = None
 
     # ── Structural-level helpers ──────────────────────────────────────────────
     def all_levels_above(self, price: float) -> List[float]:
@@ -371,14 +375,72 @@ class TechnicalAnalyst:
             fib_extensions[f"{int(ratio*100)}%"] = extension
 
         pivot_data = self._calculate_pivot_points(df.tail(20))
-        
+
+        # Detect nearest psychological round-number level — retail and algo orders
+        # cluster at these prices, creating predictable support/resistance magnets.
+        current_price = float(df['close'].iloc[-1])
+        round_prox = self._detect_round_number_proximity(current_price)
+
         return PriceLevels(
             support=support_levels,
             resistance=resistance_levels,
             pivot_points=pivot_data,
             fibonacci_retracements=fib_retracements,
-            fibonacci_extensions=fib_extensions
+            fibonacci_extensions=fib_extensions,
+            round_number_proximity=round_prox,
         )
+
+    def _detect_round_number_proximity(self, price: float) -> Optional[Dict]:
+        """Find the nearest psychological round-number price level within 2%.
+
+        Retail traders anchor limit orders and mental stops to these levels.
+        Institutions exploit this predictability for stop-runs (sweeps) and
+        liquidity grabs — exactly the setups Wyckoff and mean-reversion trade.
+
+        Candidate generation scales with price magnitude so $1k BTC levels
+        don't show up on a $2 altcoin and vice versa.
+        """
+        if price <= 0:
+            return None
+
+        candidates: List[float] = []
+        # Generate round-number candidates at multiple scales proportional to price.
+        # Arrr — the multipliers below cover the full crypto price spectrum.
+        # The logic: find the order of magnitude, then generate multiples at 1×, 2×, 5×, 10× that unit.
+        import math
+        magnitude = 10 ** math.floor(math.log10(price))
+        for unit_multiplier in (1, 2, 5, 10):
+            unit = magnitude * unit_multiplier
+            # Nearest multiple below and above price
+            lower = math.floor(price / unit) * unit
+            upper = lower + unit
+            if lower > 0:
+                candidates.append(float(lower))
+            candidates.append(float(upper))
+
+        # Also include half-magnitudes (e.g. $50k, $150k) — widely watched in crypto
+        half_unit = magnitude * 5
+        half_lower = math.floor(price / half_unit) * half_unit
+        candidates.append(float(half_lower))
+        candidates.append(float(half_lower + half_unit))
+
+        # Pick the closest candidate within 2% of current price
+        _THRESHOLD = 0.02
+        best: Optional[Dict] = None
+        for level in candidates:
+            if level <= 0:
+                continue
+            distance_pct = abs(price - level) / level
+            if distance_pct <= _THRESHOLD:
+                if best is None or distance_pct < best["distance_pct"]:
+                    direction = "at" if distance_pct < 0.001 else ("above" if level > price else "below")
+                    best = {
+                        "level": round(level, 8),
+                        "distance_pct": round(distance_pct, 6),
+                        "direction": direction,
+                    }
+
+        return best
 
     def _calculate_pivot_points(self, df: pd.DataFrame) -> Dict[str, float]:
         if len(df) < 2:

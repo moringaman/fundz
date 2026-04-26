@@ -272,6 +272,9 @@ export function DashboardPage() {
         })}
       </div>
 
+      {/* ── Open positions ── */}
+      <PositionsTableComponent />
+
       {/* ── Main dashboard grid ── */}
       <div className="dash-grid">
 
@@ -313,19 +316,17 @@ export function DashboardPage() {
                 </div>
               </div>
             </div>
+            {klines && klines.length > 0 && (
+              <div style={{ borderTop: '1px solid var(--border)', padding: '.5rem 1.5rem .8rem' }}>
+                <div style={{ fontSize: '.58rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: '.35rem' }}>
+                  Price Action · 24h
+                </div>
+                <div style={{ height: '96px', position: 'relative' }}>
+                  <MiniChart data={klines.slice(-24)} />
+                </div>
+              </div>
+            )}
           </div>
-
-          {/* Mini Chart */}
-          {klines && klines.length > 0 && (
-            <div className="panel" style={{ display: 'flex', flexDirection: 'column' }}>
-              <div className="panel-header">
-                <span className="panel-title">Price Action</span>
-              </div>
-              <div style={{ flex: 1, minHeight: '120px', position: 'relative' }}>
-                <MiniChart data={klines.slice(-24)} />
-              </div>
-            </div>
-          )}
 
           {/* Key Indicators */}
           {indicators && (
@@ -410,9 +411,6 @@ export function DashboardPage() {
               )}
             </div>
           </div>
-
-          {/* Whale Intelligence — mini strip */}
-          <WhaleIntelligencePanel compact mini />
 
         </div>
 
@@ -707,211 +705,112 @@ export function DashboardPage() {
             </div>
           </div>
 
-          {/* Daily Fee Budget Status */}
+          {/* Trade Gates — Fee Budget + Coverage combined */}
           <div className="panel">
             <div className="panel-header">
-              <span className="panel-title">Daily Fee Budget</span>
+              <span className="panel-title">Trade Gates</span>
+              {paperEnabled && paperPnl && (
+                <span style={{
+                  fontSize: '.65rem', fontFamily: 'var(--mono)', fontWeight: 700,
+                  color: feeBudgetUsedRatio > 1 ? 'var(--red)' : feeCoverageGuardActive ? 'var(--amber)' : 'var(--green)',
+                }}>
+                  {feeBudgetUsedRatio > 1 ? 'ENTRIES BLOCKED' : feeCoverageGuardActive ? 'GUARD ACTIVE' : 'OPEN'}
+                </span>
+              )}
             </div>
             <div className="panel-body">
               {paperEnabled && paperPnl ? (
-                <>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: '.5rem' }}>
-                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '.5rem' }}>
-                      <div className="stat-card">
-                        <div className="stat-label" style={{ fontSize: '.7rem' }}>Fees Today</div>
-                        <div className="stat-value" style={{ fontSize: '.95rem', fontFamily: 'var(--mono)' }}>
-                          ${dailyFeesForBudget.toFixed(2)}
-                        </div>
-                      </div>
-                      <div className="stat-card">
-                        <div className="stat-label" style={{ fontSize: '.7rem' }}>Budget Left</div>
-                        <div className="stat-value" style={{ fontSize: '.95rem', fontFamily: 'var(--mono)' }}>
-                          ${feeBudgetRemainingUsd.toFixed(2)}
-                        </div>
-                      </div>
-                    </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '.65rem' }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '.85rem' }}>
+
+                    {/* Left: Fee Budget */}
                     <div>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '.25rem' }}>
-                        <span style={{ fontSize: '.75rem', color: 'var(--text-secondary)' }}>Daily Fees</span>
-                        <span style={{ fontSize: '.75rem', fontFamily: 'var(--mono)', fontWeight: 600 }}>
-                          ${dailyFeesForBudget.toFixed(2)} / ${feeBudgetUsd.toFixed(2)} (50k @ {maxDailyFeesPct.toFixed(2)}%)
-                        </span>
+                      <div style={{ fontSize: '.58rem', fontFamily: 'var(--mono)', color: 'var(--text-dim)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: '.4rem' }}>
+                        Daily Budget
                       </div>
-                      <div style={{ width: '100%', height: '8px', background: 'var(--bg-elevated)', borderRadius: 4, overflow: 'hidden' }}>
-                        <div style={{
-                          width: `${Math.min(feeBudgetUsedRatio * 100, 100)}%`,
-                          height: '100%',
-                          background: feeBudgetUsedRatio > 1 ? 'var(--red)' : feeBudgetUsedRatio > 0.75 ? 'var(--amber)' : 'var(--green)',
-                          transition: 'width 0.3s ease',
-                        }} />
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '.3rem', marginBottom: '.4rem' }}>
+                        <div className="stat-card">
+                          <div className="stat-label">Fees Today</div>
+                          <div className="stat-value" style={{ fontSize: '.82rem' }}>${dailyFeesForBudget.toFixed(2)}</div>
+                        </div>
+                        <div className="stat-card">
+                          <div className="stat-label">Remaining</div>
+                          <div className="stat-value" style={{ fontSize: '.82rem' }}>${feeBudgetRemainingUsd.toFixed(2)}</div>
+                        </div>
                       </div>
-                    </div>
-                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '.5rem', marginTop: '.25rem' }}>
-                      <div className="stat-card">
-                        <div className="stat-label" style={{ fontSize: '.7rem' }}>Budget Used</div>
-                        <div className="stat-value" style={{ fontSize: '.8rem', fontFamily: 'var(--mono)' }}>
-                          {(feeBudgetUsedRatio * 100).toFixed(1)}%
+                      <div style={{ marginBottom: '.3rem' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '.18rem', fontSize: '.62rem', fontFamily: 'var(--mono)', color: 'var(--text-dim)' }}>
+                          <span>{(feeBudgetUsedRatio * 100).toFixed(1)}% used</span>
+                          <span>${feeBudgetUsd.toFixed(0)} cap</span>
+                        </div>
+                        <div style={{ width: '100%', height: '5px', background: 'var(--bg-elevated)', borderRadius: 3, overflow: 'hidden' }}>
+                          <div style={{ width: `${Math.min(feeBudgetUsedRatio * 100, 100)}%`, height: '100%', background: feeBudgetUsedRatio > 1 ? 'var(--red)' : feeBudgetUsedRatio > 0.75 ? 'var(--amber)' : 'var(--green)', transition: 'width 0.3s ease' }} />
                         </div>
                       </div>
                       <div className="stat-card">
-                        <div className="stat-label" style={{ fontSize: '.7rem' }}>Entries Status</div>
-                        <div className="stat-value" style={{
-                          fontSize: '.8rem',
-                          color: feeBudgetUsedRatio > 1 ? 'var(--red)' : 'var(--green)',
-                          fontWeight: 600,
-                        }}>
+                        <div className="stat-label">Entries</div>
+                        <div className="stat-value" style={{ fontSize: '.78rem', color: feeBudgetUsedRatio > 1 ? 'var(--red)' : 'var(--green)', fontWeight: 700 }}>
                           {feeBudgetUsedRatio > 1 ? 'BLOCKED' : 'ACTIVE'}
                         </div>
                       </div>
                     </div>
-                    <p style={{ fontSize: '.7rem', color: 'var(--text-dim)', marginTop: '.25rem', lineHeight: 1.4 }}>
-                      {feeBudgetUsedRatio > 1
-                        ? '🚫 Daily fee budget exceeded. New entries blocked until midnight UTC.'
-                        : `✓ $${dailyFeesForBudget.toFixed(2)} paid today. $${feeBudgetRemainingUsd.toFixed(2)} remaining before the UTC reset.`}
-                    </p>
-                  </div>
-                </>
-              ) : (
-                <p style={{ fontSize: '.78rem', color: 'var(--text-dim)', textAlign: 'center', padding: '1rem 0' }}>
-                  Enable paper trading to see fee budget status
-                </p>
-              )}
-            </div>
-          </div>
 
-          {/* Fee Coverage Efficiency */}
-          <div className="panel">
-            <div className="panel-header">
-              <span className="panel-title">Fee Coverage</span>
-            </div>
-            <div className="panel-body">
-              {paperEnabled && paperPnl ? (
-                <>
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '.5rem' }}>
-                    <div className="stat-card">
-                      <div className="stat-label" style={{ fontSize: '.7rem' }}>Realized / Fees</div>
-                      <div
-                        className="stat-value"
-                        style={{
-                          fontSize: '1rem',
-                          fontFamily: 'var(--mono)',
-                          color: feeCoverageRatio == null
-                            ? 'var(--text-secondary)'
-                            : feeCoverageRatio >= feeCoverageMinRatio
-                              ? 'var(--green)'
-                              : 'var(--red)',
-                        }}
-                      >
-                        {feeCoverageRatio == null ? 'N/A' : `${feeCoverageRatio.toFixed(2)}x`}
+                    {/* Right: Fee Coverage */}
+                    <div>
+                      <div style={{ fontSize: '.58rem', fontFamily: 'var(--mono)', color: 'var(--text-dim)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: '.4rem' }}>
+                        Fee Coverage
                       </div>
-                    </div>
-                    <div className="stat-card">
-                      <div className="stat-label" style={{ fontSize: '.7rem' }}>Target</div>
-                      <div className="stat-value" style={{ fontSize: '1rem', fontFamily: 'var(--mono)' }}>
-                        {feeCoverageMinRatio.toFixed(2)}x
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '.3rem', marginBottom: '.4rem' }}>
+                        <div className="stat-card">
+                          <div className="stat-label">Ratio</div>
+                          <div className="stat-value" style={{ fontSize: '.82rem', color: feeCoverageRatio == null ? 'var(--text-secondary)' : feeCoverageRatio >= feeCoverageMinRatio ? 'var(--green)' : 'var(--red)' }}>
+                            {feeCoverageRatio == null ? 'N/A' : `${feeCoverageRatio.toFixed(2)}x`}
+                          </div>
+                        </div>
+                        <div className="stat-card">
+                          <div className="stat-label">Target</div>
+                          <div className="stat-value" style={{ fontSize: '.82rem' }}>{feeCoverageMinRatio.toFixed(1)}x</div>
+                        </div>
+                      </div>
+                      <div style={{ marginBottom: '.3rem' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '.18rem', fontSize: '.62rem', fontFamily: 'var(--mono)', color: 'var(--text-dim)' }}>
+                          <span>progress</span>
+                          <span>${feeCoverageRealizedPnl.toFixed(2)} / ${feeCoverageFees.toFixed(2)}</span>
+                        </div>
+                        <div style={{ width: '100%', height: '5px', background: 'var(--bg-elevated)', borderRadius: 3, overflow: 'hidden' }}>
+                          <div style={{ width: `${Math.min(feeCoverageProgress * 100, 100)}%`, height: '100%', background: feeCoverageRatio == null ? 'var(--text-dim)' : feeCoverageRatio >= feeCoverageMinRatio ? 'var(--green)' : 'var(--red)', transition: 'width 0.3s ease' }} />
+                        </div>
+                      </div>
+                      <div className="stat-card">
+                        <div className="stat-label">Guard</div>
+                        <div className="stat-value" style={{ fontSize: '.78rem', color: !feeCoverageGuardEnabled ? 'var(--text-dim)' : feeCoverageGuardActive ? 'var(--red)' : 'var(--green)', fontWeight: 700 }}>
+                          {!feeCoverageGuardEnabled ? 'OFF' : feeCoverageGuardActive ? 'ACTIVE' : 'STANDBY'}
+                        </div>
                       </div>
                     </div>
                   </div>
-                  <div style={{ marginTop: '.5rem' }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '.25rem' }}>
-                      <span style={{ fontSize: '.75rem', color: 'var(--text-secondary)' }}>Coverage Progress</span>
-                      <span style={{ fontSize: '.75rem', fontFamily: 'var(--mono)', fontWeight: 600 }}>
-                        ${feeCoverageRealizedPnl.toFixed(2)} / ${feeCoverageFees.toFixed(2)}
+
+                  {/* 24h trend chart — full width */}
+                  <div style={{ padding: '.4rem .5rem', border: '1px solid var(--border)', background: 'var(--bg-elevated)', borderRadius: '6px' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '.22rem' }}>
+                      <span style={{ fontSize: '.6rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)', textTransform: 'uppercase', letterSpacing: '.05em' }}>24h Coverage Trend</span>
+                      <span style={{ fontSize: '.65rem', fontFamily: 'var(--mono)', color: (feeCoverageTrend.lastRatio - feeCoverageTrend.firstRatio) >= 0 ? 'var(--green)' : 'var(--red)' }}>
+                        {(feeCoverageTrend.lastRatio - feeCoverageTrend.firstRatio) >= 0 ? '+' : ''}{(feeCoverageTrend.lastRatio - feeCoverageTrend.firstRatio).toFixed(2)}x
                       </span>
                     </div>
-                    <div style={{ width: '100%', height: '8px', background: 'var(--bg-elevated)', borderRadius: 4, overflow: 'hidden' }}>
-                      <div style={{
-                        width: `${Math.min(feeCoverageProgress * 100, 100)}%`,
-                        height: '100%',
-                        background: feeCoverageRatio == null
-                          ? 'var(--text-dim)'
-                          : feeCoverageRatio >= feeCoverageMinRatio
-                            ? 'var(--green)'
-                            : 'var(--red)',
-                        transition: 'width 0.3s ease',
-                      }} />
-                    </div>
-                  </div>
-                  <div style={{ marginTop: '.6rem', padding: '.45rem .5rem', border: '1px solid var(--border)', background: 'var(--bg-elevated)' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '.28rem' }}>
-                      <span style={{ fontSize: '.68rem', color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '.08em' }}>24h Fee Coverage Trend</span>
-                      <span
-                        style={{
-                          fontSize: '.68rem',
-                          fontFamily: 'var(--mono)',
-                          color: (feeCoverageTrend.lastRatio - feeCoverageTrend.firstRatio) >= 0 ? 'var(--green)' : 'var(--red)',
-                        }}
-                      >
-                        {(feeCoverageTrend.lastRatio - feeCoverageTrend.firstRatio) >= 0 ? '+' : ''}
-                        {(feeCoverageTrend.lastRatio - feeCoverageTrend.firstRatio).toFixed(2)}x
-                      </span>
-                    </div>
-                    <svg
-                      viewBox={`0 0 ${feeCoverageTrend.width} ${feeCoverageTrend.height}`}
-                      style={{ width: '100%', height: '56px', display: 'block' }}
-                      preserveAspectRatio="none"
-                    >
-                      <line
-                        x1="0"
-                        y1={feeCoverageTrend.height / 2}
-                        x2={feeCoverageTrend.width}
-                        y2={feeCoverageTrend.height / 2}
-                        stroke="var(--border)"
-                        strokeWidth="1"
-                        opacity="0.8"
-                      />
-                      <polyline
-                        fill="none"
-                        stroke={feeCoverageTrend.lastRatio >= feeCoverageMinRatio ? 'var(--green)' : 'var(--accent)'}
-                        strokeWidth="2"
-                        points={feeCoverageTrend.polyline}
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                      />
+                    <svg viewBox={`0 0 ${feeCoverageTrend.width} ${feeCoverageTrend.height}`} style={{ width: '100%', height: '44px', display: 'block' }} preserveAspectRatio="none">
+                      <line x1="0" y1={feeCoverageTrend.height / 2} x2={feeCoverageTrend.width} y2={feeCoverageTrend.height / 2} stroke="var(--border)" strokeWidth="1" opacity="0.8" />
+                      <polyline fill="none" stroke={feeCoverageTrend.lastRatio >= feeCoverageMinRatio ? 'var(--green)' : 'var(--accent)'} strokeWidth="2" points={feeCoverageTrend.polyline} strokeLinecap="round" strokeLinejoin="round" />
                     </svg>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '.2rem' }}>
-                      <span style={{ fontSize: '.64rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)' }}>-24h</span>
-                      <span style={{ fontSize: '.64rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)' }}>Now</span>
+                    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                      <span style={{ fontSize: '.6rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)' }}>-24h</span>
+                      <span style={{ fontSize: '.6rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)' }}>Now</span>
                     </div>
                   </div>
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '.5rem', marginTop: '.5rem' }}>
-                    <div className="stat-card">
-                      <div className="stat-label" style={{ fontSize: '.7rem' }}>Guard</div>
-                      <div
-                        className="stat-value"
-                        style={{
-                          fontSize: '.82rem',
-                          color: !feeCoverageGuardEnabled
-                            ? 'var(--text-dim)'
-                            : feeCoverageGuardActive
-                              ? 'var(--red)'
-                              : 'var(--green)',
-                          fontWeight: 700,
-                        }}
-                      >
-                        {!feeCoverageGuardEnabled ? 'OFF' : feeCoverageGuardActive ? 'ACTIVE' : 'STANDBY'}
-                      </div>
-                    </div>
-                    <div className="stat-card">
-                      <div className="stat-label" style={{ fontSize: '.7rem' }}>Activation Fees</div>
-                      <div className="stat-value" style={{ fontSize: '.82rem', fontFamily: 'var(--mono)' }}>
-                        ${feeCoverageMinFeesUsd.toFixed(0)}
-                      </div>
-                    </div>
-                  </div>
-                  <p style={{ fontSize: '.7rem', color: 'var(--text-dim)', marginTop: '.35rem', lineHeight: 1.4 }}>
-                    {!feeCoverageGuardEnabled
-                      ? 'Fee coverage guard is disabled in Trade Gates.'
-                      : feeCoverageFees < feeCoverageMinFeesUsd
-                        ? `Tracking phase: guard activates after $${feeCoverageMinFeesUsd.toFixed(0)} fees.`
-                        : feeCoverageGuardActive
-                          ? `Guard active: ratio ${feeCoverageRatio?.toFixed(2)}x below target ${feeCoverageMinRatio.toFixed(2)}x. New entries are being tightened.`
-                          : `Healthy edge: ratio ${feeCoverageRatio?.toFixed(2)}x is meeting target ${feeCoverageMinRatio.toFixed(2)}x.`}
-                  </p>
-                </>
+                </div>
               ) : (
                 <p style={{ fontSize: '.78rem', color: 'var(--text-dim)', textAlign: 'center', padding: '1rem 0' }}>
-                  Enable paper trading to see fee coverage status
+                  Enable paper trading to see gate status
                 </p>
               )}
             </div>
@@ -1052,8 +951,8 @@ export function DashboardPage() {
 
       </div>{/* end dash-grid */}
 
-      {/* Open positions with leverage diagnostics */}
-      <PositionsTableComponent />
+      {/* Whale Intelligence — full width strip */}
+      <WhaleIntelligencePanel compact />
     </div>
   );
 }

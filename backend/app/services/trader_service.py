@@ -23,7 +23,7 @@ DEFAULT_TRADERS = [
     {
         "name": "Kai Nakamura",
         "llm_provider": "openrouter",
-        "llm_model": "anthropic/claude-sonnet-4",
+        "llm_model": "anthropic/claude-sonnet-4-5",
         "config": {
             "style": "Calm and methodical. Waits for high-conviction setups with strong multi-timeframe confluence before committing. Never chases.",
             "risk_tolerance": "moderate",
@@ -35,7 +35,7 @@ DEFAULT_TRADERS = [
     {
         "name": "Zara Hassan",
         "llm_provider": "openrouter",
-        "llm_model": "openai/gpt-4o",
+        "llm_model": "openai/gpt-4.1",
         "config": {
             "style": "Aggressive and conviction-driven. Moves fast on breakouts, cuts losers without hesitation, and lets winners run with tight trailing stops.",
             "risk_tolerance": "high",
@@ -47,7 +47,7 @@ DEFAULT_TRADERS = [
     {
         "name": "Otto Brenner",
         "llm_provider": "openrouter",
-        "llm_model": "google/gemini-2.0-flash-001",
+        "llm_model": "google/gemini-2.5-flash",
         "config": {
             "style": "Conservative contrarian. Fades extremes, targets mean reversion, and keeps position sizes small for consistent compounding over big swings.",
             "risk_tolerance": "low",
@@ -133,6 +133,30 @@ class TraderService:
         config = trader.get("config", {})
         metrics_by_id = {m.get("agent_id"): m for m in agent_metrics}
 
+        # Fetch latest sensitivity data for each agent
+        sensitivity_by_agent: Dict[str, Dict] = {}
+        try:
+            from sqlalchemy import select, desc
+            from app.models import SensitivityRecord
+            from app.database import get_async_session
+            agent_ids = [a['id'] for a in trader_agents if a.get('id')]
+            if agent_ids:
+                async with get_async_session() as _sess:
+                    _q = (
+                        select(SensitivityRecord)
+                        .where(SensitivityRecord.agent_id.in_(agent_ids))
+                        .order_by(desc(SensitivityRecord.created_at))
+                    )
+                    _res = await _sess.execute(_q)
+                    for _row in _res.scalars().all():
+                        if _row.agent_id and _row.agent_id not in sensitivity_by_agent:
+                            sensitivity_by_agent[_row.agent_id] = {
+                                'stability_tier': _row.stability_tier,
+                                'stability_score': _row.stability_score,
+                            }
+        except Exception:
+            pass
+
         agent_summary_lines = []
         for a in trader_agents:
             m = metrics_by_id.get(a["id"], {})
@@ -144,6 +168,18 @@ class TraderService:
                 for _vn, _vs in venue_stats.items():
                     _parts.append(f"{_vn}: WR={_vs.get('win_rate', 0):.0%} P&L=${_vs.get('pnl', 0):.2f} ({_vs.get('trades', 0)}t)")
                 _venue_breakdown = " [" + " | ".join(_parts) + "]"
+            
+            _sens = sensitivity_by_agent.get(a["id"])
+            _stability = ""
+            if _sens:
+                tier = _sens.get('stability_tier', 'unknown')
+                if tier == 'knife_edge':
+                    _stability = " ⚠️ STABILITY: KNIFE_EDGE (fragile - adjust SL/TP)"
+                elif tier == 'moderate':
+                    _stability = " ℹ️ STABILITY: moderate"
+                elif tier == 'plateau':
+                    _stability = " ✅ STABILITY: plateau (robust)"
+            
             agent_summary_lines.append(
                 f"  • {a['name']} ({a.get('strategy_type','?')}) — "
                 f"pairs: {', '.join(pairs)}, "
@@ -153,6 +189,7 @@ class TraderService:
                 f"runs: {m.get('total_runs', 0)}, "
                 f"enabled: {a.get('is_enabled', False)}"
                 f"{_venue_breakdown}"
+                f"{_stability}"
             )
         agent_block = "\n".join(agent_summary_lines) if agent_summary_lines else "  (no agents yet)"
 
@@ -174,6 +211,16 @@ class TraderService:
             whale_block = whale_intelligence.build_llm_context_block(whale_report)
         except Exception:
             pass  # Trader prompt continues without whale data
+
+        # Additive: inject Fear & Greed sentiment (graceful degradation)
+        # Mirrors the whale_intelligence pattern exactly — same import style, same guard.
+        fg_block = ""
+        try:
+            from app.services.sentiment_service import sentiment_service
+            _fg = await sentiment_service.fetch_fear_greed()
+            fg_block = sentiment_service.build_llm_context_block(_fg)
+        except Exception:
+            pass  # Trader prompt continues without F&G data
 
         # Additive: inject Marina's regime-derived strategy recommendations
         marina_block = ""
@@ -241,6 +288,7 @@ MARKET CONDITIONS:
   Momentum: {market_condition.get('momentum', '?')}
 {confluence_block}
 {whale_block}
+{fg_block}
 {marina_block}
 
 STRATEGY REFERENCE:
@@ -263,6 +311,7 @@ Rules:
 - Each agent should have a clear purpose and differentiated strategy
 - Don't create duplicates of existing agents
 - Disable agents with consistently negative P&L after 10+ runs
+- **CRITICAL: If an agent shows "KNIFE_EDGE" stability, you MUST propose an "adjust_params" action to change its stop_loss_pct or take_profit_pct. Knife-edge strategies are fragile — small market changes can break them. Move SL/TP toward more robust values (e.g., wider SL like 3-4%, moderate TP like 5-8%).**
 - If market is sideways / ranging with low volatility, prefer mean_reversion or grid; if trending, prefer momentum/breakout/ema_crossover
 - Grid strategy (`strategy_type: "grid"`) requires Marina's explicit recommendation or confirmed ranging/low-volatility regime before proposing
 - Marina's research recommendations above are research-grade signals — strongly consider them when proposing new agents or re-enabling existing ones

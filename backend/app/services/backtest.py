@@ -32,6 +32,9 @@ class BacktestResult:
     trades: List[Dict]
     equity_curve: List[float] = field(default_factory=list)
     drawdown_curve: List[float] = field(default_factory=list)
+    # Phase 1 — Monte Carlo bootstrap percentiles. None when MC was disabled
+    # or when the backtest produced zero trades (nothing to resample).
+    mc_summary: Optional[Dict] = None
 
 
 @dataclass
@@ -58,6 +61,14 @@ class BacktestConfig:
     # 5000 candles: ~208 days on 1h, ~35 days on 15m, ~833 days on 4h, ~13.7 years on 1d
     # Minimum 500 candles for robust indicator calculation
     candle_limit: int = 5000      # EXPANDED from 2000; fetched in paginated 1000-candle batches
+    # ── Monte Carlo (Phase 1) ─────────────────────────────────────────────
+    # Trade-level bootstrap of the realised PnL list. Cheap relative to the
+    # backtest itself; default ON so every result carries uncertainty bands.
+    run_montecarlo: bool = True
+    # None → adaptive sizing in backtest_montecarlo.bootstrap_equity_paths
+    mc_simulations: Optional[int] = None
+    # Provide for reproducible tests; None = stochastic
+    mc_seed: Optional[int] = None
 
 
 class BacktestEngine:
@@ -96,6 +107,9 @@ class BacktestEngine:
         atr     = ind.calculate_atr(high, low, close)
         vol_sma = ind.calculate_volume_sma(volume)
         adx     = ind.calculate_adx(high, low, close) if len(df) >= 28 else pd.Series([np.nan] * len(df))
+        _dm_tuple = ind.calculate_directional_movement(high, low, close) if len(df) >= 28 else None
+        plus_di  = _dm_tuple[1] if _dm_tuple is not None else pd.Series([np.nan] * len(df))
+        minus_di = _dm_tuple[2] if _dm_tuple is not None else pd.Series([np.nan] * len(df))
         ema9    = ind.calculate_ema(close, 9)
         ema21   = ind.calculate_ema(close, 21)
 
@@ -103,6 +117,12 @@ class BacktestEngine:
         _bb_widths = (bb["upper"] - bb["lower"]) / bb["middle"].replace(0, np.nan)
         _bb_roll   = _bb_widths.rolling(40).mean()
         bb_width_ratio = (_bb_widths / _bb_roll.replace(0, np.nan)).round(3)
+
+        # BB width percentile for volatility_regime_switch (120-bar rolling rank)
+        bb_width_pct = _bb_widths.rolling(120, min_periods=20).apply(
+            lambda x: float((x[:-1] < x[-1]).sum()) / max(len(x) - 1, 1) if len(x) > 1 else float("nan"),
+            raw=True,
+        )
 
         # ── Ichimoku (all rolling → compute once) ─────────────────────────────
         def _mid(h: pd.Series, l: pd.Series, p: int) -> pd.Series:
@@ -191,8 +211,10 @@ class BacktestEngine:
             "sma20": sma20, "sma50": sma50, "sma200": sma200,
             "macd": macd_df["macd"], "macd_signal": macd_df["signal"], "macd_histogram": macd_df["histogram"],
             "atr": atr, "vol_sma": vol_sma, "adx": adx,
+            "plus_di": plus_di, "minus_di": minus_di,
             "ema9": ema9, "ema21": ema21,
             "bb_width_ratio": bb_width_ratio,
+            "bb_width_pct": bb_width_pct,
             # Ichimoku
             "ichi_tenkan": ichi_tenkan, "ichi_kijun": ichi_kijun,
             "ichi_sa": ichi_sa, "ichi_sb": ichi_sb,
@@ -292,6 +314,8 @@ class BacktestEngine:
             "atr":             _f(p["atr"]),
             "volume_sma":      _f(p["vol_sma"]),
             "adx":             _f(p["adx"]),
+            "plus_di":         _f(p["plus_di"]),
+            "minus_di":        _f(p["minus_di"]),
             # S/R
             "at_support":          sr.get("at_support", False),
             "at_resistance":       sr.get("at_resistance", False),
@@ -348,11 +372,28 @@ class BacktestEngine:
             "_prev_ema_fast": _fp(p["ema9"]),
             "_prev_ema_slow": _fp(p["ema21"]),
             "_bb_width_ratio": _f(p["bb_width_ratio"]),
+            "_bb_width_pct":   _f(p["bb_width_pct"]),
             "_current_volume": _f(p["volume"]),
         }
 
-    async def run_backtest(self, config: BacktestConfig) -> BacktestResult:
-        klines = await self._fetch_historical_data(config)
+    async def run_backtest(
+        self,
+        config: BacktestConfig,
+        _klines: Optional[List[Dict]] = None,
+    ) -> BacktestResult:
+        """Run a single backtest pass.
+
+        Parameters
+        ----------
+        config : BacktestConfig
+            Strategy / risk / data-window settings.
+        _klines : optional
+            Pre-fetched candle list. Phase 2 walk-forward fetches once and
+            replays slices through this hatch to avoid hammering the exchange
+            N×n_windows times. Public callers leave this None — backwards
+            compatible.
+        """
+        klines = _klines if _klines is not None else await self._fetch_historical_data(config)
 
         # Require minimum 500 candles for robust indicator calculation (RSI, MACD, Bollinger Bands need warmup)
         if len(klines) < 500:
@@ -590,7 +631,26 @@ class BacktestEngine:
             dd = (peak_balance - balance) / peak_balance if peak_balance > 0 else 0
             drawdown_curve.append(dd)
 
-        return self._calculate_metrics(trades, equity_curve, drawdown_curve, config.initial_balance, total_fees)
+        result = self._calculate_metrics(trades, equity_curve, drawdown_curve, config.initial_balance, total_fees)
+
+        # Attach Monte Carlo bootstrap percentiles. Failure here must not sink the
+        # whole backtest — log and continue with mc_summary=None so callers can
+        # gracefully degrade. Arrr, the deterministic result be the source of truth;
+        # MC is decoration that builds trust in it.
+        if config.run_montecarlo and result.total_trades > 0:
+            try:
+                from app.services.backtest_montecarlo import bootstrap_equity_paths
+                result.mc_summary = bootstrap_equity_paths(
+                    trades=result.trades,
+                    initial_balance=config.initial_balance,
+                    n_simulations=config.mc_simulations,
+                    seed=config.mc_seed,
+                )
+            except Exception as exc:
+                logger.warning(f"Monte Carlo bootstrap failed, returning deterministic result only: {exc}")
+                result.mc_summary = None
+
+        return result
 
     async def _fetch_historical_data(self, config: BacktestConfig) -> List[Dict]:
         """
@@ -715,7 +775,8 @@ class BacktestEngine:
         total_loss = abs(sum(t.get('net_pnl', t.get('pnl', 0)) for t in losses))
         avg_win = total_win / len(wins) if wins else 0.0
         avg_loss = total_loss / len(losses) if losses else 0.0
-        profit_factor = total_win / total_loss if total_loss > 0 else float('inf') if total_win > 0 else 0.0
+        raw_pf = total_win / total_loss if total_loss > 0 else float('inf') if total_win > 0 else 0.0
+        profit_factor = float(raw_pf) if np.isfinite(raw_pf) and raw_pf <= 1e10 else 0.0
 
         # Consecutive wins/losses
         max_cw = max_cl = cw = cl = 0
@@ -730,6 +791,7 @@ class BacktestEngine:
             max_cl = max(max_cl, cl)
 
         max_dd = max(drawdown_curve) if drawdown_curve else 0.0
+        max_dd = max_dd if np.isfinite(max_dd) else 0.0
 
         # Sharpe ratio — annualized for hourly data (√8760 hours/year)
         returns = []
@@ -740,7 +802,9 @@ class BacktestEngine:
         if returns:
             avg_return = np.mean(returns)
             std_return = np.std(returns, ddof=1) if len(returns) > 1 else 1.0
-            sharpe = float(avg_return / std_return * np.sqrt(8760)) if std_return > 0 else 0.0
+            raw_sharpe = avg_return / std_return * np.sqrt(8760) if std_return > 0 else 0.0
+            # Guard against inf/NaN from extreme std or returns
+            sharpe = 0.0 if not np.isfinite(raw_sharpe) else float(raw_sharpe)
         else:
             sharpe = 0.0
 
@@ -765,22 +829,44 @@ class BacktestEngine:
             drawdown_curve=drawdown_curve,
         )
 
-    async def optimize_parameters(
+    async def _run_param_grid(
         self,
         symbol: str,
         interval: str,
         parameter_ranges: Dict[str, List],
         strategy: str = "momentum",
-    ) -> Dict:
-        best_result = None
-        best_params = {}
-        best_score = float('-inf')
-        all_results: List[Dict] = []
+        max_cells: int = 27,
+        candle_limit: int = 5000,
+    ) -> List[Dict]:
+        """Run a backtest per parameter combination. Returns raw cell results.
+
+        Shared between `optimize_parameters` (picks the winner) and the Phase 3
+        `sensitivity_analysis` (returns the whole surface). Fetches candles once
+        and reuses them across cells so the cost scales with cells, not cells×fetch.
+
+        Each returned cell dict carries the params plus headline metrics. MC
+        bootstrap is force-disabled per cell — too expensive at grid scale, and
+        sensitivity already gives ye the uncertainty story.
+        """
+        # Fetch once, reuse for every cell. Each cell's BacktestConfig still
+        # specifies candle_limit so the engine's warmup gate is satisfied, but
+        # the actual fetch is bypassed via the _klines hatch added in Phase 2.
+        _fetch_cfg = BacktestConfig(
+            symbol=symbol, interval=interval, strategy=strategy,
+            candle_limit=candle_limit, run_montecarlo=False,
+        )
+        klines = await self._fetch_historical_data(_fetch_cfg)
+        if not klines:
+            raise ValueError(f"No historical data for {symbol} {interval}")
 
         param_combinations = self._generate_param_combinations(parameter_ranges)
-
-        # Test all combinations (capped at 27 = 3^3 for safety)
-        for params in param_combinations[:27]:
+        if len(param_combinations) > max_cells:
+            logger.warning(
+                "Param grid has %d cells, capping at %d to bound runtime",
+                len(param_combinations), max_cells,
+            )
+        cells: List[Dict] = []
+        for params in param_combinations[:max_cells]:
             config = BacktestConfig(
                 symbol=symbol,
                 interval=interval,
@@ -788,20 +874,22 @@ class BacktestEngine:
                 stop_loss_pct=params.get('stop_loss', 0.02),
                 take_profit_pct=params.get('take_profit', 0.05),
                 strategy=strategy,
+                candle_limit=candle_limit,
+                run_montecarlo=False,
             )
-
             try:
-                result = await self.run_backtest(config)
-                # Composite score: risk-adjusted returns
+                result = await self.run_backtest(config, _klines=klines)
+                # Composite "fitness" score — same formula as the legacy optimizer
+                # so optimize_parameters preserves its ranking behaviour.
+                pf = result.profit_factor
                 score = (
                     result.sharpe_ratio * 0.4
                     + result.win_rate * 0.2
                     + (result.net_pnl / config.initial_balance) * 0.2
-                    + (result.profit_factor / 5.0 if result.profit_factor != float('inf') else 1.0) * 0.1
+                    + ((pf / 5.0) if pf != float('inf') else 1.0) * 0.1
                     - result.max_drawdown * 0.1
                 )
-
-                all_results.append({
+                cells.append({
                     'params': params,
                     'score': score,
                     'win_rate': result.win_rate,
@@ -809,29 +897,53 @@ class BacktestEngine:
                     'sharpe': result.sharpe_ratio,
                     'max_dd': result.max_drawdown,
                     'trades': result.total_trades,
-                    'profit_factor': result.profit_factor,
+                    'profit_factor': pf if pf != float('inf') else None,
                 })
-
-                if score > best_score:
-                    best_score = score
-                    best_result = result
-                    best_params = params
             except Exception as e:
-                logger.debug(f"Optimization combo failed: {e}")
+                logger.debug(f"Grid cell failed for {params}: {e}")
                 continue
+        return cells
 
+    async def optimize_parameters(
+        self,
+        symbol: str,
+        interval: str,
+        parameter_ranges: Dict[str, List],
+        strategy: str = "momentum",
+    ) -> Dict:
+        """Pick the best param combination by composite score.
+
+        Phase 3 refactor: delegates the grid sweep to `_run_param_grid` so the
+        sensitivity service can reuse it. Behaviour preserved — same scoring
+        formula, same 27-cell cap, same return shape.
+        """
+        all_results = await self._run_param_grid(
+            symbol, interval, parameter_ranges, strategy=strategy, max_cells=27,
+        )
+        if not all_results:
+            return {
+                'best_params': {},
+                'best_score': float('-inf'),
+                'metrics': {k: 0 for k in (
+                    'total_trades', 'win_rate', 'total_pnl', 'net_pnl', 'total_fees',
+                    'sharpe_ratio', 'max_drawdown', 'profit_factor',
+                )},
+                'all_results': [],
+            }
+
+        best_cell = max(all_results, key=lambda c: c['score'])
         return {
-            'best_params': best_params,
-            'best_score': best_score,
+            'best_params': best_cell['params'],
+            'best_score': best_cell['score'],
             'metrics': {
-                'total_trades': best_result.total_trades if best_result else 0,
-                'win_rate': best_result.win_rate if best_result else 0,
-                'total_pnl': best_result.total_pnl if best_result else 0,
-                'net_pnl': best_result.net_pnl if best_result else 0,
-                'total_fees': best_result.total_fees if best_result else 0,
-                'sharpe_ratio': best_result.sharpe_ratio if best_result else 0,
-                'max_drawdown': best_result.max_drawdown if best_result else 0,
-                'profit_factor': best_result.profit_factor if best_result else 0,
+                'total_trades': best_cell['trades'],
+                'win_rate': best_cell['win_rate'],
+                'total_pnl': best_cell['net_pnl'],   # legacy field name kept
+                'net_pnl': best_cell['net_pnl'],
+                'total_fees': 0.0,  # not tracked at grid level
+                'sharpe_ratio': best_cell['sharpe'],
+                'max_drawdown': best_cell['max_dd'],
+                'profit_factor': best_cell['profit_factor'] or 0.0,
             },
             'all_results': sorted(all_results, key=lambda x: x['score'], reverse=True)[:10],
         }

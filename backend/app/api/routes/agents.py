@@ -398,6 +398,7 @@ async def run_agent_backtest(
             profit_factor=backtest_result.profit_factor,
             equity_curve=backtest_result.equity_curve[-200:],
             trades_data=backtest_result.trades[-50:],
+            mc_summary=backtest_result.mc_summary,
             source="manual",
             candle_count=len(backtest_result.equity_curve),
         )
@@ -430,6 +431,7 @@ async def run_agent_backtest(
         },
         "trades": backtest_result.trades[-10:],
         "equity_curve": backtest_result.equity_curve,
+        "mc_summary": backtest_result.mc_summary,
     }
 
 

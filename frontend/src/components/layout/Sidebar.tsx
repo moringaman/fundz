@@ -13,9 +13,9 @@ interface SidebarProps {
 }
 
 const MARKET_CLOCKS = [
-  { label: 'London', timeZone: 'Europe/London' },
-  { label: 'New York', timeZone: 'America/New_York' },
-  { label: 'Tokyo', timeZone: 'Asia/Tokyo' },
+  { label: 'London', timeZone: 'Europe/London', hours: [{ start: 8, end: 16 }] },
+  { label: 'New York', timeZone: 'America/New_York', hours: [{ start: 9, end: 16 }] },
+  { label: 'Tokyo', timeZone: 'Asia/Tokyo', hours: [{ start: 0, end: 6 }, { start: 9, end: 15 }] },
 ];
 
 function formatMarketTime(now: Date, timeZone: string) {
@@ -25,6 +25,28 @@ function formatMarketTime(now: Date, timeZone: string) {
     minute: '2-digit',
     timeZone,
   }).format(now);
+}
+
+function getHourInTimeZone(now: Date, timeZone: string): number {
+  return parseInt(
+    new Intl.DateTimeFormat([], { hour: 'numeric', hour12: false, timeZone }).format(now)
+  );
+}
+
+function getVolumeTier(now: Date): 'high' | 'good' | 'low' {
+  const utcHour = new Date().getUTCHours();
+  
+  // NY + London overlap (14:00-16:00 UTC) - peak volume
+  if (utcHour >= 14 && utcHour < 16) return 'high';
+  
+  // London session (08:00-16:00 UTC)
+  if (utcHour >= 8 && utcHour < 16) return 'good';
+  
+  // NY session (14:00-21:00 UTC)
+  if (utcHour >= 14 && utcHour < 21) return 'good';
+  
+  // Everything else is low volume (dead zones)
+  return 'low';
 }
 
 export function Sidebar({ activePage, onNavigate }: SidebarProps) {
@@ -94,12 +116,32 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
         </div>
 
         <div className="sidebar-market-clocks">
-          {MARKET_CLOCKS.map((market) => (
-            <div key={market.label} className="sidebar-market-clock">
-              <div className="sidebar-market-clock-label">{market.label}</div>
-              <div className="sidebar-market-clock-time">{formatMarketTime(clockNow, market.timeZone)}</div>
-            </div>
-          ))}
+          {(() => {
+            const tier = getVolumeTier(clockNow);
+            return (
+              <div className={`volume-indicator volume-${tier}`}>
+                <span className="volume-label">Volume</span>
+                <span className="volume-tier">
+                  {tier === 'high' ? '● High' : tier === 'good' ? '○ Good' : '○ Low'}
+                </span>
+              </div>
+            );
+          })()}
+          {MARKET_CLOCKS.map((market) => {
+            const hour = getHourInTimeZone(clockNow, market.timeZone);
+            const isOpen = market.hours.some(({ start, end }) =>
+              start <= end ? hour >= start && hour < end : hour >= start || hour < end
+            );
+            return (
+              <div key={market.label} className={`sidebar-market-clock ${isOpen ? 'active' : ''}`}>
+                <div className="sidebar-market-clock-label">
+                  {market.label}
+                  {isOpen && <span className="session-dot" />}
+                </div>
+                <div className="sidebar-market-clock-time">{formatMarketTime(clockNow, market.timeZone)}</div>
+              </div>
+            );
+          })}
         </div>
 
         <nav className="sidebar-nav">

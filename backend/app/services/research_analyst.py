@@ -37,6 +37,13 @@ class MarketRegime:
     correlation_status: str  # "all_up", "all_down", "diverging", "mixed"
     volatility_regime: str  # "low", "medium", "high", "extreme"
     macro_context: str  # Brief macro interpretation
+    # Phase 4 — statistical posterior from the GMM regime model. None when the
+    # model hasn't been fitted yet for this symbol or the fit failed. The LLM
+    # narrative above is anchored against this when both be present; daily
+    # report flags divergence (LLM label != argmax posterior).
+    statistical_posteriors: Optional[Dict[str, float]] = None
+    statistical_label: Optional[str] = None  # argmax of statistical_posteriors
+    statistical_confidence: Optional[float] = None  # max posterior
 
 
 @dataclass
@@ -309,17 +316,58 @@ class ResearchAnalystAgent:
             # Build market context string for LLM
             context = self._build_market_context(market_data)
 
+            # Fetch Fear & Greed index to anchor the LLM's sentiment assessment
+            # in a real external data point rather than inferring from price alone.
+            # Arrr — degrade gracefully; regime assessment works without it.
+            fg_block = ""
+            try:
+                from app.services.sentiment_service import sentiment_service
+                _fg = await sentiment_service.fetch_fear_greed()
+                fg_block = sentiment_service.build_llm_context_block(_fg)
+            except Exception:
+                pass
+
+            # Phase 4 — fetch the latest GMM regime posterior for BTC (anchor symbol).
+            # Statistical model gives us numeric priors; LLM still narrates and
+            # produces the final categorical regime, but it's now anchored against
+            # the posterior. Falls back gracefully if no fit be available yet.
+            stat_posteriors: Optional[Dict[str, float]] = None
+            stat_label: Optional[str] = None
+            stat_confidence: Optional[float] = None
+            stat_block = ""
+            try:
+                from app.services.regime_service import regime_service
+                stat_pred = await regime_service.get_latest_prediction("BTCUSDT")
+                if stat_pred is not None:
+                    stat_posteriors = stat_pred.get('posteriors')
+                    stat_label = stat_pred.get('regime_label')
+                    stat_confidence = stat_pred.get('confidence')
+                    if stat_posteriors:
+                        _post_str = ", ".join(
+                            f"{k}={v:.2f}" for k, v in stat_posteriors.items()
+                        )
+                        stat_block = (
+                            f"\nStatistical regime model (GMM, BTC anchor): "
+                            f"{stat_label} (p={stat_confidence:.2f}) — {{ {_post_str} }}\n"
+                            f"Use this as a prior. If your narrative-derived regime disagrees, "
+                            f"justify the divergence in macro_context.\n"
+                        )
+            except Exception as _stat_err:
+                logger.debug(f"GMM regime prior fetch failed (non-critical): {_stat_err}")
+
             # Use LLM to assess regime
             prompt = f"""Analyze the current market regime based on this data:
 
 {context}
-
+{fg_block}{stat_block}
 Identified opportunities:
 {self._format_opportunities(opportunities)}
 
 Determine:
 1. Market regime (trending_up, trending_down, ranging, volatility_expansion)
 2. Overall sentiment (very_bullish, bullish, neutral, bearish, very_bearish)
+   Note: weight the Fear & Greed Index above if provided — it reflects actual retail positioning.
+   F&G < 20 (Extreme Fear) biases toward bearish/very_bearish; F&G > 80 biases toward bullish/very_bullish.
 3. Correlation status (all_up, all_down, diverging, mixed)
 4. Volatility regime (low, medium, high, extreme)
 5. Brief macro context
@@ -338,11 +386,18 @@ Return JSON: {{"regime": "...", "regime_confidence": 0.0-1.0, "sentiment": "..."
                     sentiment=data.get('sentiment', 'neutral'),
                     correlation_status=data.get('correlation_status', 'mixed'),
                     volatility_regime=data.get('volatility_regime', 'medium'),
-                    macro_context=data.get('macro_context', 'Analyzing market conditions')
+                    macro_context=data.get('macro_context', 'Analyzing market conditions'),
+                    statistical_posteriors=stat_posteriors,
+                    statistical_label=stat_label,
+                    statistical_confidence=stat_confidence,
                 )
             except (json.JSONDecodeError, ValueError):
-                # Fallback to default regime
-                return self._default_regime()
+                # Fallback to default regime — still attach the stat prior if we got one
+                fallback = self._default_regime()
+                fallback.statistical_posteriors = stat_posteriors
+                fallback.statistical_label = stat_label
+                fallback.statistical_confidence = stat_confidence
+                return fallback
 
         except Exception as e:
             logger.error(f"Market regime assessment failed: {e}")

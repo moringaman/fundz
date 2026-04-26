@@ -307,3 +307,103 @@ strategies:
     agent_naming: ["BTC_Fractal", "ETH_Fractal", "SOL_Fractal"]
     ai_propose: true
     require_marina: false
+
+  volatility_regime_switch:
+    label: "Volatility Regime Switch"
+    description: "Adaptive strategy that detects market regime and switches between three modes: breakout (compression→explosion), mean reversion (ranging), and trend following (trending). Uses ATR for dynamic stops and position sizing."
+    ai_guidance: |
+      This strategy detects regime and adapts:
+
+      REGIME DETECTION (check all):
+      - BB width percentile: < 10% = VOLATILITY_COMPRESSION (prepare breakout)
+      - BB width percentile: 10-40% = RANGING (mean reversion)
+      - BB width percentile: 40%+ AND ADX > 25 = TRENDING (follow trend)
+
+      MODE 1: VOLATILITY_COMPRESSION → Breakout
+      - Wait for BB squeeze: width < 10% of 120-bar avg + ADX < 20
+      - Entry: Price closes above upper BB on vol > 1.5× avg
+      - Stop: Below squeeze low or 2× ATR
+      - TP: 8% (wider for explosive moves)
+      - Trail: Activate at 3% profit, trail at 2× ATR
+
+      MODE 2: RANGING → Mean Reversion
+      - Sell to BB upper (BB upper - BB lower × 0.8), cover at BB lower
+      - Buy BB lower, cover at BB upper
+      - Stop: 0.5× ATR beyond entry band (small - quick fail)
+      - TP: BB middle (EMA) = 1:1 R:R
+      - Skip if ADX > 20 (not ranging)
+
+      MODE 3: TRENDING → Momentum
+      - ADX > 25 confirmed
+      - +DI > -DI for longs, -DI > +DI for shorts
+      - EMA alignment for trend confirmation
+      - Enter on pullback to EMA (buy dips in uptrend)
+      - Stop: 2.5× ATR (wider for trends)
+      - Trail: ATR-based, ratchet up as price moves
+
+      POSITION SIZING (dynamic):
+      - Base risk: 2% per trade
+      - Size = 2% × Account / (ATR × VolMultiplier)
+      - VolMultiplier: 1.5 in high vol, 2.0 normal, 2.5 low vol
+      - NEVER exceed 6% portfolio risk total
+    market_conditions:
+      - "volatility_compression"
+      - "ranging"
+      - "trending_up"
+      - "trending_down"
+      - "high_volatility"
+    avoid_conditions:
+      - "low_volatility"
+    timeframes:
+      default: "1h"
+      allowed:
+        - "30m"
+        - "1h"
+        - "4h"
+    risk:
+      stop_loss_pct: 2.0
+      take_profit_pct: 8.0
+      trailing_stop_pct: 4.0
+      max_portfolio_risk_pct: 6.0
+    indicators:
+      bb_period: 20
+      bb_std_dev: 2.0
+      bb_width_lookback: 120
+      bb_compression_threshold: 0.10
+      adx_period: 14
+      adx_trending_threshold: 25
+      adx_mean_reversion_cap: 20
+      atr_period: 14
+      atr_sizing: true
+      ema_period: 20
+    entry_conditions:
+      compression_mode:
+        - bb_width_pct: "< 0.10"
+        - adx: "< 20"
+        - price_breaks: "bb_upper"
+        - volume: "> 1.5 * avg_volume"
+      ranging_mode:
+        - bb_width_pct: "0.10 to 0.40"
+        - adx: "< 20"
+        - price_at: "bb_upper OR bb_lower"
+      trending_mode:
+        - adx: "> 25"
+        - di_cross: "confirmed"
+        - price_above: "EMA20"
+    exit_conditions:
+      compression_exit:
+        - tp1: 4.0
+        - tp2: 8.0
+        - stop: "atr * 2.0 OR squeeze_low"
+      ranging_exit:
+        - tp: "bb_middle"
+        - stop: "atr * 0.5"
+      trending_exit:
+        - trail_activated: 3.0
+        - trail_distance: "atr * 2.0"
+    agent_naming:
+      - "BTC_RegimeSwitch"
+      - "ETH_RegimeSwitch"
+      - "SOL_RegimeSwitch"
+    ai_propose: true
+    require_marina: false
