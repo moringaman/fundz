@@ -360,7 +360,7 @@ Determine optimal capital allocation. Return JSON:
 }}
 """
 
-            response = await self.llm_service._call_llm(prompt)
+            response = await self.llm_service._call_llm(prompt, role='portfolio_manager')
 
             try:
                 data = json.loads(response.content)
@@ -527,7 +527,7 @@ Return JSON only:
   "reasoning": "brief explanation of your allocation logic"
 }}"""
 
-            response = await self.llm_service._call_llm(prompt)
+            response = await self.llm_service._call_llm(prompt, role='portfolio_manager')
 
             try:
                 data = json.loads(response.content)

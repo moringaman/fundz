@@ -36,6 +36,42 @@ class RiskLimits(BaseModel):
     max_leveraged_notional_pct: float = Field(default=200.0, ge=10.0, le=1000.0)
     liquidation_buffer_pct: float = Field(default=12.5, ge=1.0, le=50.0)
     exposure_threshold_pct: float = Field(default=80.0, ge=10.0, le=100.0)
+    max_correlated_exposure_pct: float = Field(
+        default=30.0, ge=5.0, le=100.0,
+        description=(
+            "Maximum effective (correlation-weighted) directional exposure as % of capital. "
+            "Computed as √(Σᵢⱼ ρᵢⱼ wᵢ wⱼ) using the rolling 90-day return correlation matrix. "
+            "Treats highly-correlated long positions across BTC/ETH/SOL etc. as a single concentrated "
+            "bet rather than independent trades. Set to 100 to effectively disable."
+        ),
+    )
+    pattern_entry_orders_enabled: bool = Field(
+        default=True,
+        description=(
+            "When enabled, high-confidence chart patterns (bull_flag, wyckoff_spring, "
+            "head_shoulders, etc.) supply an explicit entry_price and the order is "
+            "routed as Limit or Stop instead of Market — preventing market-fills at "
+            "arbitrary mid-pattern prices. Disable to fall back to legacy Market orders."
+        ),
+    )
+    pattern_entry_min_confidence: float = Field(
+        default=0.65, ge=0.0, le=1.0,
+        description=(
+            "Minimum pattern confidence required to override Market order routing. "
+            "Patterns below this threshold are ignored for entry-price purposes; the "
+            "trade falls back to Market at current_price."
+        ),
+    )
+    pattern_entry_tolerance_pct: float = Field(
+        default=0.30, ge=0.0, le=5.0,
+        description=(
+            "Paper-mode fill tolerance for limit/stop pattern entries, as a percentage "
+            "of the entry price. If current price is within this band of the pattern's "
+            "entry level, the paper order fills at the entry level; otherwise the trade "
+            "is deferred (next cycle re-evaluates). Live orders pass through to the "
+            "exchange order book regardless of this setting."
+        ),
+    )
 
 
 class TradingPreferences(BaseModel):
@@ -102,6 +138,12 @@ class TradingGates(BaseModel):
     # Circuit breaker
     circuit_breaker_max_trades: int = Field(default=20, ge=5, le=200,
         description="Maximum trades per day before halting all trading")
+    max_position_size_pct: float = Field(default=5.0, ge=0.1, le=100,
+        description="Maximum % of capital for single position")
+    max_daily_loss_pct: float = Field(default=5.0, ge=0.1, le=50,
+        description="Maximum daily loss as % of capital before circuit breaker")
+    max_open_positions: int = Field(default=5, ge=1, le=50,
+        description="Maximum concurrent open positions")
     # Correlation limits
     max_same_asset_positions: int = Field(default=2, ge=1, le=10,
         description="Maximum concurrent positions on the same symbol")
@@ -112,6 +154,9 @@ class TradingGates(BaseModel):
         description="Confidence level at which full position size is used (sizing reference)")
     confidence_size_floor: float = Field(default=0.25, ge=0.1, le=1.0,
         description="Minimum position size multiplier regardless of low confidence")
+    # Minimum trade notional — prevents fee drag on micro-positions
+    min_notional: float = Field(default=10.0, ge=1.0, le=500.0,
+        description="Minimum position value in USD. Trades below this are blocked to prevent fee drag on tiny positions.")
     # TA confidence boost/penalty
     ta_boost_multiplier: float = Field(default=0.20, ge=0.0, le=0.5,
         description="Confidence boost when TA agrees with signal (fraction added)")

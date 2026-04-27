@@ -1,7 +1,7 @@
 """CRUD + performance endpoints for the Trader layer."""
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from typing import List, Optional
 import logging
 
@@ -28,12 +28,19 @@ class TraderResponse(BaseModel):
 
 
 class TraderCreate(BaseModel):
-    name: str
-    llm_provider: str = "openrouter"
-    llm_model: str = "anthropic/claude-sonnet-4"
+    name: str = Field(..., min_length=1)
+    llm_provider: str = Field(..., min_length=1)
+    llm_model: str = Field(..., min_length=1)
     allocation_pct: float = 33.3
     is_enabled: bool = True
     config: dict = {}
+
+    @field_validator("name", "llm_provider", "llm_model")
+    @classmethod
+    def _no_blank(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("must be a non-empty, non-whitespace string")
+        return v.strip()
 
 
 class TraderUpdate(BaseModel):
@@ -43,6 +50,15 @@ class TraderUpdate(BaseModel):
     allocation_pct: Optional[float] = None
     is_enabled: Optional[bool] = None
     config: Optional[dict] = None
+
+    @field_validator("name", "llm_provider", "llm_model")
+    @classmethod
+    def _no_blank(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        if not v.strip():
+            raise ValueError("must be a non-empty, non-whitespace string")
+        return v.strip()
 
 
 class TraderPerformanceResponse(BaseModel):

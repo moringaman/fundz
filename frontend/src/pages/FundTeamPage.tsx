@@ -407,8 +407,10 @@ export function FundTeamPage() {
               {/* Patterns */}
               {((technicalAnalysis as any).patterns?.length > 0) && (
                 <div>
-                  <div style={{ fontSize: '.6rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)', textTransform: 'uppercase', marginBottom: '.4rem' }}>Pattern Signals</div>
-                  {((technicalAnalysis as any).patterns as any[]).slice(0, 2).map((pattern: any, i: number) => (
+                  <div style={{ fontSize: '.6rem', color: 'var(--text-dim)', fontFamily: 'var(--mono)', textTransform: 'uppercase', marginBottom: '.4rem' }}>
+                    Pattern Signals ({(technicalAnalysis as any).patterns?.length})
+                  </div>
+                  {((technicalAnalysis as any).patterns as any[]).map((pattern: any, i: number) => (
                     <div key={i} style={{
                       padding: '.4rem .5rem',
                       background: 'var(--bg-hover)',
@@ -416,9 +418,20 @@ export function FundTeamPage() {
                       marginBottom: '.3rem',
                       borderLeft: `2px solid ${pattern.direction === 'bullish' ? 'var(--green)' : 'var(--red)'}`,
                     }}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '.2rem' }}>
-                        <span style={{ fontSize: '.7rem', fontFamily: 'var(--mono)', fontWeight: 600, color: 'var(--text)' }}>{pattern.pattern_type?.replace(/_/g, ' ')}</span>
-                        <span style={{ fontSize: '.65rem', fontFamily: 'var(--mono)', color: pattern.direction === 'bullish' ? 'var(--green)' : 'var(--red)' }}>{pattern.direction?.toUpperCase()} {(pattern.confidence * 100).toFixed(0)}%</span>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '.2rem' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '.4rem' }}>
+                          <span style={{ fontSize: '.7rem', fontFamily: 'var(--mono)', fontWeight: 600, color: 'var(--text)' }}>
+                            {pattern.pattern_type?.replace(/_/g, ' ')}
+                          </span>
+                          {pattern.timeframe && (
+                            <span style={{ fontSize: '.5rem', padding: '.1rem .3rem', background: 'var(--bg-card)', borderRadius: '3px', color: 'var(--text-dim)', fontFamily: 'var(--mono)' }}>
+                              {pattern.timeframe}
+                            </span>
+                          )}
+                        </div>
+                        <span style={{ fontSize: '.65rem', fontFamily: 'var(--mono)', color: pattern.direction === 'bullish' ? 'var(--green)' : 'var(--red)' }}>
+                          {pattern.direction?.toUpperCase()} {(pattern.confidence * 100).toFixed(0)}%
+                        </span>
                       </div>
                       <div style={{ display: 'flex', gap: '.5rem', fontSize: '.6rem', fontFamily: 'var(--mono)', color: 'var(--text-dim)' }}>
                         <span>SL: ${pattern.stop_loss?.toFixed(0)}</span>

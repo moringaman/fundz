@@ -41,7 +41,7 @@ class LLMRegistry:
         'technical_analyst': {
             'name': 'Marcus Webb',
             'title': 'Technical Analyst',
-            'model': 'google/gemma-2-9b-it',
+            'model': 'google/gemma-3-4b-it:free-2-9b-it',
             'temperature': 0.4,
             'max_tokens': 1500,
             'avatar': 'https://api.dicebear.com/7.x/avataaars/svg?seed=Marcus%20Webb&gender=male',
@@ -59,7 +59,7 @@ class LLMRegistry:
         'risk_manager': {
             'name': 'Elena Vasquez',
             'title': 'Chief Risk Officer',
-            'model': 'google/gemma-2-9b-it',
+            'model': 'google/gemma-3-4b-it:free-2-9b-it',
             'temperature': 0.3,
             'max_tokens': 800,
             'avatar': 'https://api.dicebear.com/7.x/avataaars/svg?seed=Elena%20Vasquez&gender=female',
@@ -176,6 +176,7 @@ class LLMService:
         price_data: Dict[str, Any],
         team_context: Optional[Dict[str, Any]] = None,
         agent_context: Optional[Dict[str, Any]] = None,
+        role: Optional[str] = None,
     ) -> LLMResponse:
         prompt = self._build_signal_prompt(indicators, price_data, team_context)
         system_prompt = (
@@ -183,7 +184,7 @@ class LLMService:
             if agent_context
             else self._build_generic_system_prompt()
         )
-        return await self._call_llm(prompt, system_prompt=system_prompt)
+        return await self._call_llm(prompt, system_prompt=system_prompt, role=role)
 
     async def evaluate_strategy(self, strategy_config: Dict[str, Any], performance: Dict[str, Any]) -> LLMResponse:
         prompt = self._build_strategy_evaluation_prompt(strategy_config, performance)
@@ -212,15 +213,49 @@ Provide your analysis in JSON format:
 {{"trend": "bullish/bearish/neutral", "volatility": "high/medium/low", "momentum": "strong/moderate/weak", "recommendation": "buy/sell/hold", "confidence": 0.0-1.0, "reasoning": "brief explanation"}}
 """
 
-    async def _call_llm(self, prompt: str, system_prompt: Optional[str] = None) -> LLMResponse:
+    def _resolve_call_config(self, role: Optional[str]) -> tuple:
+        """
+        Resolve (model, temperature, max_tokens) for this specific call WITHOUT
+        mutating self.*. Critical for async parallel safety: multiple roles can
+        share an LLMService instance (especially per-trader cached instances)
+        and concurrent role-tagged calls MUST NOT clobber each other's config.
+
+        Order of precedence:
+          1. role-specific override from LLMRegistry (when role provided)
+          2. instance default (self.model / self.temperature / self.max_tokens)
+        """
+        if role:
+            role_config = LLMRegistry.get_config(role)
+            return (
+                role_config.get('model', self.model),
+                role_config.get('temperature', self.temperature),
+                role_config.get('max_tokens', self.max_tokens),
+            )
+        return (self.model, self.temperature, self.max_tokens)
+
+    async def _call_llm(self, prompt: str, system_prompt: Optional[str] = None, role: Optional[str] = None) -> LLMResponse:
         if self._client is None:
             await self.initialize()
-        
+
+        model, temperature, max_tokens = self._resolve_call_config(role)
+
         try:
             if self.provider in ("openai", "openrouter", "azure"):
-                return await self._call_openai(prompt, system_prompt=system_prompt)
+                return await self._call_openai(
+                    prompt,
+                    system_prompt=system_prompt,
+                    model=model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
             elif self.provider == "anthropic":
-                return await self._call_anthropic(prompt, system_prompt=system_prompt)
+                return await self._call_anthropic(
+                    prompt,
+                    system_prompt=system_prompt,
+                    model=model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
             else:
                 raise ValueError(f"Unknown LLM provider: {self.provider}")
         except Exception as e:
@@ -232,15 +267,20 @@ Provide your analysis in JSON format:
                 action="hold"
             )
 
-    async def _call_llm_text(self, system_prompt: str, user_prompt: str, temperature: float = 0.7, max_tokens: int = 2000) -> str:
-        """Call LLM with system+user prompts, returning free-text (no JSON constraint)."""
+    async def _call_llm_text(self, system_prompt: str, user_prompt: str, temperature: float = 0.7, max_tokens: int = 2000, role: Optional[str] = None) -> str:
         if self._client is None:
             await self.initialize()
+
+        if role:
+            role_config = LLMRegistry.get_config(role)
+            model = role_config.get('model', self.model)
+        else:
+            model = self.model
 
         try:
             if self.provider in ("openai", "openrouter", "azure"):
                 response = await self._client.chat.completions.create(
-                    model=self.model,
+                    model=model,
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt},
@@ -251,7 +291,7 @@ Provide your analysis in JSON format:
                 return response.choices[0].message.content or ""
             elif self.provider == "anthropic":
                 response = await self._client.messages.create(
-                    model=self.model,
+                    model=model,
                     max_tokens=max_tokens,
                     temperature=temperature,
                     system=system_prompt,
@@ -264,22 +304,33 @@ Provide your analysis in JSON format:
             logger.error(f"LLM text call failed: {e}")
             return f"I'm sorry, I couldn't generate a response at this time. Error: {e}"
 
-    async def _call_openai(self, prompt: str, system_prompt: Optional[str] = None) -> LLMResponse:
+    async def _call_openai(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> LLMResponse:
+        model = model if model is not None else self.model
+        temperature = temperature if temperature is not None else self.temperature
+        max_tokens = max_tokens if max_tokens is not None else self.max_tokens
+
         messages: list = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
         response = await self._client.chat.completions.create(
-            model=self.model,
+            model=model,
             messages=messages,
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
+            temperature=temperature,
+            max_tokens=max_tokens,
             response_format={"type": "json_object"}
         )
-        
+
         content = response.choices[0].message.content
         data = json.loads(content)
-        
+
         return LLMResponse(
             content=content,
             reasoning=data.get("reasoning", ""),
@@ -287,18 +338,29 @@ Provide your analysis in JSON format:
             action=data.get("recommendation", data.get("action", "hold"))
         )
 
-    async def _call_anthropic(self, prompt: str, system_prompt: Optional[str] = None) -> LLMResponse:
+    async def _call_anthropic(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> LLMResponse:
+        model = model if model is not None else self.model
+        temperature = temperature if temperature is not None else self.temperature
+        max_tokens = max_tokens if max_tokens is not None else self.max_tokens
+
         response = await self._client.messages.create(
-            model=self.model,
-            max_tokens=self.max_tokens,
-            temperature=self.temperature,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
             system=system_prompt or "You are an expert cryptocurrency trading analyst. Always respond in JSON format.",
             messages=[{"role": "user", "content": prompt}]
         )
-        
+
         content = response.content[0].text
         data = json.loads(content)
-        
+
         return LLMResponse(
             content=content,
             reasoning=data.get("reasoning", ""),
@@ -558,6 +620,11 @@ IMPORTANT: Weight your decision using team intelligence:
             _trs = team_context.get("trader_risk_status") if team_context else None
             if _trs and _trs.get("note"):
                 team_section += f"\n{_trs['note']}\n"
+
+            # Trader peer learning — what the top performer is doing
+            _tpl = team_context.get("trader_peer_learning") if team_context else None
+            if _tpl and _tpl.get("peer_note"):
+                team_section += f"\n🏆 PEER LEARNING:\n{_tpl['peer_note']}\n"
 
             # Re-entry context — inject AFTER team_section is built so it always surfaces
             recent_stopout = team_context.get("recent_stopout") if team_context else None

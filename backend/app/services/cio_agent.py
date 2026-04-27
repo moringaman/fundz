@@ -334,7 +334,7 @@ IMPORTANT: Respond with ONLY the JSON array, no markdown fences, no preamble tex
 ]
 """
 
-            response = await self.llm_service._call_llm(prompt)
+            response = await self.llm_service._call_llm(prompt, role='cio_agent')
 
             try:
                 recs_data = _extract_json(response.content)

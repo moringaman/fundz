@@ -375,7 +375,7 @@ Determine:
 Return JSON: {{"regime": "...", "regime_confidence": 0.0-1.0, "sentiment": "...", "correlation_status": "...", "volatility_regime": "...", "macro_context": "brief explanation"}}
 """
 
-            response = await self.llm_service._call_llm(prompt)
+            response = await self.llm_service._call_llm(prompt, role='research_analyst')
 
             try:
                 import json

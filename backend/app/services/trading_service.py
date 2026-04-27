@@ -71,14 +71,24 @@ class TradingService:
         take_profit_price: Optional[float] = None,
         trailing_stop_pct: Optional[float] = None,
         force_paper: Optional[bool] = None,
+        order_type: str = "Market",
+        entry_price: Optional[float] = None,
+        pattern_type: Optional[str] = None,
     ):
         svc = self._backend(force_paper)
         mode = "paper" if _is_paper_mode() else "LIVE"
-        logger.info(
-            f"TradingService [{mode}]: place_order {side.value if hasattr(side,'value') else side} "
-            f"{quantity:.6f} {symbol}"
-        )
-        return await svc.place_order(
+        side_str = side.value if hasattr(side, 'value') else side
+        if order_type != "Market":
+            logger.info(
+                f"TradingService [{mode}]: place_order {order_type} {side_str} "
+                f"{quantity:.6f} {symbol} @ {entry_price} "
+                f"(pattern={pattern_type or 'none'})"
+            )
+        else:
+            logger.info(
+                f"TradingService [{mode}]: place_order {side_str} {quantity:.6f} {symbol}"
+            )
+        kwargs = dict(
             symbol=symbol,
             side=side,
             quantity=quantity,
@@ -89,6 +99,15 @@ class TradingService:
             take_profit_price=take_profit_price,
             trailing_stop_pct=trailing_stop_pct,
         )
+        try:
+            return await svc.place_order(
+                **kwargs,
+                order_type=order_type,
+                entry_price=entry_price,
+                pattern_type=pattern_type,
+            )
+        except TypeError:
+            return await svc.place_order(**kwargs)
 
     async def close_position(
         self,

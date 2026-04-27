@@ -461,6 +461,8 @@ class GateAutopilot:
             _set("ta_penalty_multiplier",  _clamp(defaults.ta_penalty_multiplier + 0.05, 0.40, 0.60))
             _set("dead_zone_penalty",      _clamp(defaults.dead_zone_penalty    + 0.04, 0.15, 0.30))
             _set("sr_proximity_block_pct", _clamp(defaults.sr_proximity_block_pct + 0.0015, 0.003, 0.02))
+            _set("max_position_size_pct",  _clamp(defaults.max_position_size_pct - 1.0, 2.0, 5.0))
+            _set("max_open_positions",     max(3, int(defaults.max_open_positions - 1)))
             reason = (f"Win rate {wr:.0%} below target or negative daily PnL → "
                       f"tightened gates to reduce low-quality entries. {trade_sample_summary}")
 
@@ -490,6 +492,9 @@ class GateAutopilot:
             _set("circuit_breaker_max_trades", _clamp(defaults.circuit_breaker_max_trades - 5, 12, 20))
             _set("confidence_size_floor",      _clamp(defaults.confidence_size_floor + 0.05, 0.30, 0.45))
             _set("mtf_mixed_penalty",          _clamp(defaults.mtf_mixed_penalty + 0.05, 0.20, 0.35))
+            _set("min_notional",               _clamp(defaults.min_notional + 5.0, 10.0, 50.0))
+            _set("max_position_size_pct",      _clamp(defaults.max_position_size_pct - 1.0, 2.0, 5.0))
+            _set("max_daily_loss_pct",         _clamp(defaults.max_daily_loss_pct - 1.0, 2.0, 5.0))
             reason = (
                 f"Fee drag MODERATE: coverage ratio {_coverage:.2f}x "
                 f"(avg gross ${_avg_gross:.2f} vs avg fee ${_avg_fee:.2f}) — "
@@ -509,6 +514,10 @@ class GateAutopilot:
             _set("mtf_mixed_penalty",          _clamp(defaults.mtf_mixed_penalty + 0.10, 0.25, 0.45))
             _set("mtf_opposed_penalty",        _clamp(defaults.mtf_opposed_penalty + 0.10, 0.35, 0.55))
             _set("dead_zone_noop_enabled",     True)
+            _set("min_notional",               _clamp(defaults.min_notional + 10.0, 15.0, 75.0))
+            _set("max_position_size_pct",      _clamp(defaults.max_position_size_pct - 2.0, 1.0, 4.0))
+            _set("max_daily_loss_pct",         _clamp(defaults.max_daily_loss_pct - 2.0, 1.0, 3.0))
+            _set("max_open_positions",         max(2, int(defaults.max_open_positions - 2)))
             reason = (
                 f"Fee drag SEVERE: coverage ratio {_coverage:.2f}x "
                 f"(avg gross ${_avg_gross:.2f} vs avg fee ${_avg_fee:.2f}) — "
@@ -525,6 +534,9 @@ class GateAutopilot:
             _set("dead_zone_penalty",      _clamp(defaults.dead_zone_penalty    + 0.08, 0.20, 0.40))
             _set("sr_proximity_block_pct", _clamp(defaults.sr_proximity_block_pct + 0.003, 0.004, 0.03))
             _set("circuit_breaker_max_trades", _clamp(defaults.circuit_breaker_max_trades - 10, 10, 30))
+            _set("max_position_size_pct",  _clamp(defaults.max_position_size_pct - 2.0, 1.0, 3.0))
+            _set("max_daily_loss_pct",     _clamp(defaults.max_daily_loss_pct - 2.0, 1.0, 3.0))
+            _set("max_open_positions",     max(2, int(defaults.max_open_positions - 2)))
             reason = (f"Win rate {wr:.0%} critically low or {cld} consecutive losing day(s) → "
                       f"gates significantly tightened. Capital preservation priority. {trade_sample_summary}")
 

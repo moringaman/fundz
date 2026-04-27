@@ -268,6 +268,7 @@ class PatternSignalResponse(BaseModel):
     take_profit_2: float
     risk_reward: float
     reasoning: str
+    timeframe: str = "1h"
 
 
 class MultiTimeframeResponse(BaseModel):
@@ -333,7 +334,8 @@ def _report_to_response(report) -> TechnicalAnalysisResponse:
                 take_profit_1=p.take_profit_1,
                 take_profit_2=p.take_profit_2,
                 risk_reward=p.risk_reward,
-                reasoning=p.reasoning
+                reasoning=p.reasoning,
+                timeframe=p.timeframe
             )
             for p in report.patterns
         ],

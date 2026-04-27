@@ -24,6 +24,15 @@ class TradingSignal:
     # Shape: {"ib_high": float, "ib_low": float, "ib_established": bool,
     #         "session_date": str, "sweep_detected": bool, "sweep_direction": str|None}
     wyckoff_state: Optional[Dict] = None
+    # Pattern-driven order routing (A-007): when a chart pattern (bull_flag,
+    # wyckoff_spring, etc.) supplies a specific entry level, callers can route
+    # the order as a Limit or Stop instead of a Market fill at current_price.
+    # entry_type ∈ {"Market", "Limit", "Stop"} — Phemex order-type vocabulary.
+    # entry_price is the trigger / limit price; ignored when entry_type=="Market".
+    # pattern_type is the originating pattern name for diagnostics/persistence.
+    entry_type: Optional[str] = None
+    entry_price: Optional[float] = None
+    pattern_type: Optional[str] = None
 
 
 class IndicatorService:
@@ -932,7 +941,8 @@ class IndicatorService:
 
         if strategy == "momentum":
             signals = self._momentum_signals(
-                rsi, price, sma_20, sma_50, sma_200, macd, macd_signal_val, atr, volume_ratio
+                rsi, price, sma_20, sma_50, sma_200, macd, macd_signal_val, atr, volume_ratio,
+                divergence_weight=_divergence.get("divergence_weight", 0.0),
             )
         elif strategy == "mean_reversion":
             signals = self._mean_reversion_signals(
@@ -1417,8 +1427,13 @@ class IndicatorService:
             wyckoff_state=_wyckoff_state_out if strategy == "wyckoff" else None,
         )
 
-    def _momentum_signals(self, rsi, price, sma_20, sma_50, sma_200, macd, macd_signal_val, atr, volume_ratio=None):
-        """Momentum: follow the trend — only trade clear trends, not noise."""
+    def _momentum_signals(self, rsi, price, sma_20, sma_50, sma_200, macd, macd_signal_val, atr, volume_ratio=None,
+                           divergence_weight: float = 0.0):
+        """Momentum: follow the trend — only trade clear trends, not noise.
+
+        divergence_weight: RSI divergence strength (positive = bullish div, negative = bearish div).
+                           Dampens signals that conflict with the divergence direction.
+        """
         signals = []
 
         # Trend direction via SMAs.
@@ -1465,6 +1480,55 @@ class IndicatorService:
                     signals.append((Signal.BUY, 0.25, "MACD bullish crossover"))
                 else:
                     signals.append((Signal.SELL, 0.25, "MACD bearish crossover"))
+
+        # ── RSI divergence dampening ───────────────────────────────────────
+        # Bearish divergence (price making higher highs but RSI making lower highs)
+        # is a classic momentum-exhaustion signal — dampen BUY signals heavily.
+        # Bullish divergence dampens SELL signals symmetrically.
+        # Threshold ±0.20: below this, divergence is marginal / noise. At ±0.35
+        # (confirmed), the dampening is aggressive. The multiplier scales linearly
+        # so weak divergence nudges gently while strong divergence blocks hard.
+        if abs(divergence_weight) > 0.20:
+            _buy_signals  = [(s, w, r) for s, w, r in signals if s == Signal.BUY]
+            _sell_signals = [(s, w, r) for s, w, r in signals if s == Signal.SELL]
+            if divergence_weight < 0 and _buy_signals:
+                # Bearish divergence — momentum fading for longs
+                _damp = max(0.15, 1.0 - abs(divergence_weight) * 2.0)
+                signals = [(s, w, r) for s, w, r in signals if s != Signal.BUY] + \
+                          [(s, w * _damp, r + f" [bearish div dampened ×{_damp:.2f}]")
+                           for s, w, r in _buy_signals]
+            elif divergence_weight > 0 and _sell_signals:
+                # Bullish divergence — momentum fading for shorts
+                _damp = max(0.15, 1.0 - abs(divergence_weight) * 2.0)
+                signals = [(s, w, r) for s, w, r in signals if s != Signal.SELL] + \
+                          [(s, w * _damp, r + f" [bullish div dampened ×{_damp:.2f}]")
+                           for s, w, r in _sell_signals]
+
+        # ── MACD histogram deceleration ─────────────────────────────────────
+        # When the MACD histogram is positive but small relative to the MACD line,
+        # momentum is decelerating — the trend may be near exhaustion.
+        # Ratio: |histogram| / |macd| → near 0 means histogram converging to zero.
+        # Dampen signals whose direction matches the fading histogram.
+        if macd is not None and abs(macd) > 1e-12:
+            _hist = macd - macd_signal_val  # MACD histogram
+            _hist_ratio = abs(_hist) / abs(macd)
+            if _hist_ratio < 0.30:
+                if _hist > 0:
+                    # Bullish histogram but fading — dampen BUY signals
+                    _buy_sigs = [(s, w, r) for s, w, r in signals if s == Signal.BUY]
+                    if _buy_sigs:
+                        _damp = max(0.30, _hist_ratio * 3)
+                        signals = [(s, w, r) for s, w, r in signals if s != Signal.BUY] + \
+                                  [(s, w * _damp, r + f" [MACD hist fading ×{_damp:.2f}]")
+                                   for s, w, r in _buy_sigs]
+                elif _hist < 0:
+                    # Bearish histogram but fading — dampen SELL signals
+                    _sell_sigs = [(s, w, r) for s, w, r in signals if s == Signal.SELL]
+                    if _sell_sigs:
+                        _damp = max(0.30, _hist_ratio * 3)
+                        signals = [(s, w, r) for s, w, r in signals if s != Signal.SELL] + \
+                                  [(s, w * _damp, r + f" [MACD hist fading ×{_damp:.2f}]")
+                                   for s, w, r in _sell_sigs]
 
         # Volume confirmation — momentum on high volume is more reliable
         if volume_ratio is not None:

@@ -18,6 +18,20 @@ from app.clients.phemex import PhemexClient
 from app.config import settings
 
 
+class PatternEntryDeferred(Exception):
+    def __init__(self, symbol: str, order_type: str, entry_price: float,
+                 current_price: float, pattern_type: Optional[str] = None):
+        self.symbol = symbol
+        self.order_type = order_type
+        self.entry_price = entry_price
+        self.current_price = current_price
+        self.pattern_type = pattern_type
+        super().__init__(
+            f"Pattern entry deferred: {order_type} {symbol} @ {entry_price:.6g} "
+            f"not yet triggered (current {current_price:.6g}, pattern={pattern_type or 'none'})"
+        )
+
+
 class PaperTradingService:
     # Fee rates — Phemex spot taker: 0.1%, perp taker (USDT- and coin-margined): 0.06%
     SPOT_FEE_RATE = 0.001    # 0.10% — spot only (not used in this system)
@@ -121,6 +135,9 @@ class PaperTradingService:
         leverage: float = 1.0,
         margin_used: Optional[float] = None,
         liquidation_price: Optional[float] = None,
+        order_type: str = "Market",
+        entry_price: Optional[float] = None,
+        pattern_type: Optional[str] = None,
     ):
         """Place a paper trading order using real market price when price is omitted."""
         if not self._enabled:
@@ -133,6 +150,31 @@ class PaperTradingService:
             except Exception as e:
                 self.logger.error(f"Failed to fetch market price: {e}")
                 raise ValueError("Unable to fetch current market price")
+
+        if order_type != "Market" and entry_price is not None and entry_price > 0:
+            try:
+                from app.services.pattern_entry import OrderPlan, can_fill_now
+                from app.api.routes.settings import get_risk_limits as _gates_for_pattern
+                _tol = float(getattr(_gates_for_pattern(), "pattern_entry_tolerance_pct", 0.30) or 0.30)
+            except Exception:
+                _tol = 0.30
+                from app.services.pattern_entry import OrderPlan, can_fill_now
+            _plan = OrderPlan(order_type=order_type, entry_price=float(entry_price), pattern_type=pattern_type)
+            _side_str = side.value if hasattr(side, "value") else str(side)
+            if not can_fill_now(_plan, _side_str, float(price), tolerance_pct=_tol):
+                self.logger.info(
+                    f"Paper {order_type} order deferred for {symbol}: "
+                    f"current={price:.6g} not at entry={entry_price:.6g} "
+                    f"(pattern={pattern_type or 'none'}, tol={_tol:.2f}%)"
+                )
+                raise PatternEntryDeferred(
+                    symbol=symbol,
+                    order_type=order_type,
+                    entry_price=float(entry_price),
+                    current_price=float(price),
+                    pattern_type=pattern_type,
+                )
+            price = float(entry_price)
 
         async with get_async_session() as db:
             # Ensure USDT balance exists

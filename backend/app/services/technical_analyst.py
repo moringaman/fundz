@@ -2,6 +2,7 @@ from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime
 from dataclasses import dataclass
 import pandas as pd
+import numpy as np
 import logging
 
 from app.clients.phemex import PhemexClient
@@ -217,6 +218,7 @@ class PatternSignal:
     take_profit_2: float
     risk_reward: float
     reasoning: str
+    timeframe: str = "1h"  # Timeframe the pattern was detected on
 
 
 @dataclass
@@ -283,7 +285,7 @@ class TechnicalAnalyst:
             current_price = data_primary['close'].iloc[-1]
 
             price_levels = self._calculate_price_levels(data_primary)
-            patterns = self._identify_patterns(data_primary, current_price, price_levels)
+            patterns = self._identify_patterns(data_primary, current_price, price_levels, tf_primary)
             multi_tf = self._analyze_multitimeframe(data_primary, data_mid, data_high, current_price, symbol, tf_primary, tf_mid, tf_high)
 
             signal, confidence = self._generate_overall_signal(
@@ -469,12 +471,13 @@ class TechnicalAnalyst:
             "s3": s3
         }
 
-    def _identify_patterns(self, df: pd.DataFrame, current_price: float, price_levels: Optional[PriceLevels] = None) -> List[PatternSignal]:
+    def _identify_patterns(self, df: pd.DataFrame, current_price: float, price_levels: Optional[PriceLevels] = None, timeframe: str = "1h") -> List[PatternSignal]:
         patterns = []
         
         closes = df['close']
         highs = df['high']
         lows = df['low']
+        volumes = df['volume']
         
         rsi = self.indicator_service.calculate_rsi(closes).iloc[-1]
         macd_data = self.indicator_service.calculate_macd(closes)
@@ -498,6 +501,31 @@ class TechnicalAnalyst:
             _sr_block_pct = float(get_trading_gates().sr_proximity_block_pct)
         except Exception:
             pass
+
+        # Chart Pattern Detections (investingoal.com patterns)
+        # Each pattern tagged with the timeframe it was detected on
+        flag_patterns = self._detect_flag_pattern(df, current_price, timeframe)
+        patterns.extend(flag_patterns)
+        
+        triangle_patterns = self._detect_triangle_patterns(df, current_price, timeframe)
+        patterns.extend(triangle_patterns)
+        
+        hs_patterns = self._detect_head_shoulders(df, current_price, timeframe)
+        patterns.extend(hs_patterns)
+        
+        dt_patterns = self._detect_double_triple(df, current_price, timeframe)
+        patterns.extend(dt_patterns)
+        
+        cup_patterns = self._detect_cup_handle(df, current_price, timeframe)
+        patterns.extend(cup_patterns)
+        
+        wedge_patterns = self._detect_wedge(df, current_price, timeframe)
+        patterns.extend(wedge_patterns)
+        
+        rectangle_patterns = self._detect_rectangle(df, current_price, timeframe)
+        patterns.extend(rectangle_patterns)
+
+        # Existing patterns below
 
         if rsi < 35 and current_price <= bb_lower:
             # Oversold bounce — bullish
@@ -922,24 +950,665 @@ class TechnicalAnalyst:
 
         return obs
 
-    def _empty_report(self, symbol: str) -> TechnicalAnalystReport:
-        return TechnicalAnalystReport(
-            timestamp=datetime.utcnow(),
-            symbol=symbol,
-            current_price=0,
-            price_levels=PriceLevels(
-                support=[],
-                resistance=[],
-                pivot_points={},
-                fibonacci_retracements={},
-                fibonacci_extensions={}
-            ),
-            patterns=[],
-            multi_timeframe=None,
-            overall_signal="hold",
-            confidence=0,
-            key_observations=[]
-        )
+    # =========================================================================
+    # CHART PATTERN DETECTION METHODS (investingoal.com patterns)
+    # =========================================================================
+    
+    def _detect_flag_pattern(self, df: pd.DataFrame, current_price: float, timeframe: str = "1h") -> List[PatternSignal]:
+        patterns = []
+        if len(df) < 20:
+            return patterns
+            
+        closes = df['close']
+        highs = df['high']
+        lows = df['low']
+        volumes = df['volume']
+        
+        # Bull Flag: strong uptrend (pole) + tight consolidation (flag) + breakout up
+        # Bear Flag: strong downtrend (pole) + tight consolidation (flag) + breakout down
+        
+        lookback = min(40, len(df) - 1)
+        recent = df.tail(lookback + 1).copy()
+        
+        # Find the pole: largest move in one direction
+        pole_start_idx = None
+        pole_end_idx = None
+        pole_size = 0.0
+        pole_direction = None
+        
+        for i in range(lookback - 5):
+            window = recent.iloc[i:i+10]
+            if len(window) < 5:
+                continue
+            move = window['close'].iloc[-1] - window['close'].iloc[0]
+            move_pct = abs(move) / window['close'].iloc[0]
+            
+            if move_pct > pole_size and move_pct > 0.03:  # min 3% move for pole
+                pole_size = move_pct
+                pole_direction = "bullish" if move > 0 else "bearish"
+                pole_start_idx = i
+                pole_end_idx = i + 9
+        
+        if pole_direction is None or pole_end_idx is None:
+            return patterns
+            
+        pole_start = recent['close'].iloc[pole_start_idx]
+        pole_end = recent['close'].iloc[pole_end_idx]
+        
+        # Flag: consolidation after pole (tight range, declining volume)
+        flag_start = pole_end_idx
+        flag_end = lookback
+        
+        if flag_end - flag_start < 3:  # need at least 3 candles in flag
+            return patterns
+            
+        flag_df = recent.iloc[flag_start:flag_end+1]
+        if len(flag_df) < 3:
+            return patterns
+            
+        flag_high = flag_df['high'].max()
+        flag_low = flag_df['low'].min()
+        flag_range_pct = (flag_high - flag_low) / flag_low
+        
+        # Flag should be tight: < 50% of pole size
+        valid_flag = flag_range_pct < pole_size * 0.5 and flag_range_pct < 0.02
+        
+        if not valid_flag:
+            return patterns
+            
+        # Volume should decline during flag
+        pole_vol = volumes.iloc[pole_start_idx:pole_end_idx+1].mean()
+        flag_vol = volumes.iloc[flag_start:flag_end+1].mean()
+        volume_declining = flag_vol < pole_vol * 0.8
+        
+        # Flag breakout: entry at breakout level, not current price
+        if pole_direction == "bullish":
+            at_breakout = current_price >= flag_high * 0.998
+            if at_breakout:
+                target = current_price + (pole_end - pole_start)
+                stop_loss = flag_low
+                conf = 0.78 if volume_declining else 0.68
+                patterns.append(PatternSignal(
+                    pattern_type="bull_flag",
+                    direction="bullish",
+                    confidence=conf,
+                    entry_price=round(flag_high * 0.9985, 8),  # Enter just below breakout
+                    stop_loss=round(stop_loss * 0.998, 8),
+                    take_profit_1=round(target * 0.998, 8),
+                    take_profit_2=round(target * 1.01, 8),
+                    risk_reward=round((target - flag_high) / (flag_high - stop_loss), 2),
+                    reasoning="Bull flag breakout: entry at resistance breakout. Target = pole length.",
+                    timeframe=timeframe,
+                ))
+        else:
+            at_breakout = current_price <= flag_low * 1.002
+            if at_breakout:
+                target = current_price - (pole_start - pole_end)
+                stop_loss = flag_high
+                conf = 0.78 if volume_declining else 0.68
+                patterns.append(PatternSignal(
+                    pattern_type="bear_flag",
+                    direction="bearish",
+                    confidence=conf,
+                    entry_price=round(flag_low * 1.0015, 8),  # Enter just above breakdown
+                    stop_loss=round(stop_loss * 1.002, 8),
+                    take_profit_1=round(target * 1.002, 8),
+                    take_profit_2=round(target * 0.99, 8),
+                    risk_reward=round((flag_low - target) / (stop_loss - flag_low), 2),
+                    reasoning="Bear flag breakdown: entry at support breakdown. Target = pole length.",
+                    timeframe=timeframe,
+                ))
+        
+        return patterns
+    
+    def _detect_triangle_patterns(self, df: pd.DataFrame, current_price: float, timeframe: str = "1h") -> List[PatternSignal]:
+        patterns = []
+        if len(df) < 40:
+            return patterns
+            
+        highs = df['high'].values
+        lows = df['low'].values
+        closes = df['close']
+        
+        # Get trendlines using linear regression on highs and lows
+        lookback = min(30, len(df) - 1)
+        recent = df.tail(lookback + 1)
+        
+        upper_lines = []
+        lower_lines = []
+        
+        # Find local extrema for trendline fitting
+        for i in range(3, lookback - 3):
+            if highs[i] > highs[i-1] and highs[i] > highs[i+1]:
+                upper_lines.append((i, highs[i]))
+            if lows[i] < lows[i-1] and lows[i] < lows[i+1]:
+                lower_lines.append((i, lows[i]))
+        
+        if len(upper_lines) < 3 or len(lower_lines) < 3:
+            return patterns
+        
+        # Simple linear trendlines
+        import numpy as np
+        
+        upper_x = np.array([p[0] for p in upper_lines])
+        upper_y = np.array([p[1] for p in upper_lines])
+        lower_x = np.array([p[0] for p in lower_lines])
+        lower_y = np.array([p[1] for p in lower_lines])
+        
+        upper_slope = np.polyfit(upper_x, upper_y, 1)[0]
+        lower_slope = np.polyfit(lower_x, lower_y, 1)[0]
+        
+        # Ascending Triangle: flat top, rising bottom -> bullish breakout
+        if abs(upper_slope) < 0.001 and lower_slope > 0.001:
+            flat_top = max(highs[-5:])
+            if current_price > flat_top * 0.998:
+                target = flat_top + (flat_top - current_low)
+                patterns.append(PatternSignal(
+                    pattern_type="ascending_triangle",
+                    direction="bullish",
+                    confidence=0.70,
+                    entry_price=round(flat_top * 0.9985, 8),  # Entry at breakout level
+                    stop_loss=round(current_low * 0.97, 8),
+                    take_profit_1=round(target * 0.998, 8),
+                    take_profit_2=round(target * 1.01, 8),
+                    risk_reward=round((target - flat_top) / (flat_top - current_low), 2),
+                    reasoning="Ascending triangle breakout: entry at resistance. Target = triangle height.",
+                    timeframe=timeframe,
+                ))
+        
+        # Descending Triangle: falling top, flat bottom -> bearish breakdown
+        elif upper_slope < -0.001 and abs(lower_slope) < 0.001:
+            flat_bottom = min(lows[-5:])
+            if current_price < flat_bottom * 1.002:
+                target = flat_bottom - (current_high - flat_bottom)
+                patterns.append(PatternSignal(
+                    pattern_type="descending_triangle",
+                    direction="bearish",
+                    confidence=0.70,
+                    entry_price=round(flat_bottom * 1.0015, 8),  # Entry at breakdown level
+                    stop_loss=round(current_high * 1.03, 8),
+                    take_profit_1=round(target * 1.002, 8),
+                    take_profit_2=round(target * 0.99, 8),
+                    risk_reward=round((flat_bottom - target) / (current_high - flat_bottom), 2),
+                    reasoning="Descending triangle breakdown: entry at support. Target = triangle height.",
+                    timeframe=timeframe,
+                ))
+        
+        # Symmetrical Triangle: converging lines -> breakout either way
+        elif abs(upper_slope) < 0.002 and abs(lower_slope) < 0.002 and upper_slope * lower_slope < 0:
+            triangle_high = max(highs[-5:])
+            triangle_low = min(lows[-5:])
+            range_pct = (triangle_high - triangle_low) / current_price
+            
+            if range_pct < 0.03:
+                recent_move = closes.iloc[-1] - closes.iloc[-5]
+                if recent_move > 0:
+                    target = triangle_high + (triangle_high - triangle_low)
+                    patterns.append(PatternSignal(
+                        pattern_type="symmetrical_triangle",
+                        direction="bullish",
+                        confidence=0.60,
+                        entry_price=round(triangle_high * 0.9985, 8),
+                        stop_loss=round(triangle_low * 0.98, 8),
+                        take_profit_1=round(target * 0.998, 8),
+                        take_profit_2=round(target * 1.01, 8),
+                        risk_reward=round((target - triangle_high) / (triangle_high - triangle_low), 2),
+                        reasoning="Symmetrical triangle breakout up: entry at resistance. Target = range height.",
+                        timeframe=timeframe,
+                    ))
+                else:
+                    target = triangle_low - (triangle_high - triangle_low)
+                    patterns.append(PatternSignal(
+                        pattern_type="symmetrical_triangle",
+                        direction="bearish",
+                        confidence=0.60,
+                        entry_price=round(triangle_low * 1.0015, 8),
+                        stop_loss=round(triangle_high * 1.02, 8),
+                        take_profit_1=round(target * 1.002, 8),
+                        take_profit_2=round(target * 0.99, 8),
+                        risk_reward=round((triangle_low - target) / (triangle_high - triangle_low), 2),
+                        reasoning="Symmetrical triangle breakdown: entry at support. Target = range height.",
+                        timeframe=timeframe,
+                    ))
+        
+        # Symmetrical Triangle: converging lines -> breakout either way
+        elif abs(upper_slope) < 0.002 and abs(lower_slope) < 0.002 and upper_slope * lower_slope < 0:
+            triangle_high = max(highs[-5:])
+            triangle_low = min(lows[-5:])
+            range_pct = (triangle_high - triangle_low) / current_price
+            
+            if range_pct < 0.03:  # Tight triangle
+                # Determine breakout direction based on recent momentum
+                recent_move = closes.iloc[-1] - closes.iloc[-5]
+                if recent_move > 0:
+                    patterns.append(PatternSignal(
+                        pattern_type="symmetrical_triangle",
+                        direction="bullish",
+                        confidence=0.60,
+                        entry_price=current_price,
+                        stop_loss=round(triangle_low * 0.98, 8),
+                        take_profit_1=round(triangle_high + range_pct * current_price, 8),
+                        take_profit_2=round(triangle_high + range_pct * 1.5 * current_price, 8),
+                        risk_reward=1.2,
+                        reasoning="Symmetrical triangle converging. Recent momentum up, breakout expected.",
+                    ))
+                else:
+                    patterns.append(PatternSignal(
+                        pattern_type="symmetrical_triangle",
+                        direction="bearish",
+                        confidence=0.60,
+                        entry_price=current_price,
+                        stop_loss=round(triangle_high * 1.02, 8),
+                        take_profit_1=round(triangle_low - range_pct * current_price, 8),
+                        take_profit_2=round(triangle_low - range_pct * 1.5 * current_price, 8),
+                        risk_reward=1.2,
+                        reasoning="Symmetrical triangle converging. Recent momentum down, breakdown expected.",
+                    ))
+        
+        return patterns
+    
+    def _detect_head_shoulders(self, df: pd.DataFrame, current_price: float, timeframe: str = "1h") -> List[PatternSignal]:
+        patterns = []
+        if len(df) < 40:
+            return patterns
+            
+        highs = df['high'].values
+        lows = df['low'].values
+        
+        lookback = min(30, len(df) - 1)
+        recent = df.tail(lookback + 1)
+        
+        # Find local maxima for H&S
+        local_maxima = []
+        for i in range(2, lookback - 2):
+            if highs[i] > highs[i-1] and highs[i] > highs[i+1] and highs[i] > highs[i-2] and highs[i] > highs[i+2]:
+                local_maxima.append((i, highs[i]))
+        
+        # Find local minima for inverse H&S
+        local_minima = []
+        for i in range(2, lookback - 2):
+            if lows[i] < lows[i-1] and lows[i] < lows[i+1] and lows[i] < lows[i-2] and lows[i] < lows[i+2]:
+                local_minima.append((i, lows[i]))
+        
+        # Head and Shoulders: 3 peaks, middle highest
+        if len(local_maxima) >= 3:
+            # Get last 3 peaks
+            peaks = local_maxima[-3:]
+            left_shoulder = peaks[0][1]
+            head = peaks[1][1]
+            right_shoulder = peaks[2][1]
+            
+            # Head should be higher than both shoulders
+            if head > left_shoulder * 1.02 and head > right_shoulder * 1.02:
+                # Shoulders should be roughly equal (within 3%)
+                if abs(left_shoulder - right_shoulder) / left_shoulder < 0.03:
+                    neckline = min(left_shoulder, right_shoulder)
+                    if current_price < neckline * 1.01:
+                        patterns.append(PatternSignal(
+                            pattern_type="head_shoulders",
+                            direction="bearish",
+                            confidence=0.75,
+                            entry_price=current_price,
+                            stop_loss=round(head * 1.02, 8),
+                            take_profit_1=round(neckline - (head - neckline) * 0.5, 8),
+                            take_profit_2=round(neckline - (head - neckline), 8),
+                            risk_reward=1.5,
+                            reasoning="Head and Shoulders: distribution complete. Neckline break targets lower.",
+                            timeframe=timeframe,
+                        ))
+        
+        if len(local_minima) >= 3:
+            troughs = local_minima[-3:]
+            left_shoulder = troughs[0][1]
+            head = troughs[1][1]
+            right_shoulder = troughs[2][1]
+            
+            if head < left_shoulder * 0.98 and head < right_shoulder * 0.98:
+                if abs(left_shoulder - right_shoulder) / left_shoulder < 0.03:
+                    neckline = max(left_shoulder, right_shoulder)
+                    if current_price > neckline * 0.99:
+                        patterns.append(PatternSignal(
+                            pattern_type="inverse_head_shoulders",
+                            direction="bullish",
+                            confidence=0.75,
+                            entry_price=current_price,
+                            stop_loss=round(head * 0.98, 8),
+                            take_profit_1=round(neckline + (neckline - head) * 0.5, 8),
+                            take_profit_2=round(neckline + (neckline - head), 8),
+                            risk_reward=1.5,
+                            reasoning="Inverse Head and Shoulders: accumulation complete. Neckline break targets higher.",
+                            timeframe=timeframe,
+                        ))
+        
+        return patterns
+    
+    def _detect_double_triple(self, df: pd.DataFrame, current_price: float, timeframe: str = "1h") -> List[PatternSignal]:
+        patterns = []
+        if len(df) < 30:
+            return patterns
+            
+        highs = df['high'].values
+        lows = df['low'].values
+        
+        lookback = min(25, len(df) - 1)
+        
+        # Find local maxima
+        local_maxima = []
+        for i in range(2, lookback - 2):
+            if highs[i] > highs[i-1] and highs[i] > highs[i+1]:
+                local_maxima.append(highs[i])
+        
+        # Find local minima
+        local_minima = []
+        for i in range(2, lookback - 2):
+            if lows[i] < lows[i-1] and lows[i] < lows[i+1]:
+                local_minima.append(lows[i])
+        
+        # Double Top: two peaks at same level
+        if len(local_maxima) >= 2:
+            peak1 = local_maxima[-2]
+            peak2 = local_maxima[-1]
+            if abs(peak1 - peak2) / peak1 < 0.02:
+                resistance = (peak1 + peak2) / 2
+                if current_price > resistance * 0.99:
+                    patterns.append(PatternSignal(
+                        pattern_type="double_top",
+                        direction="bearish",
+                        confidence=0.72,
+                        entry_price=current_price,
+                        stop_loss=round(peak2 * 1.02, 8),
+                        take_profit_1=round(resistance - (resistance * 0.05), 8),
+                        take_profit_2=round(resistance - (resistance * 0.10), 8),
+                        risk_reward=2.0,
+                        reasoning="Double Top: two peaks at resistance. Strong rejection expected.",
+                        timeframe=timeframe,
+                    ))
+        
+        if len(local_minima) >= 2:
+            trough1 = local_minima[-2]
+            trough2 = local_minima[-1]
+            if abs(trough1 - trough2) / trough1 < 0.02:
+                support = (trough1 + trough2) / 2
+                if current_price < support * 1.01:
+                    patterns.append(PatternSignal(
+                        pattern_type="double_bottom",
+                        direction="bullish",
+                        confidence=0.72,
+                        entry_price=current_price,
+                        stop_loss=round(trough2 * 0.98, 8),
+                        take_profit_1=round(support + (support * 0.05), 8),
+                        take_profit_2=round(support + (support * 0.10), 8),
+                        risk_reward=2.0,
+                        reasoning="Double Bottom: two troughs at support. Strong bounce expected.",
+                        timeframe=timeframe,
+                    ))
+        
+        if len(local_maxima) >= 3:
+            peak1 = local_maxima[-3]
+            peak2 = local_maxima[-2]
+            peak3 = local_maxima[-1]
+            if abs(peak1 - peak2) / peak1 < 0.03 and abs(peak2 - peak3) / peak2 < 0.03:
+                resistance = (peak1 + peak2 + peak3) / 3
+                if current_price > resistance * 0.99:
+                    patterns.append(PatternSignal(
+                        pattern_type="triple_top",
+                        direction="bearish",
+                        confidence=0.80,
+                        entry_price=current_price,
+                        stop_loss=round(peak3 * 1.02, 8),
+                        take_profit_1=round(resistance - (resistance * 0.08), 8),
+                        take_profit_2=round(resistance - (resistance * 0.15), 8),
+                        risk_reward=2.5,
+                        reasoning="Triple Top: three peaks at resistance. Strong rejection = high conviction.",
+                        timeframe=timeframe,
+                    ))
+        
+        if len(local_minima) >= 3:
+            trough1 = local_minima[-3]
+            trough2 = local_minima[-2]
+            trough3 = local_minima[-1]
+            if abs(trough1 - trough2) / trough1 < 0.03 and abs(trough2 - trough3) / trough2 < 0.03:
+                support = (trough1 + trough2 + trough3) / 3
+                if current_price < support * 1.01:
+                    patterns.append(PatternSignal(
+                        pattern_type="triple_bottom",
+                        direction="bullish",
+                        confidence=0.80,
+                        entry_price=current_price,
+                        stop_loss=round(trough3 * 0.98, 8),
+                        take_profit_1=round(support + (support * 0.08), 8),
+                        take_profit_2=round(support + (support * 0.15), 8),
+                        risk_reward=2.5,
+                        reasoning="Triple Bottom: three troughs at support. Strong bounce = high conviction.",
+                        timeframe=timeframe,
+                    ))
+        
+        return patterns
+    
+    def _detect_cup_handle(self, df: pd.DataFrame, current_price: float, timeframe: str = "1h") -> List[PatternSignal]:
+        patterns = []
+        if len(df) < 50:
+            return patterns
+            
+        closes = df['close'].values
+        highs = df['high'].values
+        lows = df['low'].values
+        volumes = df['volume'].values
+        
+        lookback = min(40, len(df) - 1)
+        
+        # Cup and Handle: rounded bottom (U-shape) + pullback + breakout higher
+        # Need to find a U-shaped formation
+        
+        # Find the lowest point in recent data
+        min_idx = np.argmin(closes[:lookback])
+        min_price = closes[min_idx]
+        
+        # Check for U-shape: prices on both sides of min should be higher
+        if min_idx < 10 or min_idx > lookback - 10:
+            return patterns
+        
+        # Cup: price rises on both sides of minimum
+        left_rise = closes[min_idx] - closes[min_idx - 10]
+        right_rise = closes[min_idx + 10] - closes[min_idx]
+        if left_rise > 0 and right_rise > 0:
+            cup_bottom = min_price
+            cup_left_edge = closes[min_idx - 10]
+            cup_right_edge = closes[min_idx + 10]
+            if abs(cup_left_edge - cup_right_edge) / cup_left_edge < 0.05:
+                handle_start = min_idx + 10
+                handle_end = lookback
+                if handle_end - handle_start >= 5:
+                    handle_df = closes[handle_start:handle_end+1]
+                    handle_high = np.max(handle_df)
+                    handle_low = np.min(handle_df)
+                    cup_depth = (cup_left_edge + cup_right_edge) / 2 - cup_bottom
+                    handle_range = handle_high - handle_low
+                    if handle_range < cup_depth * 0.4:
+                        cup_edge = (cup_left_edge + cup_right_edge) / 2
+                        if current_price > cup_edge * 1.01:
+                            patterns.append(PatternSignal(
+                                pattern_type="cup_handle",
+                                direction="bullish",
+                                confidence=0.75,
+                                entry_price=current_price,
+                                stop_loss=round(cup_bottom * 0.97, 8),
+                                take_profit_1=round(cup_edge + cup_depth * 1.0, 8),
+                                take_profit_2=round(cup_edge + cup_depth * 1.5, 8),
+                                risk_reward=2.0,
+                                reasoning="Cup and Handle: U-shape completes, handle pulls back. Breakout targets higher.",
+                                timeframe=timeframe,
+                            ))
+        
+        max_idx = np.argmax(closes[:lookback])
+        
+        if max_idx < 10 or max_idx > lookback - 10:
+            return patterns
+        
+        left_drop = closes[max_idx] - closes[max_idx - 10]
+        right_drop = closes[max_idx] - closes[max_idx + 10]
+        
+        if left_drop > 0 and right_drop > 0:
+            cup_top = closes[max_idx]
+            cup_left_edge = closes[max_idx - 10]
+            cup_right_edge = closes[max_idx + 10]
+            
+            if abs(cup_left_edge - cup_right_edge) / cup_left_edge < 0.05:
+                handle_start = max_idx + 10
+                handle_end = lookback
+                
+                if handle_end - handle_start >= 5:
+                    handle_df = closes[handle_start:handle_end+1]
+                    handle_high = np.max(handle_df)
+                    handle_low = np.min(handle_df)
+                    
+                    cup_drop = cup_top - (cup_left_edge + cup_right_edge) / 2
+                    handle_range = handle_high - handle_low
+                    
+                    if handle_range < cup_drop * 0.4:
+                        cup_edge = (cup_left_edge + cup_right_edge) / 2
+                        if current_price < cup_edge * 0.99:
+                            patterns.append(PatternSignal(
+                                pattern_type="inverse_cup_handle",
+                                direction="bearish",
+                                confidence=0.75,
+                                entry_price=current_price,
+                                stop_loss=round(cup_top * 1.03, 8),
+                                take_profit_1=round(cup_edge - cup_drop * 1.0, 8),
+                                take_profit_2=round(cup_edge - cup_drop * 1.5, 8),
+                                risk_reward=2.0,
+                                reasoning="Inverse Cup and Handle: ∩-shape completes, handle pulls back. Breakdown targets lower.",
+                                timeframe=timeframe,
+                            ))
+        
+        return patterns
+    
+    def _detect_wedge(self, df: pd.DataFrame, current_price: float, timeframe: str = "1h") -> List[PatternSignal]:
+        patterns = []
+        if len(df) < 30:
+            return patterns
+            
+        highs = df['high'].values
+        lows = df['low'].values
+        
+        lookback = min(25, len(df) - 1)
+        
+        # Find trendlines
+        upper_lines = []
+        lower_lines = []
+        
+        for i in range(3, lookback - 3):
+            if highs[i] > highs[i-1] and highs[i] > highs[i+1]:
+                upper_lines.append((i, highs[i]))
+            if lows[i] < lows[i-1] and lows[i] < lows[i+1]:
+                lower_lines.append((i, lows[i]))
+        
+        if len(upper_lines) < 3 or len(lower_lines) < 3:
+            return patterns
+        
+        import numpy as np
+        
+        upper_x = np.array([p[0] for p in upper_lines])
+        upper_y = np.array([p[1] for p in upper_lines])
+        lower_x = np.array([p[0] for p in lower_lines])
+        lower_y = np.array([p[1] for p in lower_lines])
+        
+        upper_slope = np.polyfit(upper_x, upper_y, 1)[0]
+        lower_slope = np.polyfit(lower_x, lower_y, 1)[0]
+        
+        # Rising Wedge: both lines sloping up, but upper steeper -> bearish
+        if upper_slope > 0 and lower_slope > 0 and upper_slope > lower_slope:
+            wedge_high = highs[-1]
+            wedge_low = lows[-1]
+            recent_range = wedge_high - wedge_low
+            
+            if current_price < wedge_low * 1.005:
+                patterns.append(PatternSignal(
+                    pattern_type="rising_wedge",
+                    direction="bearish",
+                    confidence=0.68,
+                    entry_price=current_price,
+                    stop_loss=round(wedge_high * 1.02, 8),
+                    take_profit_1=round(current_price - recent_range * 0.5, 8),
+                    take_profit_2=round(current_price - recent_range, 8),
+                    risk_reward=1.5,
+                    reasoning="Rising wedge: converging up. Bearish reversal typical.",
+                    timeframe=timeframe,
+                ))
+        
+        elif upper_slope < 0 and lower_slope < 0 and lower_slope < upper_slope:
+            wedge_high = highs[-1]
+            wedge_low = lows[-1]
+            recent_range = wedge_high - wedge_low
+            
+            if current_price > wedge_high * 0.995:
+                patterns.append(PatternSignal(
+                    pattern_type="falling_wedge",
+                    direction="bullish",
+                    confidence=0.68,
+                    entry_price=current_price,
+                    stop_loss=round(wedge_low * 0.98, 8),
+                    take_profit_1=round(current_price + recent_range * 0.5, 8),
+                    take_profit_2=round(current_price + recent_range, 8),
+                    risk_reward=1.5,
+                    reasoning="Falling wedge: converging down. Bullish reversal typical.",
+                    timeframe=timeframe,
+                ))
+        
+        return patterns
+    
+    def _detect_rectangle(self, df: pd.DataFrame, current_price: float, timeframe: str = "1h") -> List[PatternSignal]:
+        patterns = []
+        if len(df) < 20:
+            return patterns
+            
+        highs = df['high'].values
+        lows = df['low'].values
+        
+        lookback = min(20, len(df) - 1)
+        
+        # Rectangle: price moving sideways between parallel support/resistance
+        recent_highs = highs[-lookback:]
+        recent_lows = lows[-lookback:]
+        
+        channel_high = np.max(recent_highs)
+        channel_low = np.min(recent_lows)
+        range_pct = (channel_high - channel_low) / channel_low
+        
+        # Should be a tight range (not trending)
+        if range_pct < 0.03:
+            # Determine breakout direction by recent momentum
+            closes = df['close'].values
+            recent_move = closes[-1] - closes[-5]
+            
+            if recent_move > 0:
+                patterns.append(PatternSignal(
+                    pattern_type="rectangle",
+                    direction="bullish",
+                    confidence=0.55,
+                    entry_price=current_price,
+                    stop_loss=round(channel_low * 0.98, 8),
+                    take_profit_1=round(channel_high + range_pct * current_price, 8),
+                    take_profit_2=round(channel_high + range_pct * 1.5 * current_price, 8),
+                    risk_reward=1.2,
+                    reasoning="Rectangle: sideways channel. Breakout up likely.",
+                    timeframe=timeframe,
+                ))
+            else:
+                patterns.append(PatternSignal(
+                    pattern_type="rectangle",
+                    direction="bearish",
+                    confidence=0.55,
+                    entry_price=current_price,
+                    stop_loss=round(channel_high * 1.02, 8),
+                    take_profit_1=round(channel_low - range_pct * current_price, 8),
+                    take_profit_2=round(channel_low - range_pct * 1.5 * current_price, 8),
+                    risk_reward=1.2,
+                    reasoning="Rectangle: sideways channel. Breakdown likely.",
+                    timeframe=timeframe,
+                ))
+        
+        return patterns
 
     async def get_confluence_scores(self, symbols: List[str], timeframe: str = "1h") -> Dict[str, Dict[str, Any]]:
         """

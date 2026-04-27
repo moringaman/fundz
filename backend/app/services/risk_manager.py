@@ -300,6 +300,48 @@ class RiskManager:
         self._daily_pnl = {'today': 0}
         self._last_reset = datetime.now()
 
+    def check_correlation_concentration(
+        self,
+        intended_trade: Dict[str, Any],
+        current_positions: List[Dict[str, Any]],
+        total_capital: float,
+        max_correlated_exposure_pct: float,
+    ) -> RiskCheckResult:
+        if total_capital <= 0 or max_correlated_exposure_pct >= 100:
+            return RiskCheckResult(allowed=True, action="allow", reason="correlation gate disabled")
+        try:
+            from app.services.correlation_service import correlation_service
+            exposure = correlation_service.compute_correlated_exposure(
+                positions=current_positions,
+                intended_trade=intended_trade,
+                total_capital=total_capital,
+            )
+        except Exception as e:
+            logger.debug(f"Correlation concentration check skipped: {e}")
+            return RiskCheckResult(allowed=True, action="allow", reason=f"correlation check unavailable: {e}")
+
+        if exposure.effective_pct > max_correlated_exposure_pct:
+            top_pair = max(exposure.weighted_pairs, key=lambda p: abs(p[2] * p[3]), default=None)
+            pair_note = ""
+            if top_pair:
+                s1, s2, rho, w = top_pair
+                pair_note = f" — primary correlated pair: {s1}/{s2} ρ={rho:+.2f}"
+            return RiskCheckResult(
+                allowed=False,
+                action="reject",
+                reason=(
+                    f"Correlation-weighted exposure {exposure.effective_pct:.1f}% > "
+                    f"{max_correlated_exposure_pct:.1f}% limit "
+                    f"(raw long={exposure.raw_long_pct:.1f}%, short={exposure.raw_short_pct:.1f}%)"
+                    f"{pair_note}"
+                ),
+            )
+        return RiskCheckResult(
+            allowed=True,
+            action="allow",
+            reason=f"effective exposure {exposure.effective_pct:.1f}% within limit",
+        )
+
     async def generate_risk_assessment(
         self,
         current_positions: List[Dict[str, Any]] = None,
@@ -583,7 +625,7 @@ Provide brief risk assessment in JSON:
 }}
 """
 
-            response = await self.llm_service._call_llm(prompt)
+            response = await self.llm_service._call_llm(prompt, role='risk_manager')
 
             try:
                 data = json.loads(response.content)

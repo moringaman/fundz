@@ -12,7 +12,7 @@ from app.clients.phemex import PhemexClient
 from app.config import settings
 from app.database import get_async_session
 from app.services.indicators import IndicatorService
-from app.services.paper_trading import paper_trading
+from app.services.paper_trading import paper_trading, PatternEntryDeferred
 from app.services.trading_service import trading_service, _is_paper_mode
 from app.services.position_sync import position_sync_service
 from app.services.backtest import BacktestEngine
@@ -518,6 +518,44 @@ class AgentScheduler:
         except Exception:
             pass
 
+        # ── Trader peer learning: inject top performer's approach ──────────
+        # Agents learn from the best-performing trader's style, strategy focus,
+        # and recent performance. Only injected when the current agent belongs
+        # to a trader that isn't #1 — no need to learn from yourself.
+        try:
+            _agent_cfg_pl = self._enabled_agents.get(agent_id, {})
+            _trader_id_pl = _agent_cfg_pl.get("trader_id") or _agent_cfg_pl.get("_trader_id_pre")
+            if _trader_id_pl and self._traders and self._current_trader_perf:
+                _agent_trader = next((t for t in self._traders if t["id"] == _trader_id_pl), None)
+                _perfs_sorted = sorted(
+                    self._current_trader_perf.items(),
+                    key=lambda kv: kv[1].get("total_pnl", 0) or 0,
+                    reverse=True,
+                )
+                if _perfs_sorted:
+                    _top_id, _top_perf = _perfs_sorted[0]
+                    if _top_id != _trader_id_pl:
+                        _top_trader = next((t for t in self._traders if t["id"] == _top_id), None)
+                        if _top_trader:
+                            _top_wr = float(_top_perf.get("win_rate") or 0) * 100
+                            _top_pnl = float(_top_perf.get("total_pnl") or 0)
+                            _peer_note = (
+                                f"The fund's top-performing trader, {_top_trader['name']}, "
+                                f"has a {_top_wr:.0f}% win rate with ${_top_pnl:+.2f} net P&L. "
+                                f"Their style: {_top_trader.get('config', {}).get('style', 'balanced')}. "
+                                f"They favour {', '.join(_top_trader.get('config', {}).get('preferred_strategies', ['momentum']))} "
+                                f"strategies. Consider their disciplined, high-conviction approach "
+                                f"when evaluating this signal — emulate what is working."
+                            )
+                            ctx["trader_peer_learning"] = {
+                                "top_trader_name": _top_trader["name"],
+                                "top_trader_style": _top_trader.get("config", {}).get("style", ""),
+                                "top_trader_strategies": _top_trader.get("config", {}).get("preferred_strategies", []),
+                                "peer_note": _peer_note,
+                            }
+        except Exception:
+            pass
+
         # AI self-learning: inject a rolling window of the agent's own past LLM reasoning
         # and their outcomes so the LLM can reflect on its own previous logic.
         # Loads the 5 most recent AI runs with stored reasoning for this agent+symbol.
@@ -799,6 +837,8 @@ class AgentScheduler:
             from sqlalchemy import select
             async with get_async_session() as session:
                 self._traders = await trader_service.seed_default_traders(session)
+                from app.services.trader_service import validate_trader_configs
+                await validate_trader_configs(session)
                 if self._traders:
                     alpha = self._traders[0]
                     # Only assign unassigned agents if any exist (one-time migration guard)
@@ -1127,6 +1167,8 @@ class AgentScheduler:
                 # per ~23h per symbol, even if this loop runs every minute.
                 await self._maybe_refit_regime_models()
 
+                await self._maybe_refresh_correlation_matrix()
+
                 # POSITION MONITORING: Check SL/TP on every loop iteration
                 await self._monitor_open_positions()
 
@@ -1202,6 +1244,58 @@ class AgentScheduler:
                         "session": _session_label,
                     },
                 )
+
+                if trader_agents and trader.get("llm_model"):
+                    try:
+                        trader_llm = await trader_service.get_trader_llm(trader)
+                    except Exception:
+                        trader_llm = None
+
+                    if trader_llm:
+                        pos_block = []
+                        trader_agent_id_set = {a.get("id") for a in trader_agents}
+                        paper_poss = await paper_trading.get_positions()
+                        live_poss = []
+                        try:
+                            live_poss = await trading_service.get_positions()
+                        except Exception:
+                            pass
+                        for pos in list(paper_poss) + list(live_poss):
+                            pos_agent = getattr(pos, 'agent_id', None)
+                            if pos_agent and pos_agent in trader_agent_id_set:
+                                entry = getattr(pos, 'entry_price', 0) or 0
+                                curr = getattr(pos, 'current_price', entry)
+                                if entry > 0:
+                                    pnl_pct = ((curr - entry) / entry) * 100
+                                    sl = getattr(pos, 'stop_loss_price', None)
+                                    tp = getattr(pos, 'take_profit_price', None)
+                                    pos_block.append(f"{pos.symbol}: {pnl_pct:+.1f}% | Entry ${entry:.2f}" +
+                                                   (f" | SL ${sl:.2f}" if sl else "") +
+                                                   (f" | TP ${tp:.2f}" if tp else ""))
+                        if pos_block:
+                            pos_summary = "Open positions:\n" + "\n".join(f"- {p}" for p in pos_block)
+                            pos_system = (
+                                f"You are {trader_name}, a crypto fund trader. "
+                                f"Review your open positions and provide a brief update. "
+                                f"Focus on: P&L status (profitable/breakeven/underwater), "
+                                f"any SL/TP adjustments you might want (don't execute, just note), "
+                                f"and key market levels you're watching. "
+                                f"Keep it brief - 1-2 sentences per position. "
+                                f"Only flag REAL issues: wrong direction, clearly broken trade thesis. "
+                                f"Don't mention duplicates - multiple agents holding same pair is normal."
+                            )
+                            try:
+                                pos_response = await trader_llm._call_llm_text(pos_system, f"{pos_summary}\n", temperature=0.3, max_tokens=200)
+                                if pos_response and not pos_response.startswith("I'm sorry"):
+                                    await team_chat.add_message(
+                                        agent_role=f"trader_{trader_name.lower().replace(' ', '_')}",
+                                        content=f"📊 **Position Update:** {pos_response.strip()}",
+                                        message_type="analysis",
+                                        metadata={"_override_name": trader_name, "_override_avatar": trader_avatar},
+                                    )
+                            except Exception as e:
+                                logger.debug(f"Trader position update failed: {e}")
+
             except Exception as e:
                 logger.debug(f"Trader check-in emit failed for {trader.get('name', 'trader')}: {e}")
 
@@ -1223,7 +1317,7 @@ class AgentScheduler:
             gates = get_trading_gates()
             risk = get_risk_limits()
             fund_size = getattr(prefs, "total_fund_usd", 10000) or 10000
-            _daily_loss_pct = risk.max_daily_loss_pct
+            _daily_loss_pct = gates.max_daily_loss_pct
             _daily_trade_max = gates.circuit_breaker_max_trades
         except Exception:
             fund_size = 10000
@@ -2085,6 +2179,53 @@ class AgentScheduler:
                         except Exception as _so_err:
                             logger.debug(f"Scale-out processing error for {pos.symbol}: {_so_err}")
 
+                    # ── Momentum exhaustion early exit ────────────────────────
+                    # If the trend structure that justified this entry has broken down,
+                    # exit BEFORE the mechanical SL triggers. This catches the "waning
+                    # momentum" scenario where RSI has collapsed from a strong entry
+                    # reading but price hasn't yet crossed the SL level.
+                    _entry_inds = None
+                    try:
+                        _entry_inds = getattr(pos, 'entry_indicators', None)
+                    except Exception:
+                        pass
+                    if _entry_inds and isinstance(_entry_inds, dict):
+                        _entry_rsi = _entry_inds.get('rsi')
+                        _entry_adx = _entry_inds.get('adx')
+                        if _entry_rsi is not None and _entry_rsi > 55:
+                            try:
+                                import pandas as _pd_me
+                                _exit_df = await self.indicator_service.fetch_ohlcv(pos.symbol, '1h', limit=50)
+                                if _exit_df is not None and len(_exit_df) >= 5:
+                                    _rsi_exit = self.indicator_service.calculate_rsi(_exit_df['close'].astype(float))
+                                    _rsi_now = float(_rsi_exit.iloc[-1]) if not _pd_me.isna(_rsi_exit.iloc[-1]) else None
+                                    if _rsi_now is not None and _rsi_now < max(40, _entry_rsi - 20):
+                                        _drop = _entry_rsi - _rsi_now
+                                        _direction = "LONG" if not is_short else "SHORT"
+                                        logger.warning(
+                                            f"Momentum exhaustion exit: {pos.symbol} {_direction} "
+                                            f"RSI dropped {_entry_rsi:.1f}→{_rsi_now:.1f} "
+                                            f"({-_drop:.1f} pts) — exiting before SL"
+                                        )
+                                        exit_side = "buy" if is_short else "sell"
+                                        await _svc.place_order(
+                                            symbol=pos.symbol, side=exit_side,
+                                            quantity=pos.quantity, price=current_price,
+                                            agent_id=pos.agent_id,
+                                        )
+                                        from app.services.team_chat import team_chat
+                                        await team_chat.add_message(
+                                            agent_role="system",
+                                            content=(
+                                                f"⚡ Momentum exhaustion: {pos.symbol} {_direction} "
+                                                f"exited @ ${current_price:.2f} (RSI {_entry_rsi:.1f}→{_rsi_now:.1f})"
+                                            ),
+                                            message_type="trade",
+                                        )
+                                        continue  # skip normal SL/TP check
+                            except Exception as _me_err:
+                                logger.debug(f"Momentum exhaustion check skipped for {pos.symbol}: {_me_err}")
+
                     position_dict = {
                         'side': pos_side,
                         'entry_price': entry,
@@ -2767,74 +2908,110 @@ class AgentScheduler:
         Updates constraints that ALL agents will respect for the next 5 minutes
         """
         try:
+            _team_start_ts = datetime.now()
             logger.info("Team Tier: Running team analysis (research + portfolio + risk)")
 
-            # Fetch shared data once for all team members
-            agents_list = await self._fetch_agents_from_db()
-            agent_metrics = self._build_agent_metrics_list(agents_list)
-            current_positions = await self._get_current_positions()
+            try:
+                from app.api.routes.settings import get_trading_prefs as _get_prefs_top
+                _ra_symbols = list(_get_prefs_top().trading_pairs) or None
+            except Exception:
+                _ra_symbols = None
 
-            # Compute daily P&L from DB (robust across restarts)
-            daily_pnl = await self._compute_daily_pnl()
-            # Sync to risk manager so in-memory tracker stays accurate
+            async def _safe_call(coro, label):
+                try:
+                    return await coro
+                except Exception as e:
+                    logger.error(f"Team Tier: {label} failed: {e}")
+                    return None
+
+            agents_list, current_positions, daily_pnl, analyst_report_raw, market_condition_raw = await asyncio.gather(
+                _safe_call(self._fetch_agents_from_db(), "fetch agents"),
+                _safe_call(self._get_current_positions(), "fetch positions"),
+                _safe_call(self._compute_daily_pnl(), "compute daily pnl"),
+                _safe_call(research_analyst.analyze_markets(symbols=_ra_symbols), "research analyst"),
+                _safe_call(fund_manager.analyze_market(), "fund manager market analysis"),
+            )
+
+            agents_list = agents_list or []
+            current_positions = current_positions or []
+            daily_pnl = float(daily_pnl or 0.0)
+
+            agent_metrics = self._build_agent_metrics_list(agents_list)
+
             risk_manager._check_daily_reset()
             risk_manager._daily_pnl['today'] = daily_pnl
 
-            # Calculate real total capital: live Phemex balance or paper DB balance + open positions
             positions_value = sum(
                 p.get("quantity", 0) * p.get("current_price", p.get("entry_price", 0))
                 for p in current_positions
             )
-            total_capital = await self._get_total_capital(positions_value=positions_value)
+
+            all_symbols = set()
+            for a in agents_list:
+                pairs = a.get("trading_pairs") or a.get("config", {}).get("trading_pairs", [])
+                all_symbols.update(pairs)
+            try:
+                from app.api.routes.settings import get_trading_prefs
+                all_symbols.update(get_trading_prefs().trading_pairs)
+            except Exception:
+                pass
+            if not all_symbols:
+                all_symbols = {"BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT"}
+
+            from collections import Counter
+            tf_counts = Counter(a.get("timeframe", "1h") for a in agents_list)
+            dominant_tf = tf_counts.most_common(1)[0][0] if tf_counts else "1h"
+
+            try:
+                from app.api.routes.settings import get_trading_gates as _get_gates_capacity
+                _gates_capacity = _get_gates_capacity()
+                _max_daily_loss_pct = _gates_capacity.max_daily_loss_pct
+            except Exception:
+                _gates_capacity = None
+                _max_daily_loss_pct = 5.0
+
+            total_capital = float(
+                await _safe_call(self._get_total_capital(positions_value=positions_value), "compute total capital")
+                or 0.0
+            )
             self._total_capital = total_capital
 
-            # 1. Research Analyst: Multi-symbol market analysis across all configured pairs
-            try:
-                try:
-                    from app.api.routes.settings import get_trading_prefs
-                    _ra_symbols = list(get_trading_prefs().trading_pairs) or None
-                except Exception:
-                    _ra_symbols = None
-                analyst_report = await research_analyst.analyze_markets(symbols=_ra_symbols)
-                self._current_analyst_report = analyst_report
-                logger.info(f"Team Tier: Analyst report - Market {analyst_report.market_regime.regime}, "
-                           f"Sentiment: {analyst_report.market_regime.sentiment}")
-                await team_chat.log_analyst_report(analyst_report)
-            except Exception as e:
-                logger.error(f"Team Tier: Research analyst failed: {e}")
+            confluence_scores_raw, risk_assessment_raw = await asyncio.gather(
+                _safe_call(
+                    technical_analyst.get_confluence_scores(list(all_symbols), timeframe=dominant_tf),
+                    "TA confluence",
+                ),
+                _safe_call(
+                    risk_manager.generate_risk_assessment(
+                        current_positions=current_positions,
+                        daily_pnl=daily_pnl,
+                        total_capital=total_capital,
+                        max_daily_loss_pct=_max_daily_loss_pct,
+                    ),
+                    "risk assessment",
+                ),
+            )
 
-            # 2. Portfolio Manager: Reallocation based on analyst + real agent performance
-            market_condition = None
-            confluence_scores = None
-            try:
-                market_condition = await fund_manager.analyze_market()
-
-                # Gather unique trading symbols: agent pairs + configured global pairs
-                all_symbols = set()
-                for a in agents_list:
-                    pairs = a.get("trading_pairs") or a.get("config", {}).get("trading_pairs", [])
-                    all_symbols.update(pairs)
-                # Also include all pairs from the global trading config
+            if analyst_report_raw is not None:
+                self._current_analyst_report = analyst_report_raw
                 try:
-                    from app.api.routes.settings import get_trading_prefs
-                    all_symbols.update(get_trading_prefs().trading_pairs)
-                except Exception:
-                    pass
-                if not all_symbols:
-                    all_symbols = {"BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT"}
-
-                # Get Technical Analyst confluence scores so FM can reconcile signals.
-                # Use the most common agent timeframe so scores are relevant to the
-                # strategies that will consume them.
-                try:
-                    from collections import Counter
-                    tf_counts = Counter(a.get("timeframe", "1h") for a in agents_list)
-                    dominant_tf = tf_counts.most_common(1)[0][0] if tf_counts else "1h"
-                    confluence_scores = await technical_analyst.get_confluence_scores(list(all_symbols), timeframe=dominant_tf)
-                    self._current_confluence_scores = confluence_scores
-                    logger.info(f"Team Tier: TA confluence for {len(confluence_scores)} symbols (tf={dominant_tf})")
+                    logger.info(
+                        f"Team Tier: Analyst report - Market {analyst_report_raw.market_regime.regime}, "
+                        f"Sentiment: {analyst_report_raw.market_regime.sentiment}"
+                    )
+                    await team_chat.log_analyst_report(analyst_report_raw)
                 except Exception as e:
-                    logger.warning(f"Team Tier: TA confluence failed, FM will proceed without: {e}")
+                    logger.debug(f"Team Tier: analyst report logging failed: {e}")
+
+            market_condition = market_condition_raw
+
+            confluence_scores = None
+            if confluence_scores_raw is not None:
+                confluence_scores = confluence_scores_raw
+                self._current_confluence_scores = confluence_scores
+                logger.info(f"Team Tier: TA confluence for {len(confluence_scores)} symbols (tf={dominant_tf})")
+
+            try:
 
                 # When traders exist James allocates to traders (not directly to agents).
                 # Direct agent allocation only runs when there are no traders.
@@ -3089,22 +3266,16 @@ class AgentScheduler:
             except Exception as e:
                 logger.error(f"Team Tier: Strategy review failed: {e}")
 
-            # 3. Risk Manager: Portfolio-level risk check with real positions + P&L
-            try:
-                from app.api.routes.settings import get_risk_limits
-                _risk_limits = get_risk_limits()
-                risk_assessment = await risk_manager.generate_risk_assessment(
-                    current_positions=current_positions,
-                    daily_pnl=daily_pnl,
-                    total_capital=total_capital,
-                    max_daily_loss_pct=_risk_limits.max_daily_loss_pct,
-                )
-                self._current_risk_assessment = risk_assessment
-                logger.info(f"Team Tier: Risk assessment - Level: {risk_assessment.risk_level}, "
-                           f"Daily PnL: ${(risk_assessment.daily_pnl or 0):+.2f}")
-                await team_chat.log_risk_assessment(risk_assessment)
-            except Exception as e:
-                logger.error(f"Team Tier: Risk manager failed: {e}")
+            if risk_assessment_raw is not None:
+                self._current_risk_assessment = risk_assessment_raw
+                try:
+                    logger.info(
+                        f"Team Tier: Risk assessment - Level: {risk_assessment_raw.risk_level}, "
+                        f"Daily PnL: ${(risk_assessment_raw.daily_pnl or 0):+.2f}"
+                    )
+                    await team_chat.log_risk_assessment(risk_assessment_raw)
+                except Exception as e:
+                    logger.debug(f"Team Tier: risk assessment logging failed: {e}")
 
             # 3.5 Fund Manager SL/TP Review: Adjust open position levels
             #     based on TA confluence + market context + risk assessment
@@ -3179,6 +3350,11 @@ class AgentScheduler:
             except Exception as e:
                 logger.error(f"Team Tier: CIO report failed: {e}")
 
+            try:
+                _team_elapsed = (datetime.now() - _team_start_ts).total_seconds()
+                logger.info(f"Team Tier: completed in {_team_elapsed:.1f}s")
+            except Exception:
+                pass
         except Exception as e:
             logger.error(f"Team analysis tier failed: {e}")
 
@@ -3210,6 +3386,37 @@ class AgentScheduler:
                     pass
         except Exception as e:
             logger.error(f"Regime refit hook failed: {e}")
+
+    async def _maybe_refresh_correlation_matrix(self):
+        try:
+            from app.services.correlation_service import correlation_service
+            if not correlation_service.is_stale():
+                return
+            symbols = set()
+            try:
+                from app.api.routes.settings import get_trading_prefs
+                symbols.update(get_trading_prefs().trading_pairs)
+            except Exception:
+                pass
+            for a in self._enabled_agents.values():
+                pairs = a.get("trading_pairs") or a.get("config", {}).get("trading_pairs", [])
+                symbols.update(pairs)
+            if not symbols:
+                symbols = {"BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT"}
+            matrix = await correlation_service.refresh(symbols)
+            if matrix is not None:
+                try:
+                    avg_off_diag = (matrix.matrix.sum() - len(matrix.symbols)) / max(
+                        len(matrix.symbols) * (len(matrix.symbols) - 1), 1
+                    )
+                    logger.info(
+                        f"Correlation matrix refreshed: {len(matrix.symbols)} symbols, "
+                        f"{matrix.observations} obs, avg pairwise ρ={avg_off_diag:+.2f}"
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.error(f"Correlation refresh hook failed: {e}")
 
     async def _maybe_generate_daily_report(self):
         """Generate a daily report snapshot once per day (not repeatedly)."""
@@ -3832,6 +4039,8 @@ class AgentScheduler:
         best_signal = "hold"
         best_df = None
         best_reasoning = ""
+        best_market_context: Optional[Dict] = None
+        best_indicators: Optional[Dict] = None
 
         for candidate_symbol in _scan_order:
             try:
@@ -3941,7 +4150,7 @@ class AgentScheduler:
                         'sma_50':     float(_ai_sma50.iloc[-1])          if _ai_sma50 is not None else None,
                         'sma_200':    float(_ai_sma200.iloc[-1])         if _ai_sma200 is not None else None,
                         'atr':        float(_ai_atr.iloc[-1])            if _ai_atr is not None else None,
-                        'volume':     float(_ai_close.index[-1]) if len(df) > 0 else None,
+                        'volume':     float(_ai_vol.iloc[-1]) if _ai_vol is not None and len(df) > 0 else None,
                         'volume_sma': float(_ai_vol_sma.iloc[-1])        if _ai_vol_sma is not None else None,
                     }
 
@@ -4087,6 +4296,14 @@ class AgentScheduler:
                     best_signal = sig
                     best_df = df
                     best_reasoning = reas
+                    try:
+                        best_market_context = dict(_enriched_ctx) if '_enriched_ctx' in locals() and _enriched_ctx else (dict(market_context) if market_context else {})
+                    except Exception:
+                        best_market_context = dict(market_context) if market_context else {}
+                    try:
+                        best_indicators = dict(signal_result.indicators) if signal_result and getattr(signal_result, 'indicators', None) else {}
+                    except Exception:
+                        best_indicators = {}
 
                 # ── Watchlist update ──────────────────────────────────────────
                 # Near-miss: add to watchlist so next cycle prioritises this symbol.
@@ -4126,6 +4343,46 @@ class AgentScheduler:
         df = best_df
         current_price = df['close'].iloc[-1]
         team_context = await self._build_team_context(agent_id, symbol, timeframe)
+
+        try:
+            from app.services.signal_fusion import build_evidence_vector, fuse, persist_evidence
+            _fusion_ctx = dict(best_market_context or {})
+            if team_context:
+                for _k in ("regime", "ta_confluence_score", "ta_signal_direction", "htf_trend",
+                           "whale_flow", "whale_intelligence", "sentiment", "pattern"):
+                    if _k in team_context and _k not in _fusion_ctx:
+                        _fusion_ctx[_k] = team_context[_k]
+            _evidence = build_evidence_vector(
+                agent_id=agent_id,
+                symbol=symbol,
+                strategy=strategy_type,
+                timeframe=timeframe,
+                signal=signal,
+                raw_confidence=confidence,
+                market_context=_fusion_ctx,
+                indicators=best_indicators or {},
+            )
+            _fused = fuse(_evidence)
+            _pre_fusion_conf = confidence
+            if _fused.direction != 0:
+                if _fused.direction > 0:
+                    signal = "buy"
+                elif _fused.direction < 0:
+                    signal = "sell"
+                confidence = _fused.fused_confidence
+                if abs(_fused.fused_confidence - _pre_fusion_conf) >= 0.05:
+                    logger.info(
+                        f"Signal fusion {name}/{symbol}: raw={_pre_fusion_conf:.2f} → "
+                        f"fused={confidence:.2f} (agreement={_fused.agreement_score:.2f}, "
+                        f"log_odds={_fused.log_odds:+.2f})"
+                    )
+                reasoning = (reasoning or "") + (
+                    f" | Fusion: agreement={_fused.agreement_score:.0%}, "
+                    f"contrib={_fused.contributions}"
+                )
+            persist_evidence(_evidence, _fused)
+        except Exception as _fuse_err:
+            logger.debug(f"Signal fusion skipped for {name}/{symbol}: {_fuse_err}")
 
         if len(trading_pairs) > 1:
             logger.info(f"Agent {name}: scanned {len(trading_pairs)} pairs, "
@@ -4553,6 +4810,7 @@ class AgentScheduler:
                 #   low vol  → narrower TP (e.g. 6% → 4%) — avoids sitting forever
                 #   high vol → wider TP   (e.g. 6% → 8%) — rides the move properly
                 _original_tp_pct = take_profit_pct
+                _atr_ratio = 1.0
                 try:
                     if df is not None and len(df) >= 20:
                         import pandas as _pd_tp
@@ -4578,6 +4836,18 @@ class AgentScheduler:
                                 )
                 except Exception as _atr_err:
                     logger.debug(f"ATR scaling skipped ({_atr_err}) — using base TP {take_profit_pct:.1f}%")
+
+                # ── ATR-aware SL scaling ──────────────────────────────────────────
+                _original_sl_pct = stop_loss_pct
+                _atr_sl_mult = max(0.6, min(1.5, _atr_ratio))
+                if _atr_sl_mult != 1.0:
+                    stop_loss_pct = round(stop_loss_pct * _atr_sl_mult, 2)
+                    if abs(_atr_sl_mult - 1.0) > 0.05:
+                        logger.info(
+                            f"ATR-scaled SL: {name}/{symbol} "
+                            f"ATR ratio={_atr_ratio:.2f} → mult={_atr_sl_mult:.2f} "
+                            f"SL {_original_sl_pct:.1f}% → {stop_loss_pct:.1f}%"
+                        )
 
                 # ── Confluence-aware TP scaling (post-ATR) ───────────────────
                 # Scale TP based on multi-timeframe confluence score:
@@ -4846,7 +5116,8 @@ class AgentScheduler:
                 #
                 # NOTE: These gates ONLY apply to NEW entries — closing an
                 # existing position doesn't need USDT capital.
-                _MIN_NOTIONAL = 10.0  # USD
+                _gates = _get_gates()
+                _MIN_NOTIONAL = float(getattr(_gates, "min_notional", 10.0) or 10.0)
                 _UNDERFUND_RATIO = 0.25
                 if not _closing_existing and position_value < _MIN_NOTIONAL:
                     _skip_reason = (
@@ -4889,15 +5160,16 @@ class AgentScheduler:
                     # Open a short position — quantity already calculated above
                     pass
                 
-                from app.api.routes.settings import get_risk_limits
+                from app.api.routes.settings import get_risk_limits, get_trading_gates
                 _limits = get_risk_limits()
+                _gates = get_trading_gates()
                 risk_config = RiskConfig(
                     stop_loss_pct=stop_loss_pct,
                     take_profit_pct=take_profit_pct,
-                    max_daily_loss=_limits.max_daily_loss_pct,
+                    max_daily_loss=_gates.max_daily_loss_pct,
                     total_capital=total_fund,
                     max_position_size=leveraged_notional if not _closing_existing else quantity * current_price,
-                    max_open_positions=_limits.max_open_positions,
+                    max_open_positions=_gates.max_open_positions,
                     max_exposure=total_fund * _limits.exposure_threshold_pct / 100,
                     leverage=leverage,
                     max_leveraged_notional_pct=getattr(_limits, 'max_leveraged_notional_pct', 200.0),
@@ -4927,7 +5199,7 @@ class AgentScheduler:
                     if risk_check.action == "stop":
                         asyncio.create_task(_send_telegram(telegram_service.alert_daily_loss_limit(
                             daily_loss_pct=abs(risk_manager.get_daily_pnl()),
-                            limit_pct=_limits.max_daily_loss_pct,
+                            limit_pct=_gates.max_daily_loss_pct,
                         )))
                     else:
                         asyncio.create_task(_send_telegram(telegram_service.alert_trade_rejected(
@@ -5070,6 +5342,45 @@ class AgentScheduler:
                             agent_id=agent_id, timestamp=datetime.now(), symbol=symbol,
                             signal="hold", confidence=0, price=current_price,
                             executed=False, error=_conc_reason,
+                        )
+
+                    _max_corr_pct = getattr(_limits, "max_correlated_exposure_pct", 30.0) or 30.0
+                    _intended_margin = position_value if position_value else 0.0
+                    _intended_trade = {
+                        "symbol": symbol,
+                        "side": signal,
+                        "margin": _intended_margin,
+                    }
+                    _current_for_corr = [
+                        {
+                            "symbol": _p.symbol,
+                            "side": "buy" if _p.side == OrderSide.BUY else "sell",
+                            "quantity": _p.quantity,
+                            "entry_price": _p.entry_price,
+                            "current_price": _p.current_price,
+                            "leverage": getattr(_p, "leverage", 1.0) or 1.0,
+                            "margin_used": float(getattr(_p, "margin_used", 0) or 0),
+                        }
+                        for _p in _all_open
+                    ]
+                    _corr_check = risk_manager.check_correlation_concentration(
+                        intended_trade=_intended_trade,
+                        current_positions=_current_for_corr,
+                        total_capital=total_fund,
+                        max_correlated_exposure_pct=_max_corr_pct,
+                    )
+                    if not _corr_check.allowed:
+                        logger.info(f"Correlation gate: {_corr_check.reason}")
+                        self._record_run(agent_id, symbol, signal, confidence, current_price, False, error=_corr_check.reason)
+                        await team_chat.log_trade_blocked(
+                            trader_name=_trader_name, trader_avatar=_trader_avatar,
+                            agent_name=name, symbol=symbol, side=signal,
+                            reason=_corr_check.reason,
+                        )
+                        return AgentRun(
+                            agent_id=agent_id, timestamp=datetime.now(), symbol=symbol,
+                            signal="hold", confidence=0, price=current_price,
+                            executed=False, error=_corr_check.reason,
                         )
                 # ── End correlation limit ─────────────────────────────────────
                 # (technical_report already fetched above for dynamic limits)
@@ -5350,6 +5661,29 @@ class AgentScheduler:
                     )
                 # ─────────────────────────────────────────────────────────────────
 
+                _pattern_order_type = "Market"
+                _pattern_entry_price: Optional[float] = None
+                _pattern_type_name: Optional[str] = None
+                try:
+                    from app.services.pattern_entry import select_pattern_entry
+                    from app.api.routes.settings import get_risk_limits as _pattern_gates
+                    _pg = _pattern_gates()
+                    if getattr(_pg, "pattern_entry_orders_enabled", True) and technical_report:
+                        _plan = select_pattern_entry(
+                            side=signal,
+                            current_price=current_price,
+                            patterns=technical_report.patterns or [],
+                            min_confidence=float(getattr(_pg, "pattern_entry_min_confidence", 0.65) or 0.65),
+                            enabled=True,
+                        )
+                        if _plan:
+                            _pattern_order_type = _plan.order_type
+                            _pattern_entry_price = _plan.entry_price
+                            _pattern_type_name = _plan.pattern_type
+                            logger.info(f"Pattern entry routing: {_plan.rationale}")
+                except Exception as _pat_err:
+                    logger.debug(f"Pattern entry selection skipped: {_pat_err}")
+
                 if use_paper and paper_trading._enabled:
                     try:
                         # Look up trader_id from agent config
@@ -5368,6 +5702,9 @@ class AgentScheduler:
                             leverage=leverage,
                             margin_used=margin_used,
                             liquidation_price=liquidation_price,
+                            order_type=_pattern_order_type,
+                            entry_price=_pattern_entry_price,
+                            pattern_type=_pattern_type_name,
                         )
                         executed = True
                         self._trades_this_hour += 1  # hourly frequency gate counter
@@ -5479,6 +5816,25 @@ class AgentScheduler:
                             symbol=symbol, side=signal, quantity=quantity, price=current_price,
                             sl_price=adjusted_sl, tp_price=adjusted_tp, is_paper=True,
                         )))
+                    except PatternEntryDeferred as _ped:
+                        logger.info(f"Pattern entry deferred (paper): {_ped}")
+                        self._record_run(agent_id, symbol, signal, confidence, current_price, False, error=str(_ped))
+                        await team_chat.log_trade_blocked(
+                            trader_name=_trader_name, trader_avatar=_trader_avatar,
+                            agent_name=name, symbol=symbol, side=signal,
+                            reason=f"Pattern entry deferred — waiting for {_ped.entry_price:.6g} ({_ped.pattern_type or 'no pattern'})",
+                        )
+                        _wk_ped = f"{agent_id}:{symbol}"
+                        _wl_ttl_ped = self._WATCHLIST_TF_SECS.get(timeframe, 3600) * 4
+                        self._setup_watchlist[_wk_ped] = {
+                            "confidence": confidence, "signal": signal,
+                            "at": datetime.now(), "ttl_secs": _wl_ttl_ped,
+                        }
+                        return AgentRun(
+                            agent_id=agent_id, timestamp=datetime.now(), symbol=symbol,
+                            signal="hold", confidence=confidence, price=current_price,
+                            executed=False, error=str(_ped),
+                        )
                     except Exception as e:
                         logger.error(f"Paper trade failed: {e}", exc_info=True)
                         await team_chat.log_trade_blocked(
@@ -6258,13 +6614,13 @@ class AgentScheduler:
                             logger.info(f"Strategy action: {result_msg}")
                         else:
                             from app.models import User
-                            from app.api.routes.settings import get_risk_limits, get_trading_prefs
+                            from app.api.routes.settings import get_risk_limits, get_trading_gates, get_trading_prefs
                             user = await db.scalar(select(User).limit(1))
                             if not user:
                                 result_msg = "No user found to own new agent"
                             else:
-                                # Strategy-specific configuration
                                 risk = get_risk_limits()
+                                gates = get_trading_gates()
                                 prefs = get_trading_prefs()
                                 trading_pairs = prefs.trading_pairs or ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT"]
 
@@ -6324,7 +6680,7 @@ class AgentScheduler:
                                     },
                                     is_enabled=True,
                                     allocation_percentage=20.0,
-                                    max_position_size=risk.max_position_size_pct / 100 * self._total_capital,
+                                    max_position_size=gates.max_position_size_pct / 100 * self._total_capital,
                                 )
                                 db.add(new_agent)
                                 await db.commit()
@@ -6496,7 +6852,7 @@ class AgentScheduler:
                             },
                             is_enabled=True,
                             allocation_percentage=20.0,
-                            max_position_size=risk.max_position_size_pct / 100 * self._total_capital,
+                            max_position_size=gates.max_position_size_pct / 100 * self._total_capital,
                         )
                         db.add(new_agent)
                         await db.commit()

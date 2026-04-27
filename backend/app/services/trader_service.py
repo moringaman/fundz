@@ -59,6 +59,46 @@ DEFAULT_TRADERS = [
 ]
 
 
+def _validate_default_traders() -> None:
+    for i, defn in enumerate(DEFAULT_TRADERS):
+        for field_name in ("name", "llm_provider", "llm_model"):
+            value = (defn.get(field_name) or "").strip() if isinstance(defn.get(field_name), str) else None
+            if not value:
+                raise ValueError(
+                    f"DEFAULT_TRADERS[{i}] is missing required field {field_name!r}. "
+                    f"Every default trader must have a non-empty name, llm_provider, "
+                    f"and llm_model. Found: {defn!r}"
+                )
+
+
+_validate_default_traders()
+
+
+async def validate_trader_configs(db_session) -> None:
+    """
+    Boot-time guard: fails loudly if any persisted Trader row has empty
+    llm_provider or llm_model. Prevents silent fallback to .env defaults
+    once the row is loaded into get_trader_llm.
+    """
+    from sqlalchemy import select
+    from app.models import Trader
+
+    result = await db_session.execute(select(Trader))
+    invalid = []
+    for t in result.scalars().all():
+        provider = (t.llm_provider or "").strip()
+        model = (t.llm_model or "").strip()
+        if not provider or not model:
+            invalid.append((t.id, t.name, provider, model))
+    if invalid:
+        details = "; ".join(f"{name} (id={tid}): provider={p!r}, model={m!r}" for tid, name, p, m in invalid)
+        raise RuntimeError(
+            f"Refusing to start: {len(invalid)} trader row(s) have empty LLM configuration. "
+            f"Per-trader LLM config is mandatory and the .env LLM_MODEL is NOT a fallback. "
+            f"Fix via /traders API or directly in the traders table. Offenders: {details}"
+        )
+
+
 @dataclass
 class TraderPerformance:
     trader_id: str
@@ -94,12 +134,24 @@ class TraderService:
     # ── LLM instance per trader ──────────────────────────────────────────
 
     async def get_trader_llm(self, trader: dict) -> LLMService:
-        """Get or create an LLM service instance for a specific trader."""
         trader_id = trader["id"]
         if trader_id not in self._trader_llm_cache:
+            provider = (trader.get("llm_provider") or "").strip()
+            model = (trader.get("llm_model") or "").strip()
+            if not provider or not model:
+                raise ValueError(
+                    f"Trader {trader.get('name', trader_id)!r} (id={trader_id}) is missing "
+                    f"required LLM configuration. Per-trader llm_provider and llm_model "
+                    f"are mandatory; the .env LLM_PROVIDER / LLM_MODEL settings are NOT "
+                    f"used as a fallback for traders (multi-trader competition requires "
+                    f"each trader's model to be authoritative). "
+                    f"Got provider={provider!r}, model={model!r}. "
+                    f"Set the trader's llm_provider and llm_model via the /traders API "
+                    f"or by updating the row in the traders table."
+                )
             llm = LLMService()
-            llm.provider = trader.get("llm_provider", settings.llm_provider)
-            llm.model = trader.get("llm_model", settings.llm_model)
+            llm.provider = provider
+            llm.model = model
             llm.temperature = trader.get("config", {}).get("temperature", 0.5)
             llm.max_tokens = trader.get("config", {}).get("max_tokens", 1200)
             await llm.initialize()
@@ -254,6 +306,53 @@ class TraderService:
         if config.get("succession_context"):
             succession_block = f"\nEVOLUTION CONTEXT FROM PREDECESSOR:\n{config['succession_context']}\n"
 
+        # ── Cross-trader peer learning: top performer reference ──────────────
+        # Shows the trader leaderboard so underperforming traders can see what
+        # the top performer is doing differently and emulate their approach.
+        _peer_learning_block = ""
+        try:
+            from app.services.agent_scheduler import agent_scheduler as _peer_sched
+            _peer_perf = getattr(_peer_sched, '_current_trader_perf', {})
+            if _peer_perf:
+                _perfs = sorted(
+                    _peer_perf.items(),
+                    key=lambda kv: float(kv[1].get("total_pnl", 0) or 0),
+                    reverse=True,
+                )
+                if len(_perfs) >= 2 and _perfs[0][0] != trader["id"]:
+                    _top_id, _top_perf = _perfs[0]
+                    _top_trader = next(
+                        (t for t in getattr(_peer_sched, '_traders', []) if t.get("id") == _top_id),
+                        None,
+                    )
+                    if _top_trader:
+                        _top_wr = float(_top_perf.get("win_rate") or 0) * 100
+                        _top_pnl = float(_top_perf.get("total_pnl") or 0)
+                        _this_wr = 0
+                        _this_pnl = 0.0
+                        for _tid, _tp in _perfs:
+                            if _tid == trader["id"]:
+                                _this_wr = float(_tp.get("win_rate") or 0) * 100
+                                _this_pnl = float(_tp.get("total_pnl") or 0)
+                                break
+                        _gap = _top_pnl - _this_pnl
+                        _peer_learning_block = (
+                            f"\n🏆 TRADER PEER LEARNING:\n"
+                            f"The fund's top performer is {_top_trader['name']} "
+                            f"(${_top_pnl:+.2f} net, {_top_wr:.0f}% WR).\n"
+                            f"Your P&L: ${_this_pnl:+.2f} net. "
+                            f"Performance gap: ${_gap:+.2f}.\n"
+                            f"{_top_trader['name']}'s style: {_top_trader.get('config', {}).get('style', 'balanced')}.\n"
+                            f"They favour: {', '.join(_top_trader.get('config', {}).get('preferred_strategies', ['momentum']))} strategies.\n"
+                            f"\nLearn from {_top_trader['name']}:\n"
+                            f"- Consider whether your current strategy mix matches their proven approach.\n"
+                            f"- If your agents are underperforming on similar strategies, review their SL/TP/venue settings.\n"
+                            f"- Their patient, high-conviction style may be more effective than chasing setups.\n"
+                            f"- Look at your worst agents — would they survive in {_top_trader['name']}'s portfolio?\n"
+                        )
+        except Exception:
+            pass
+
         # Build venues block — Hyperliquid is always available for paper trading.
         # Live trading additionally requires HYPERLIQUID_WALLET_KEY to be set.
         _hl_live = bool(settings.hyperliquid_wallet_key)
@@ -281,7 +380,7 @@ YOUR TRADING STYLE: {config.get('style', 'Balanced approach')}
 YOUR RISK TOLERANCE: {config.get('risk_tolerance', 'moderate')}
 YOUR PREFERRED STRATEGIES: {config.get('preferred_strategies', ['momentum'])}
 YOUR CAPITAL ALLOCATION: {trader.get('allocation_pct', 33.3):.1f}% of fund
-{pink_slip_block}{succession_block}
+{pink_slip_block}{succession_block}{_peer_learning_block}
 MARKET CONDITIONS:
   Trend: {market_condition.get('trend', '?')}
   Volatility: {market_condition.get('volatility', '?')}
