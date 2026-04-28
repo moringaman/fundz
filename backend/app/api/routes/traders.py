@@ -6,11 +6,20 @@ from typing import List, Optional
 import logging
 
 from app.database import get_async_session
-from app.services.trader_service import trader_service
+from app.services.trader_service import trader_service, DEFAULT_TRADERS
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/traders", tags=["traders"])
+
+_pairs_by_name = {t["name"]: (t.get("config") or {}).get("assigned_pairs", []) for t in DEFAULT_TRADERS}
+
+
+def _ensure_assigned_pairs(config: dict, name: str) -> dict:
+    if "assigned_pairs" not in config:
+        config = dict(config)
+        config["assigned_pairs"] = _pairs_by_name.get(name, [])
+    return config
 
 
 # ── Pydantic models ─────────────────────────────────────────────────────────
@@ -102,7 +111,7 @@ async def list_traders():
                 llm_model=t.llm_model,
                 allocation_pct=t.allocation_pct,
                 is_enabled=t.is_enabled,
-                config=t.config or {},
+                config=_ensure_assigned_pairs(t.config or {}, t.name),
                 performance_metrics=t.performance_metrics or {},
                 agent_count=counts.get(t.id, 0),
             )
@@ -136,9 +145,9 @@ async def create_trader(body: TraderCreate):
             llm_model=trader.llm_model,
             allocation_pct=trader.allocation_pct,
             is_enabled=trader.is_enabled,
-            config=trader.config or {},
+            config=_ensure_assigned_pairs(trader.config or {}, trader.name),
             performance_metrics=trader.performance_metrics or {},
-            agent_count=0,
+            agent_count=counts.get(trader.id, 0),
         )
 
 
@@ -208,9 +217,11 @@ async def update_trader(trader_id: str, body: TraderUpdate):
             llm_model=trader.llm_model,
             allocation_pct=trader.allocation_pct,
             is_enabled=trader.is_enabled,
-            config=trader.config or {},
+            config=_ensure_assigned_pairs(trader.config or {}, trader.name),
             performance_metrics=trader.performance_metrics or {},
+            agent_count=0,
         )
+
 
 
 @router.delete("/{trader_id}")

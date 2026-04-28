@@ -160,6 +160,14 @@ class AgentScheduler:
 
         # Phase 9.1 — Consistency gating
         self._consistency_flags: Dict[str, str] = {}  # {trader_id: last_known_flag}
+        self._agent_cap_max = 4
+        self._agent_cap_min_trades = 10
+        self._agent_cap_last_run: Optional[datetime] = None
+        self._atr_target_vol_pct = 3.0
+        self._atr_period = 14
+        self._calibration_buckets: list = []
+        self._calibration_last_refresh: Optional[datetime] = None
+        self._calibration_min_samples = 100
 
         # ── Setup Maturing Watchlist ───────────────────────────────────────
         # When a scan produces a near-miss signal (confidence 0.55–0.65) the
@@ -404,6 +412,12 @@ class AgentScheduler:
             _strat_insight = self._current_trade_insights["strategy_insights"].get(_stype)
             if _strat_insight:
                 ctx["strategy_learning"] = _strat_insight
+
+        if self._current_trade_insights and self._current_trade_insights.get("rr_erosion"):
+            _stype = self._enabled_agents.get(agent_id, {}).get("strategy_type", "")
+            _erosion = self._current_trade_insights["rr_erosion"].get(_stype)
+            if _erosion:
+                ctx["rr_erosion"] = _erosion
 
         # Detect recent stop-out on this symbol — tells the LLM this is a re-entry
         # opportunity, not a fresh position.  Backtest gate also uses this key.
@@ -3350,6 +3364,9 @@ class AgentScheduler:
             except Exception as e:
                 logger.error(f"Team Tier: CIO report failed: {e}")
 
+            await self._apply_agent_count_cap(agents_list)
+            await self._refresh_calibration()
+
             try:
                 _team_elapsed = (datetime.now() - _team_start_ts).total_seconds()
                 logger.info(f"Team Tier: completed in {_team_elapsed:.1f}s")
@@ -3357,6 +3374,193 @@ class AgentScheduler:
                 pass
         except Exception as e:
             logger.error(f"Team analysis tier failed: {e}")
+
+    async def _calibrated_agent_score(self, agent_id: str) -> float:
+        pnl_factor = 250.0
+
+        try:
+            from app.database import get_async_session
+            from app.models import AgentMetricRecord
+            from sqlalchemy import select
+
+            async with get_async_session() as db:
+                result = await db.execute(
+                    select(AgentMetricRecord)
+                    .where(
+                        AgentMetricRecord.agent_id == agent_id,
+                        AgentMetricRecord.is_paper == _is_paper_mode(),
+                    )
+                )
+                metrics = result.scalar_one_or_none()
+        except Exception:
+            return 0.5
+
+        if not metrics or (metrics.actual_trades or 0) < self._agent_cap_min_trades:
+            return 0.5
+
+        win_rate = metrics.win_rate or 0.0
+        net_pnl = metrics.total_pnl or 0.0
+        total_trades = metrics.actual_trades or 0
+
+        pnl_score = 1.0 / (1.0 + (pnl_factor / max(net_pnl + pnl_factor, 0.01)))
+        pnl_score = max(0.01, min(pnl_score, 0.99))
+        sample_weight = min(total_trades / 50.0, 1.0)
+
+        return round(win_rate * 0.50 + pnl_score * 0.30 + sample_weight * 0.20, 4)
+
+    async def _apply_agent_count_cap(self, agents_list: list):
+        if self._agent_cap_last_run and (datetime.now() - self._agent_cap_last_run).total_seconds() < 1200:
+            return
+
+        enabled = [a for a in agents_list if a.get("is_enabled", True)]
+        if len(enabled) <= self._agent_cap_max:
+            return
+
+        scored = {}
+        for agent in enabled:
+            scored[agent["id"]] = await self._calibrated_agent_score(agent["id"])
+
+        ranked = sorted(enabled, key=lambda a: scored.get(a["id"], 0.5), reverse=True)
+        to_keep_ids = {a["id"] for a in ranked[:self._agent_cap_max]}
+        to_disable = [a for a in ranked[self._agent_cap_max:] if scored.get(a["id"], 0.5) < 0.55]
+
+        if not to_disable:
+            return
+
+        from app.database import get_async_session
+        from app.models import Agent as DBAgent
+        from sqlalchemy import select
+
+        async with get_async_session() as db:
+            for agent in to_disable:
+                agent_id = agent["id"]
+                agent_name = agent.get("name", agent_id)
+                score = scored.get(agent_id, 0.5)
+
+                db_agent = await db.get(DBAgent, agent_id)
+                if not db_agent or not db_agent.is_enabled:
+                    continue
+
+                db_agent.is_enabled = False
+                await db.commit()
+                self.unregister_agent(agent_id)
+
+                asyncio.create_task(team_chat.add_message(
+                    agent_role="risk_manager",
+                    content=(
+                        f"📉 **Agent Capped — {agent_name}:** calibrated score {score:.3f} "
+                        f"ranked #{ranked.index(agent) + 1}/{len(ranked)}. "
+                        f"Disabled to concentrate capital on top {self._agent_cap_max} performers."
+                    ),
+                    message_type="alert",
+                ))
+
+        self._agent_cap_last_run = datetime.now()
+        logger.info(
+            f"Agent cap: disabled {len(to_disable)} agents, "
+            f"keeping top {len(to_keep_ids)} (scores: "
+            + ", ".join(f"{a.get('name', a['id'])}={scored.get(a['id'], '?'):.3f}"
+                        for a in ranked[:self._agent_cap_max])
+            + ")"
+        )
+
+    async def _refresh_calibration(self):
+        if self._calibration_last_refresh and (datetime.now() - self._calibration_last_refresh).total_seconds() < 1200:
+            return
+
+        try:
+            from app.database import get_async_session
+            from app.models import AgentRunRecord
+            from sqlalchemy import select
+
+            async with get_async_session() as db:
+                result = await db.execute(
+                    select(AgentRunRecord.confidence, AgentRunRecord.pnl)
+                    .where(
+                        AgentRunRecord.pnl.is_not(None),
+                        AgentRunRecord.executed.is_(True),
+                        AgentRunRecord.use_paper == _is_paper_mode(),
+                    )
+                    .order_by(AgentRunRecord.timestamp.desc())
+                    .limit(500)
+                )
+                rows = result.fetchall()
+
+            if len(rows) < self._calibration_min_samples:
+                return
+
+            bucket_step = 0.10
+            num_buckets = 10
+            buckets = []
+            for i in range(num_buckets):
+                lo = i * bucket_step
+                hi = lo + bucket_step
+                in_bucket = [(c, p) for c, p in rows if lo <= c < hi]
+                total = len(in_bucket)
+                wins = sum(1 for _, p in in_bucket if (p or 0) > 0)
+                empirical_wr = wins / total if total > 0 else None
+                buckets.append({
+                    "lo": round(lo, 2),
+                    "hi": round(hi, 2),
+                    "total": total,
+                    "wins": wins,
+                    "empirical_wr": round(empirical_wr, 4) if empirical_wr is not None else None,
+                })
+
+            self._calibration_buckets = buckets
+            self._calibration_last_refresh = datetime.now()
+
+            filled = [b for b in buckets if b["empirical_wr"] is not None]
+            if filled:
+                logger.info(
+                    f"Confidence calibration refreshed: {len(rows)} trades, "
+                    f"{len(filled)}/10 buckets filled. "
+                    + "  ".join(
+                        f"[{b['lo']:.1f}-{b['hi']:.1f}]:{b['empirical_wr']:.0%}"
+                        for b in filled if b["total"] >= 5
+                    )
+                )
+
+        except Exception as exc:
+            logger.debug(f"Confidence calibration refresh skipped: {exc}")
+
+    def _calibrate_confidence(self, raw: float) -> float:
+        if not self._calibration_buckets:
+            return raw
+
+        bucket_step = 0.10
+        idx = min(int(raw / bucket_step), 9)
+        bucket = self._calibration_buckets[idx]
+        empirical = bucket.get("empirical_wr")
+
+        if empirical is not None and bucket.get("total", 0) >= 5:
+            return max(0.05, min(0.95, empirical))
+
+        lo_bucket = None
+        for b in reversed(self._calibration_buckets[:idx]):
+            if b.get("empirical_wr") is not None and b.get("total", 0) >= 5:
+                lo_bucket = b
+                break
+
+        hi_bucket = None
+        for b in self._calibration_buckets[idx + 1:]:
+            if b.get("empirical_wr") is not None and b.get("total", 0) >= 5:
+                hi_bucket = b
+                break
+
+        if lo_bucket and hi_bucket:
+            mid_lo = (lo_bucket["lo"] + lo_bucket["hi"]) / 2
+            mid_hi = (hi_bucket["lo"] + hi_bucket["hi"]) / 2
+            t = (raw - mid_lo) / (mid_hi - mid_lo)
+            interpolated = lo_bucket["empirical_wr"] + t * (hi_bucket["empirical_wr"] - lo_bucket["empirical_wr"])
+            return round(max(0.05, min(0.95, interpolated)), 4)
+
+        if lo_bucket:
+            return lo_bucket["empirical_wr"]
+        if hi_bucket:
+            return hi_bucket["empirical_wr"]
+
+        return raw
 
     async def _maybe_refit_regime_models(self):
         """Phase 4 — daily GMM regime refit. The cadence guard inside
@@ -3623,11 +3827,49 @@ class AgentScheduler:
                 if _tp < _sl * 2.0:
                     _tp = round(_sl * 2.0, 1)  # enforce 2:1 minimum
 
+                _pairs = config.get("trading_pairs") or []
+                if not _pairs:
+                    _trader_id = config.get("trader_id")
+                    if _trader_id and self._traders:
+                        _trader = next((t for t in self._traders if t.get("id") == _trader_id), None)
+                        if _trader:
+                            _pairs = (_trader.get("config") or {}).get("assigned_pairs", [])
+                if not _pairs:
+                    _pairs = get_trading_prefs().trading_pairs or ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT"]
+
+                # ── Trader pair restriction enforcement ──────────────────────
+                # Filter agent's trading_pairs to only include symbols in the
+                # trader's assigned_pairs (if the trader has assigned_pairs set).
+                # This is the last line of defense — prevents agents from
+                # trading symbols outside their trader's mandate.
+                _trader_id = config.get("trader_id")
+                if _trader_id and self._traders and _pairs:
+                    _trader = next((t for t in self._traders if t.get("id") == _trader_id), None)
+                    if _trader:
+                        _assigned = (_trader.get("config") or {}).get("assigned_pairs", [])
+                        if _assigned:
+                            _filtered = [p for p in _pairs if p in _assigned]
+                            if len(_filtered) < len(_pairs):
+                                _removed = set(_pairs) - set(_filtered)
+                                logger.warning(
+                                    f"Agent {config.get('name', '')} ({config.get('strategy_type', '')}): "
+                                    f"filtered out {_removed} — not in trader "
+                                    f"{_trader.get('name', '')}'s assigned_pairs ({_assigned})"
+                                )
+                            _pairs = _filtered
+                            if not _pairs:
+                                logger.error(
+                                    f"Agent {config.get('name', '')}: ALL trading_pairs filtered out — "
+                                    f"trader {_trader.get('name', '')} is restricted to {_assigned}. "
+                                    f"Agent will be skipped this cycle."
+                                )
+                # ── End trader pair restriction ─────────────────────────────
+
                 result = await self.run_agent(
                     agent_id=config['id'],
                     name=config.get('name', ''),
                     strategy_type=_s_type,
-                    trading_pairs=get_trading_prefs().trading_pairs or ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+                    trading_pairs=_pairs,
                     allocation_pct=allocation_pct,
                     max_position=config.get('max_position_size', 0.1),
                     stop_loss_pct=_sl,
@@ -3668,7 +3910,30 @@ class AgentScheduler:
         import pandas as pd
 
         MAX_OPEN_LEVELS = config.get('max_grid_levels', 5)
-        trading_pairs = config.get('trading_pairs', [])
+        trading_pairs = config.get('trading_pairs') or []
+        if not trading_pairs:
+            _trader_id = config.get("trader_id")
+            if _trader_id and self._traders:
+                _trader = next((t for t in self._traders if t.get("id") == _trader_id), None)
+                if _trader:
+                    trading_pairs = (_trader.get("config") or {}).get("assigned_pairs", [])
+
+        _trader_id = config.get("trader_id")
+        if _trader_id and self._traders and trading_pairs:
+            _trader = next((t for t in self._traders if t.get("id") == _trader_id), None)
+            if _trader:
+                _assigned = (_trader.get("config") or {}).get("assigned_pairs", [])
+                if _assigned:
+                    _filtered = [p for p in trading_pairs if p in _assigned]
+                    if len(_filtered) < len(trading_pairs):
+                        _removed = set(trading_pairs) - set(_filtered)
+                        logger.warning(
+                            f"Grid agent {config.get('name', '')}: "
+                            f"filtered out {_removed} — not in trader "
+                            f"{_trader.get('name', '')}'s assigned_pairs ({_assigned})"
+                        )
+                    trading_pairs = _filtered
+
         timeframe = config.get('timeframe', '15m')
         agent_name = config.get('name', agent_id[:8])
 
@@ -4339,6 +4604,7 @@ class AgentScheduler:
         symbol = best_symbol
         signal = best_signal
         confidence = best_confidence
+        confidence = self._calibrate_confidence(confidence)
         reasoning = best_reasoning
         df = best_df
         current_price = df['close'].iloc[-1]
@@ -5064,7 +5330,19 @@ class AgentScheduler:
                 # allocation_pct is a % of the total fund; using only available USDT
                 # would produce shrinking positions as capital gets deployed.
                 total_fund = self._total_capital or usdt_balance
-                target_position_value = total_fund * allocation_pct / 100 * _size_mult * _conf_mult * _perf_mult
+
+                _atr_mult = 1.0
+                if df is not None and len(df) >= self._atr_period + 1:
+                    try:
+                        atr = self.indicator_service.calculate_atr(
+                            df['high'], df['low'], df['close'], self._atr_period
+                        )
+                        atr_pct = (atr.iloc[-1] / current_price) * 100 if current_price > 0 else 3.0
+                        _atr_mult = max(0.25, min(2.5, self._atr_target_vol_pct / max(atr_pct, 0.1)))
+                    except Exception:
+                        pass
+
+                target_position_value = total_fund * allocation_pct / 100 * _size_mult * _conf_mult * _perf_mult * _atr_mult
 
                 # Cap at 95% of available USDT to avoid overdrafts
                 position_value = min(target_position_value, usdt_balance * 0.95)
@@ -5084,7 +5362,7 @@ class AgentScheduler:
                 quantity = leveraged_notional / current_price if current_price > 0 else 0.0
 
                 logger.debug(
-                    f"Sizing {name} ({strategy_type}, {_size_mult:.0%} strat, {_conf_mult:.0%} conf, {_perf_mult:.2f}× perf, {leverage:.1f}x lev): "
+                    f"Sizing {name} ({strategy_type}, {_size_mult:.0%} strat, {_conf_mult:.0%} conf, {_perf_mult:.2f}× perf, {_atr_mult:.2f}× atr, {leverage:.1f}x lev): "
                     f"total_fund=${total_fund:.0f}, alloc={allocation_pct:.2f}%, "
                     f"target=${target_position_value:.0f}, available=${usdt_balance:.0f}, margin=${margin_used:.0f}, "
                     f"notional=${leveraged_notional:.0f}, qty={quantity:.4f} @ ${current_price}"
@@ -6624,6 +6902,14 @@ class AgentScheduler:
                                 prefs = get_trading_prefs()
                                 trading_pairs = prefs.trading_pairs or ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT"]
 
+                                _create_trader_id = action.trader_id if hasattr(action, 'trader_id') else None
+                                if _create_trader_id and self._traders:
+                                    _create_trader = next((t for t in self._traders if t.get("id") == _create_trader_id), None)
+                                    if _create_trader:
+                                        _create_pairs = (_create_trader.get("config") or {}).get("assigned_pairs", [])
+                                        if _create_pairs:
+                                            trading_pairs = _create_pairs
+
                                 import app.strategies as strategy_registry
                                 STRATEGY_PROFILES = strategy_registry.strategy_profiles({
                                     "default_stop_loss_pct": risk.default_stop_loss_pct,
@@ -6656,9 +6942,17 @@ class AgentScheduler:
                                     agent_name = profile["name"]
 
                                 # Use the symbol specifically proposed by strategy_review (action.params["symbol"]).
-                                # Fall back to the global prefs list only when no symbol was proposed.
+                                # Validate against the trader's assigned_pairs if the trader has a restriction.
                                 proposed_symbol = (action.params or {}).get("symbol")
                                 if proposed_symbol:
+                                    _trader_assigned = (_create_trader.get("config") or {}).get("assigned_pairs", []) if _create_trader_id and _create_trader else []
+                                    if _trader_assigned and proposed_symbol not in _trader_assigned:
+                                        logger.warning(
+                                            f"Strategy review: proposed symbol {proposed_symbol} not in trader "
+                                            f"{_create_trader.get('name', '?')}'s assigned_pairs {_trader_assigned}. "
+                                            f"Falling back to first assigned pair."
+                                        )
+                                        proposed_symbol = _trader_assigned[0]
                                     trading_pairs = [proposed_symbol]
                                     # Canonicalise name: "BTC_Momentum Rider" etc.
                                     sym_prefix = proposed_symbol.replace("USDT", "").replace("USD", "")
@@ -6816,6 +7110,23 @@ class AgentScheduler:
                         trading_pairs = action.get("trading_pairs") or prefs.trading_pairs or [
                             "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT"
                         ]
+                        # ── Trader pair restriction enforcement ──────────────────
+                        # Filter proposed trading_pairs to only include symbols in the
+                        # trader's assigned_pairs (if set). Prevents a trader's LLM
+                        # from proposing agents on symbols outside its mandate.
+                        _trader_assigned = (trader.get("config") or {}).get("assigned_pairs", [])
+                        if _trader_assigned:
+                            _valid_pairs = [p for p in trading_pairs if p in _trader_assigned]
+                            if _valid_pairs:
+                                trading_pairs = _valid_pairs
+                            else:
+                                logger.warning(
+                                    f"Trader {trader['name']}: create_agent rejected — "
+                                    f"proposed pairs {trading_pairs} not in assigned_pairs {_trader_assigned}. "
+                                    f"Falling back to first assigned pair."
+                                )
+                                trading_pairs = [_trader_assigned[0]]
+                        # ── End trader pair restriction ──────────────────────────
                         strategy = action.get("strategy_type", "momentum")
 
                         # Resolve venue — hyperliquid is always valid for paper trading;

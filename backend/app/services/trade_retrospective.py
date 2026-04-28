@@ -42,6 +42,9 @@ class TradeAnalysis:
     max_adverse: Optional[float] = None    # worst unrealized % during trade
     exit_efficiency: Optional[float] = None  # actual exit % / best possible %
     pattern_label: Optional[str] = None
+    take_profit_pct: Optional[float] = None
+    theoretical_tp_hit: Optional[bool] = None
+    exit_efficiency_vs_tp: Optional[float] = None
 
 
 class TradeRetrospectiveService:
@@ -149,13 +152,32 @@ class TradeRetrospectiveService:
 
             # Analyze each trade
             analyses: List[TradeAnalysis] = []
+            agents_by_id = {a["id"]: a for a in agents_list}
+            agents_by_id = {a["id"]: a for a in agents_list}
+
+            agent_tp_cache: Dict[str, Optional[float]] = {}
+
             for trade in trades_to_analyze:
-                analysis = self._analyze_trade(trade, market_data.get(trade["symbol"]))
+                aid = trade.get("agent_id")
+                if aid and aid not in agent_tp_cache:
+                    agent = agents_by_id.get(aid, {})
+                    agent_tp_cache[aid] = agent.get("take_profit_pct")
+                    if agent_tp_cache[aid] is None:
+                        import app.strategies as strategy_registry
+                        strat = agent.get("strategy_type", "momentum")
+                        _, default_tp = strategy_registry.bootstrap_rr().get(strat, (2.5, 6.0))
+                        agent_tp_cache[aid] = default_tp
+
+            for trade in trades_to_analyze:
+                analysis = self._analyze_trade(
+                    trade,
+                    market_data.get(trade["symbol"]),
+                    take_profit_pct=agent_tp_cache.get(trade.get("agent_id")),
+                )
                 if analysis:
                     analyses.append(analysis)
 
             # Aggregate per-agent insights
-            agents_by_id = {a["id"]: a for a in agents_list}
             agent_insights = self._compute_agent_insights(analyses, agents_by_id)
 
             # Aggregate cross-agent strategy insights
@@ -164,14 +186,17 @@ class TradeRetrospectiveService:
             # Generate parameter adjustment recommendations (including SL widening)
             adjustments = self._recommend_adjustments(analyses, agents_by_id)
 
+            rr_erosion = self._compute_rr_erosion(analyses)
+
             # Build summary
-            summary = self._build_summary(analyses, agent_insights)
+            summary = self._build_summary(analyses, agent_insights, rr_erosion)
 
             result = {
                 "trade_analyses": [self._analysis_to_dict(a) for a in analyses],
                 "agent_insights": agent_insights,
                 "strategy_insights": strategy_insights,
                 "parameter_adjustments": adjustments,
+                "rr_erosion": rr_erosion,
                 "summary": summary,
                 "analyzed_at": datetime.utcnow().isoformat(),
                 "trade_count": len(analyses),
@@ -189,6 +214,7 @@ class TradeRetrospectiveService:
         self,
         trade: Dict,
         market_df: Optional[pd.DataFrame],
+        take_profit_pct: Optional[float] = None,
     ) -> Optional[TradeAnalysis]:
         """Analyze a single closed trade against market context."""
         try:
@@ -281,6 +307,26 @@ class TradeRetrospectiveService:
                     if analysis.max_favorable and analysis.max_favorable > 0:
                         actual_pct = abs(trade["pnl_pct"])
                         analysis.exit_efficiency = round(min(actual_pct / analysis.max_favorable, 1.0), 2) if trade["result"] == "win" else 0.0
+
+                    if take_profit_pct and take_profit_pct > 0 and trade["entry_price"] > 0:
+                        analysis.take_profit_pct = take_profit_pct
+                        if trade["side"] == "long":
+                            tp_price = trade["entry_price"] * (1 + take_profit_pct / 100)
+                            analysis.theoretical_tp_hit = bool(
+                                trade_candles["high"].max() >= tp_price
+                            )
+                        else:
+                            tp_price = trade["entry_price"] * (1 - take_profit_pct / 100)
+                            analysis.theoretical_tp_hit = bool(
+                                trade_candles["low"].min() <= tp_price
+                            )
+                        if analysis.theoretical_tp_hit:
+                            actual_pct = abs(trade["pnl_pct"])
+                            analysis.exit_efficiency_vs_tp = round(
+                                actual_pct / take_profit_pct, 2
+                            ) if trade["result"] == "win" else 0.0
+                        else:
+                            analysis.exit_efficiency_vs_tp = 0.0
 
                 # Label trade pattern
                 analysis.pattern_label = self._label_pattern(analysis)
@@ -711,6 +757,7 @@ class TradeRetrospectiveService:
         self,
         analyses: List[TradeAnalysis],
         agent_insights: Dict[str, Dict],
+        rr_erosion: Optional[Dict] = None,
     ) -> str:
         """Build a concise human-readable summary."""
         if not analyses:
@@ -732,7 +779,22 @@ class TradeRetrospectiveService:
             elif insight.get("strengths"):
                 parts.append(f"{name} ({wr:.0%} WR): {insight['strengths'][0]}")
 
-        return ". ".join(parts[:5])  # Cap at 5 lines
+        if rr_erosion and "__total__" in rr_erosion:
+            total = rr_erosion["__total__"]
+            tp_hit = total.get("tp_hit_rate", 0)
+            avg_eff = total.get("avg_exit_efficiency_vs_tp", 0)
+            parts.append(
+                f"R:R: {tp_hit:.0%} of trades hit TP, avg capture {avg_eff:.0%}"
+            )
+            for strat, data in rr_erosion.items():
+                if strat == "__total__":
+                    continue
+                parts.append(
+                    f"{strat}: TP hit {data['tp_hit_rate']:.0%}, "
+                    f"capture {data['avg_exit_efficiency_vs_tp']:.0%}"
+                )
+
+        return ". ".join(parts[:8])
 
     def _analysis_to_dict(self, a: TradeAnalysis) -> Dict[str, Any]:
         return {
@@ -754,7 +816,62 @@ class TradeRetrospectiveService:
             "max_adverse": a.max_adverse,
             "exit_efficiency": a.exit_efficiency,
             "pattern_label": a.pattern_label,
+            "take_profit_pct": a.take_profit_pct,
+            "theoretical_tp_hit": a.theoretical_tp_hit,
+            "exit_efficiency_vs_tp": a.exit_efficiency_vs_tp,
         }
+
+    def _compute_rr_erosion(self, analyses: List[TradeAnalysis]) -> Dict:
+        if not analyses:
+            return {}
+
+        by_strategy: Dict[str, list] = {}
+        for a in analyses:
+            if not a.pattern_label:
+                continue
+            strat = a.pattern_label.split("_")[0] if "_" in a.pattern_label else "unknown"
+            by_strategy.setdefault(strat, []).append(a)
+
+        erosion = {}
+        for strat, trades in by_strategy.items():
+            with_tp = [t for t in trades if t.take_profit_pct is not None]
+            hits = [t for t in with_tp if t.theoretical_tp_hit]
+            hit_rate = len(hits) / len(with_tp) if with_tp else 0.0
+
+            efficiencies = [
+                t.exit_efficiency_vs_tp for t in hits
+                if t.exit_efficiency_vs_tp is not None and t.result == "win"
+            ]
+            avg_eff = sum(efficiencies) / len(efficiencies) if efficiencies else 0.0
+
+            all_eff = [
+                t.exit_efficiency_vs_tp for t in with_tp
+                if t.exit_efficiency_vs_tp is not None
+            ]
+            avg_all = sum(all_eff) / len(all_eff) if all_eff else 0.0
+
+            erosion[strat] = {
+                "total": len(with_tp),
+                "tp_hit_rate": round(hit_rate, 3),
+                "tp_hit_count": len(hits),
+                "avg_exit_efficiency_vs_tp": round(avg_eff, 3),
+                "avg_efficiency_all": round(avg_all, 3),
+            }
+
+        all_with_tp = [t for t in analyses if t.take_profit_pct is not None]
+        all_hits = [t for t in all_with_tp if t.theoretical_tp_hit]
+        all_effs = [
+            t.exit_efficiency_vs_tp for t in all_hits
+            if t.exit_efficiency_vs_tp is not None and t.result == "win"
+        ]
+
+        erosion["__total__"] = {
+            "total": len(all_with_tp),
+            "tp_hit_rate": round(len(all_hits) / len(all_with_tp), 3) if all_with_tp else 0.0,
+            "avg_exit_efficiency_vs_tp": round(sum(all_effs) / len(all_effs), 3) if all_effs else 0.0,
+        }
+
+        return erosion
 
 
 # Singleton

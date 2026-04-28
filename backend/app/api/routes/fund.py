@@ -947,8 +947,10 @@ async def get_trader_leaderboard():
     from sqlalchemy import select as sa_select
     from app.models import Agent as DBAgent
     from app.database import get_async_session
-    from app.services.trader_service import trader_service
+    from app.services.trader_service import trader_service, DEFAULT_TRADERS
     from app.services.paper_trading import paper_trading
+
+    _pairs_by_name = {t["name"]: (t.get("config") or {}).get("assigned_pairs", []) for t in DEFAULT_TRADERS}
 
     traders = agent_scheduler.get_traders()
     allocations = agent_scheduler.get_trader_allocations()
@@ -1023,6 +1025,10 @@ async def get_trader_leaderboard():
             sharpe = 0.0
             sharpe_tier = "medium"
 
+        cfg = dict(t.get("config", {}))
+        if "assigned_pairs" not in cfg:
+            cfg["assigned_pairs"] = _pairs_by_name.get(t["name"], [])
+
         leaderboard.append({
             "id": t["id"],
             "name": t["name"],
@@ -1031,7 +1037,7 @@ async def get_trader_leaderboard():
             "allocation_dollars": total_capital * alloc_pct / 100,
             "total_capital": total_capital,
             "is_enabled": t.get("is_enabled", True),
-            "config": t.get("config", {}),
+            "config": cfg,
             "total_pnl": round(total_pnl, 2),
             "win_rate": win_rate,
             "total_trades": total_trades,

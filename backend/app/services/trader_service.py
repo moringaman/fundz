@@ -28,6 +28,7 @@ DEFAULT_TRADERS = [
             "style": "Calm and methodical. Waits for high-conviction setups with strong multi-timeframe confluence before committing. Never chases.",
             "risk_tolerance": "moderate",
             "preferred_strategies": ["momentum", "breakout"],
+            "assigned_pairs": ["BTCUSDT", "ETHUSDT"],
             "avatar": "🧠",
             "bio": "Former quant researcher turned discretionary trader. 8 years in derivatives. Known for patience and precision — only enters when the risk/reward is unambiguous.",
         },
@@ -40,8 +41,9 @@ DEFAULT_TRADERS = [
             "style": "Aggressive and conviction-driven. Moves fast on breakouts, cuts losers without hesitation, and lets winners run with tight trailing stops.",
             "risk_tolerance": "high",
             "preferred_strategies": ["breakout", "ai"],
+            "assigned_pairs": ["SOLUSDT", "XRPUSDT"],
             "avatar": "⚡",
-            "bio": "Ex-prop desk at a crypto-native fund. Built her edge on volatility plays and momentum surges. High energy, high output — tracks 15+ pairs simultaneously.",
+            "bio": "Ex-prop desk at a crypto-native fund. Built her edge on volatility plays and momentum surges. Concentrates on high-beta pairs for maximum breakout potential.",
         },
     },
     {
@@ -52,8 +54,9 @@ DEFAULT_TRADERS = [
             "style": "Conservative contrarian. Fades extremes, targets mean reversion, and keeps position sizes small for consistent compounding over big swings.",
             "risk_tolerance": "low",
             "preferred_strategies": ["mean_reversion", "momentum"],
+            "assigned_pairs": ["ADAUSDT"],
             "avatar": "🎯",
-            "bio": "Veteran trader with a background in statistical arbitrage. Values capital preservation above all else. Rarely wrong, rarely in a hurry.",
+            "bio": "Veteran trader with a background in statistical arbitrage. Values capital preservation above all else. Specialises in range-bound pairs where mean reversion has a structural edge.",
         },
     },
 ]
@@ -374,13 +377,18 @@ class TraderService:
             "  - If in doubt, choose hyperliquid — lower fees directly improve net P&L."
         )
 
+        _assigned_pairs = config.get('assigned_pairs', [])
+        _assigned_pairs_line = ""
+        if _assigned_pairs:
+            _assigned_pairs_line = f"YOUR ASSIGNED TRADING PAIRS: {', '.join(_assigned_pairs)}\nYOU ARE RESTRICTED TO THESE PAIRS ONLY. All agents you create must trade exclusively from this list.\n"
+
         prompt = f"""You are Trader "{trader['name']}", a competing portfolio trader in a hedge fund.
 
 YOUR TRADING STYLE: {config.get('style', 'Balanced approach')}
 YOUR RISK TOLERANCE: {config.get('risk_tolerance', 'moderate')}
 YOUR PREFERRED STRATEGIES: {config.get('preferred_strategies', ['momentum'])}
 YOUR CAPITAL ALLOCATION: {trader.get('allocation_pct', 33.3):.1f}% of fund
-{pink_slip_block}{succession_block}{_peer_learning_block}
+{_assigned_pairs_line}{pink_slip_block}{succession_block}{_peer_learning_block}
 MARKET CONDITIONS:
   Trend: {market_condition.get('trend', '?')}
   Volatility: {market_condition.get('volatility', '?')}

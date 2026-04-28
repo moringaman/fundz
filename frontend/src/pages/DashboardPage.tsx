@@ -392,8 +392,21 @@ export function DashboardPage() {
                         <span style={{ fontSize: '.85rem' }}>{t.config?.avatar || ['🥇','🥈','🥉'][i] || '🏅'}</span>
                         <div>
                           <div style={{ fontSize: '.75rem', fontWeight: 600, color: 'var(--text-primary)' }}>{t.name}</div>
-                          <div style={{ fontSize: '.6rem', fontFamily: 'var(--mono)', color: 'var(--text-dim)' }}>
-                            {t.agent_count} agents
+                          <div style={{ fontSize: '.6rem', fontFamily: 'var(--mono)', color: 'var(--text-dim)', display: 'flex', alignItems: 'center', gap: '.4rem' }}>
+                            <span>{t.agent_count} agents</span>
+                            {t.config?.assigned_pairs?.length > 0 && (
+                              <span style={{ display: 'flex', gap: '.2rem' }}>
+                                {t.config.assigned_pairs.map((p: string) => (
+                                  <span key={p} style={{
+                                    fontSize: '.5rem', fontFamily: 'var(--mono)', padding: '.1rem .3rem',
+                                    background: 'var(--bg-hover)', border: '1px solid var(--border)',
+                                    borderRadius: '3px', color: 'var(--text-dim)',
+                                  }}>
+                                    {p.replace('USDT', '')}
+                                  </span>
+                                ))}
+                              </span>
+                            )}
                           </div>
                         </div>
                       </div>

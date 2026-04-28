@@ -278,6 +278,17 @@ export function TradersPage() {
                   <div style={{ fontSize: '.6rem', fontFamily: 'var(--mono)', color: 'var(--accent)', marginTop: '.1rem' }}>
                     {modelLabel(t.llm_model)}
                   </div>
+                  {cfg.assigned_pairs?.length > 0 && (
+                    <div style={{ display: 'flex', gap: '.25rem', marginTop: '.35rem' }}>
+                      {cfg.assigned_pairs.map((p: string) => (
+                        <span key={p} style={{
+                          fontSize: '.54rem', fontFamily: 'var(--mono)', padding: '.18rem .4rem',
+                          background: 'rgba(0,212,255,.08)', border: '1px solid rgba(0,212,255,.25)',
+                          color: 'var(--accent)', letterSpacing: '.06em',
+                        }}>{p.replace('USDT', '')}</span>
+                      ))}
+                    </div>
+                  )}
                 </div>
 
               </div>

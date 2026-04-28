@@ -578,6 +578,34 @@ Return JSON: {{"trend": "strong_bullish|bullish|neutral|bearish|strong_bearish",
                         + "\n".join(f"  {r}" for r in retro_rules)
                     )
 
+            rr = team_context.get("rr_erosion")
+            if rr:
+                tp_hit = rr.get("tp_hit_rate", 0)
+                avg_eff = rr.get("avg_exit_efficiency_vs_tp", 0)
+                total = rr.get("total", 0)
+                if total >= 3:
+                    if tp_hit > 0.40 and avg_eff < 0.50:
+                        parts.append(
+                            f"R:R EROSION: {tp_hit:.0%} of your {total} recent trades "
+                            f"reached their TP level but you only captured "
+                            f"{avg_eff:.0%} of the target profit. "
+                            f"Your trailing/breakeven exits are cutting winners short. "
+                            f"Consider wider trailing stops or raising the breakeven "
+                            f"activation threshold."
+                        )
+                    elif tp_hit < 0.15 and avg_eff < 0.30:
+                        parts.append(
+                            f"R:R ALERT: Only {tp_hit:.0%} of your {total} trades "
+                            f"reached TP. Targets may be too ambitious for current "
+                            f"volatility — consider reducing TP or tightening stops "
+                            f"to lock in smaller but more reliable gains."
+                        )
+                    elif tp_hit > 0.50 and avg_eff > 0.70:
+                        parts.append(
+                            f"R:R HEALTHY: {tp_hit:.0%} TP hit rate with {avg_eff:.0%} "
+                            f"avg capture — exit discipline is working well."
+                        )
+
             # Whale intelligence — Hyperliquid on-chain smart-money positioning
             whale = team_context.get("whale")
             if whale and (whale.get("long_notional", 0) + whale.get("short_notional", 0)) >= 10_000:
