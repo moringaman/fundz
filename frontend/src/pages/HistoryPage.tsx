@@ -17,6 +17,7 @@ import { formatPrice, formatPnl, formatPnlPct } from '../utils/formatPrice';
 import { usePagination, Paginator } from '../components/common/Paginator';
 import { SkeletonStats, SkeletonTable } from '../components/common/Skeleton';
 import { PositionEmptyState } from '../components/PositionsTable';
+import PendingOrders from '../components/PendingOrders';
 
 export function HistoryPage() {
   const { isPaper } = useTradingMode();
@@ -152,19 +153,19 @@ export function HistoryPage() {
           {activePnl && (
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: '.65rem' }}>
               <div className="stat-card">
-                <p className="stat-label">Total P&L</p>
+                <p className="stat-label" title="Realized P&L minus entry & exit fees. Your true net profit/loss.">Total P&L (After Fees)</p>
                 <p className={`stat-value ${activePnl.total_pnl >= 0 ? 'positive' : 'negative'}`}>
                   ${activePnl.total_pnl?.toFixed(2) || '0.00'}
                 </p>
               </div>
               <div className="stat-card">
-                <p className="stat-label">Realized P&L</p>
+                <p className="stat-label" title="Sum of entry-to-exit price differences. Does not include fees.">Realized P&L (Gross)</p>
                 <p className={`stat-value ${(activePnl.realized_pnl ?? 0) >= 0 ? 'positive' : 'negative'}`}>
                   ${activePnl.realized_pnl?.toFixed(2) || '0.00'}
                 </p>
               </div>
               <div className="stat-card">
-                <p className="stat-label">Unrealized P&L</p>
+                <p className="stat-label" title="Unrealized P&L on open positions, net of estimated exit fees.">Unrealized P&L</p>
                 <p className={`stat-value ${(activePnl.unrealized_pnl ?? 0) >= 0 ? 'positive' : 'negative'}`}>
                   ${activePnl.unrealized_pnl?.toFixed(2) || '0.00'}
                 </p>
@@ -428,12 +429,14 @@ export function HistoryPage() {
                     </>
                   )
                 ) : (
-                  activeTrades.length === 0 ? (
-                    <p style={{ padding: '1.25rem 1.5rem', color: 'var(--text-dim)', fontSize: '.8rem' }}>
-                      No {tab} orders yet.
-                    </p>
-                  ) : (
-                    <>
+                  <div style={{ padding: 0 }}>
+                    <PendingOrders />
+                    {activeTrades.length === 0 ? (
+                      <p style={{ padding: '1.25rem 1.5rem', color: 'var(--text-dim)', fontSize: '.8rem' }}>
+                        No {tab} orders yet.
+                      </p>
+                    ) : (
+                      <>
                       <div className="trades-table">
                         <div className="trades-header" style={{ gridTemplateColumns: '1fr 0.9fr 0.6fr 0.7fr 0.8fr 0.8fr 0.8fr 0.8fr 0.7fr 0.9fr 0.9fr 0.9fr 0.8fr' }}>
                           <span>Time</span><span>Symbol</span><span>Side</span><span>Qty</span>
@@ -466,7 +469,8 @@ export function HistoryPage() {
                         <Paginator page={ordersPager.page} totalPages={ordersPager.totalPages} total={ordersPager.total} pageSize={10} onPage={ordersPager.setPage} label="orders" />
                       </div>
                     </>
-                  )
+                    )}
+                  </div>
                 )}
               </div>
             </div>

@@ -189,6 +189,73 @@ def snap_sl_to_structure(
     return candidate_sl
 
 
+def _psychological_grid(price: float) -> float:
+    """Return the psychological level grid size for a given price.
+
+    Round numbers (00 endings) and halfway marks (50) cluster orders.
+    The grid adapts to the instrument's price scale:
+      BTC @ 48k   → 500   (levels at 48,000, 48,500, 49,000…)
+      ETH @ 3k    → 50    (levels at 3,000, 3,050, 3,100…)
+      SOL @ 120   → 5     (levels at 120, 125, 130…)
+      XRP @ 0.50  → 0.01  (levels at 0.50, 0.51, 0.52…)
+      DOGE @ 0.08 → 0.005 (levels at 0.080, 0.085, 0.090…)
+    """
+    if price >= 250000:  return 5000
+    if price >= 50000:   return 500
+    if price >= 10000:   return 100
+    if price >= 2500:    return 50
+    if price >= 500:     return 10
+    if price >= 100:     return 5
+    if price >= 25:      return 1.0
+    if price >= 5:       return 0.50
+    if price >= 1:       return 0.10
+    if price >= 0.10:    return 0.01
+    if price >= 0.01:    return 0.001
+    if price >= 0.001:   return 0.0001
+    if price >= 0.0001:  return 0.00001
+    return 0.000001
+
+
+def snap_to_psychological(
+    candidate_price: float,
+    entry_price: float,
+    is_sl: bool,
+    margin_pct: float = 0.002,
+    max_adjust_pct: float = 0.01,
+) -> float:
+    """Snap a TP or SL price relative to the nearest psychological round number.
+
+    Psychological levels (round numbers) act as price magnets because retail
+    traders cluster orders and stops at these obvious prices.
+
+    * For **take-profit**: sit *just before* the level so the order fills
+      before price hits the wall where liquidity reverses.
+    * For **stop-loss**:   sit *just past*  the level so noise/wicks to the
+      round number don't stop you out prematurely.
+
+    Only adjusts if the candidate is within *max_adjust_pct* of a psychological
+    level.  *margin_pct* controls how far before/past the level the snapped
+    price lands.
+    """
+    grid = _psychological_grid(candidate_price)
+    nearest_psych = round(candidate_price / grid) * grid
+    dist_pct = abs(candidate_price - nearest_psych) / max(candidate_price, 1e-10)
+    if dist_pct > max_adjust_pct:
+        return candidate_price
+
+    margin = nearest_psych * margin_pct
+    toward_entry = 1 if entry_price > candidate_price else -1
+
+    if is_sl:
+        # SL: move further from entry (past the level)
+        snapped = nearest_psych - margin if toward_entry > 0 else nearest_psych + margin
+    else:
+        # TP: move closer to entry (just before the level)
+        snapped = nearest_psych + margin if toward_entry > 0 else nearest_psych - margin
+
+    return round(snapped, 8)
+
+
 def _is_near_resistance(current_price: float, price_levels: Optional[PriceLevels], proximity_pct: float = 0.005) -> bool:
     """Check if current price is within proximity_pct of nearest resistance (0.5% default)."""
     if not price_levels or not price_levels.resistance:
@@ -1101,18 +1168,38 @@ class TechnicalAnalyst:
         # Ascending Triangle: flat top, rising bottom -> bullish breakout
         if abs(upper_slope) < 0.001 and lower_slope > 0.001:
             flat_top = max(highs[-5:])
+            _asc_low = min(lows[-5:])
             if current_price > flat_top * 0.998:
-                target = flat_top + (flat_top - current_low)
+                target = flat_top + (flat_top - _asc_low)
                 patterns.append(PatternSignal(
                     pattern_type="ascending_triangle",
                     direction="bullish",
                     confidence=0.70,
-                    entry_price=round(flat_top * 0.9985, 8),  # Entry at breakout level
-                    stop_loss=round(current_low * 0.97, 8),
+                    entry_price=round(flat_top * 0.9985, 8),
+                    stop_loss=round(_asc_low * 0.97, 8),
                     take_profit_1=round(target * 0.998, 8),
                     take_profit_2=round(target * 1.01, 8),
-                    risk_reward=round((target - flat_top) / (flat_top - current_low), 2),
+                    risk_reward=round((target - flat_top) / (flat_top - _asc_low), 2),
                     reasoning="Ascending triangle breakout: entry at resistance. Target = triangle height.",
+                    timeframe=timeframe,
+                ))
+        
+        # Descending Triangle: falling top, flat bottom -> bearish breakdown
+        elif upper_slope < -0.001 and abs(lower_slope) < 0.001:
+            flat_bottom = min(lows[-5:])
+            _desc_high = max(highs[-5:])
+            if current_price < flat_bottom * 1.002:
+                target = flat_bottom - (_desc_high - flat_bottom)
+                patterns.append(PatternSignal(
+                    pattern_type="descending_triangle",
+                    direction="bearish",
+                    confidence=0.70,
+                    entry_price=round(flat_bottom * 1.0015, 8),
+                    stop_loss=round(_desc_high * 1.03, 8),
+                    take_profit_1=round(target * 1.002, 8),
+                    take_profit_2=round(target * 0.99, 8),
+                    risk_reward=round((flat_bottom - target) / (_desc_high - flat_bottom), 2),
+                    reasoning="Descending triangle breakdown: entry at support. Target = triangle height.",
                     timeframe=timeframe,
                 ))
         

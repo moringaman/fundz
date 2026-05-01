@@ -91,6 +91,9 @@ class LiveTradingService:
         leverage: float = 1.0,
         margin_used: Optional[float] = None,
         liquidation_price: Optional[float] = None,
+        order_type: str = "Market",
+        entry_price: Optional[float] = None,
+        pattern_type: Optional[str] = None,
     ) -> Optional[dict]:
         """
         Place a real Phemex contract order with SL/TP.
@@ -121,6 +124,19 @@ class LiveTradingService:
         except Exception as be:
             logger.warning(f"LiveTrading: balance check failed (proceeding): {be}")
 
+        # ── Resolve order type / limit price ───────────────────────────────
+        _use_order_type = order_type or "Market"
+        _limit_price = entry_price if entry_price and _use_order_type != "Market" else None
+        if _use_order_type != "Market" and _limit_price is None:
+            from app.api.routes.settings import get_trading_prefs as _tp_fn
+            _tp = _tp_fn()
+            _offset_bps = float(getattr(_tp, "limit_order_offset_bps", 5.0) or 5.0)
+            _offset_fraction = _offset_bps / 10000.0
+            _is_long = side_str.lower() == "buy"
+            _limit_price = price * (1 - _offset_fraction) if _is_long else price * (1 + _offset_fraction)
+            _use_order_type = "Limit"
+            logger.info(f"LiveTrading: computed limit price {_limit_price:.4f} ({_offset_bps} bps {'below' if _is_long else 'above'} market {price})")
+
         # ── Place Phemex order ─────────────────────────────────────────────
         try:
             if leverage > 1.0:
@@ -129,7 +145,8 @@ class LiveTradingService:
                 symbol=symbol,
                 side=side_str,
                 quantity=quantity,
-                order_type="Market",
+                order_type=_use_order_type,
+                price=_limit_price,
                 stop_loss_price=stop_loss_price,
                 take_profit_price=take_profit_price,
                 reduce_only=False,

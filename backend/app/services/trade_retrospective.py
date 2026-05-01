@@ -77,7 +77,7 @@ class TradeRetrospectiveService:
         """
         try:
             from app.services.paper_trading import paper_trading
-            paper_closed = await paper_trading.get_closed_trades(limit=200)
+            paper_closed = await paper_trading.get_closed_trades(limit=200, include_archived=True)
 
             # Include live Hyperliquid positions so agents running on real money
             # also contribute to retrospective learning.  Failures are non-fatal —
@@ -204,6 +204,13 @@ class TradeRetrospectiveService:
 
             self._cached_result = result
             self._last_analysis_time = datetime.utcnow()
+
+            # Persist snapshot for historical trend tracking
+            try:
+                await self._persist_snapshot(result, analyses)
+            except Exception as _snap_err:
+                logger.warning(f"Retrospective: snapshot persist failed (non-fatal): {_snap_err}")
+
             return result
 
         except Exception as e:
@@ -872,6 +879,82 @@ class TradeRetrospectiveService:
         }
 
         return erosion
+
+    async def _persist_snapshot(
+        self,
+        result: Dict[str, Any],
+        analyses: List[TradeAnalysis],
+    ) -> None:
+        """Persist the full retrospective result as a historical snapshot."""
+        from app.database import get_async_session
+        from app.models import RetrospectiveSnapshot
+        import uuid
+
+        wins = sum(1 for a in analyses if a.result == "win")
+        losses = sum(1 for a in analyses if a.result == "loss")
+        total = len(analyses)
+        total_pnl = sum(a.net_pnl for a in analyses)
+
+        snapshot = RetrospectiveSnapshot(
+            id=str(uuid.uuid4()),
+            analyzed_at=datetime.utcnow(),
+            trade_count=total,
+            win_count=wins,
+            loss_count=losses,
+            total_pnl=round(total_pnl, 2),
+            overall_win_rate=round(wins / total, 3) if total else None,
+            adjustment_count=len(result.get("parameter_adjustments", [])),
+            trade_analyses=result.get("trade_analyses", []),
+            agent_insights=result.get("agent_insights", {}),
+            strategy_insights=result.get("strategy_insights", {}),
+            parameter_adjustments=result.get("parameter_adjustments", []),
+            rr_erosion=result.get("rr_erosion", {}),
+            summary=result.get("summary", ""),
+        )
+        try:
+            async with get_async_session() as db:
+                db.add(snapshot)
+                await db.commit()
+        except Exception as e:
+            logger.warning(f"Failed to persist retrospective snapshot: {e}")
+
+    @staticmethod
+    async def get_snapshot_history(
+        limit: int = 50,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Return paginated retrospective snapshot history for trend dashboard."""
+        from app.database import get_async_session
+        from app.models import RetrospectiveSnapshot
+        from sqlalchemy import select, desc
+
+        async with get_async_session() as db:
+            rows = await db.execute(
+                select(RetrospectiveSnapshot)
+                .order_by(desc(RetrospectiveSnapshot.analyzed_at))
+                .offset(offset)
+                .limit(limit)
+            )
+            snapshots = rows.scalars().all()
+            return [
+                {
+                    "id": s.id,
+                    "analyzed_at": s.analyzed_at.isoformat() if s.analyzed_at else None,
+                    "trade_count": s.trade_count,
+                    "win_count": s.win_count,
+                    "loss_count": s.loss_count,
+                    "total_pnl": s.total_pnl,
+                    "overall_win_rate": s.overall_win_rate,
+                    "adjustment_count": s.adjustment_count,
+                    "summary": s.summary,
+                    "trade_analyses": s.trade_analyses,
+                    "agent_insights": s.agent_insights,
+                    "strategy_insights": s.strategy_insights,
+                    "parameter_adjustments": s.parameter_adjustments,
+                    "rr_erosion": s.rr_erosion,
+                }
+                for s in snapshots
+            ]
 
 
 # Singleton

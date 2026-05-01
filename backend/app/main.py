@@ -431,6 +431,8 @@ async def lifespan(app: FastAPI):
         ("agents", "venue", "ALTER TABLE agents ADD COLUMN venue VARCHAR(20) DEFAULT 'phemex'"),
         # AI self-learning — store LLM reasoning per run for feedback loop
         ("agent_run_records", "llm_reasoning", "ALTER TABLE agent_run_records ADD COLUMN llm_reasoning TEXT"),
+        # Post-trade narrative reflection
+        ("agent_run_records", "reflection", "ALTER TABLE agent_run_records ADD COLUMN reflection TEXT"),
         # Per-venue performance attribution
         ("agent_metric_records", "venue_stats", "ALTER TABLE agent_metric_records ADD COLUMN venue_stats JSONB DEFAULT '{}'::jsonb"),
         # Phase 1 quant rigour — Monte Carlo bootstrap percentiles on backtests

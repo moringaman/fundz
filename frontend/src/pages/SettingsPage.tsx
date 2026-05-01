@@ -165,6 +165,12 @@ export function SettingsPage() {
     us_open_preopen_tighten_utc: 1230,
     us_open_confirmation_end_utc: 1415,
     us_open_confirmation_confidence: 0.80,
+    fast_entry_enabled: false,
+    fast_entry_confidence_threshold: 0.85,
+    fast_entry_strategies: 'momentum,breakout,trend_following,scalping,ai',
+    dead_zone_noop_enabled: true,
+    dead_zone_penalty: 0.15,
+    bull_bear_mode: 'deterministic',
   });
 
   // Hydrate forms from server data
@@ -1731,6 +1737,128 @@ export function SettingsPage() {
                   value={gatesForm.max_directional_concentration_pct}
                   onChange={e => setGatesForm(p => ({ ...p, max_directional_concentration_pct: parseFloat(e.target.value) }))} />
               </div>
+            </div>
+          </div>
+
+          {/* Fast Entry Mode */}
+          <div style={{ borderBottom: '1px solid var(--border)', paddingBottom: '1.25rem', marginBottom: '1.25rem' }}>
+            <p style={{ fontSize: '.75rem', fontWeight: 700, color: 'var(--accent)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: '.35rem' }}>
+              Fast Entry Mode ⚡
+            </p>
+            <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', lineHeight: 1.55, marginBottom: '.75rem' }}>
+              Momentum and breakout strategies need to enter <strong style={{ color: 'var(--text-primary)' }}>during</strong> a move, not after it confirms.
+              When enabled, high-confidence signals from eligible strategies skip the TA veto
+              and pre-trade backtest gates — reducing entry latency from ~10s to ~1s.
+              Disabled automatically by the gate autopilot in cautious/defensive regimes.
+            </p>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+              <div>
+                <label className="settings-label">Enable Fast Entry</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>
+                  Skip slow gates for high-confidence time-sensitive signals
+                </p>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '.5rem' }}>
+                  <input type="checkbox"
+                    checked={(gatesForm as any).fast_entry_enabled ?? false}
+                    onChange={e => setGatesForm(p => ({ ...p, fast_entry_enabled: e.target.checked }))}
+                    style={{ accentColor: 'var(--accent)' }}
+                  />
+                  <span style={{ fontWeight: 600, color: (gatesForm as any).fast_entry_enabled ? 'var(--accent)' : 'var(--text-dim)' }}>
+                    {(gatesForm as any).fast_entry_enabled ? 'ON' : 'OFF'}
+                  </span>
+                </label>
+              </div>
+              <div>
+                <label className="settings-label">Confidence Threshold</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>
+                  Min confidence to trigger fast entry (0.70–1.0)
+                </p>
+                <input type="number" step="0.01" min="0.70" max="1.0" className="settings-input"
+                  value={(gatesForm as any).fast_entry_confidence_threshold ?? 0.85}
+                  onChange={e => setGatesForm(p => ({ ...p, fast_entry_confidence_threshold: parseFloat(e.target.value) }))} />
+              </div>
+              <div style={{ gridColumn: 'span 2' }}>
+                <label className="settings-label">Eligible Strategies</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>
+                  Comma-separated strategy types (momentum, breakout, trend_following, scalping, ai)
+                </p>
+                <input type="text" className="settings-input" style={{ width: '100%' }}
+                  value={(gatesForm as any).fast_entry_strategies ?? 'momentum,breakout,trend_following,scalping,ai'}
+                  onChange={e => setGatesForm(p => ({ ...p, fast_entry_strategies: e.target.value }))} />
+              </div>
+            </div>
+          </div>
+
+          {/* Overnight Dead Zone */}
+          <div style={{ borderBottom: '1px solid var(--border)', paddingBottom: '1.25rem', marginBottom: '1.25rem' }}>
+            <p style={{ fontSize: '.75rem', fontWeight: 700, color: 'var(--accent)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: '.35rem' }}>
+              Overnight Dead Zone
+            </p>
+            <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', lineHeight: 1.55, marginBottom: '1rem' }}>
+              20:00–00:00 UTC — low volume, noise-heavy. Disable the no-op to allow trading
+              during dead hours for training/backtesting purposes.
+            </p>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+              <div>
+                <label className="settings-label">Pause Trading in Dead Zone</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>
+                  When ON, all decision engines are paused during dead hours (monitoring only). Turn OFF to allow trading.
+                </p>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '.5rem' }}>
+                  <input type="checkbox"
+                    checked={(gatesForm as any).dead_zone_noop_enabled ?? true}
+                    onChange={e => setGatesForm(p => ({ ...p, dead_zone_noop_enabled: e.target.checked }))}
+                    style={{ accentColor: 'var(--accent)' }}
+                  />
+                  <span style={{ fontWeight: 600, color: (gatesForm as any).dead_zone_noop_enabled ? 'var(--accent)' : 'var(--text-dim)' }}>
+                    {(gatesForm as any).dead_zone_noop_enabled ? 'ON (paused)' : 'OFF (trading allowed)'}
+                  </span>
+                </label>
+              </div>
+              <div>
+                <label className="settings-label">Confidence Penalty</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>
+                  Confidence reduction during dead zone (0.0–0.5)
+                </p>
+                <input type="number" step="0.05" min="0" max="0.5" className="settings-input"
+                  value={(gatesForm as any).dead_zone_penalty ?? 0.15}
+                  onChange={e => setGatesForm(p => ({ ...p, dead_zone_penalty: parseFloat(e.target.value) }))} />
+              </div>
+            </div>
+          </div>
+
+          {/* Bull / Bear Debate */}
+          <div style={{ borderBottom: '1px solid var(--border)', paddingBottom: '1.25rem', marginBottom: '1.25rem' }}>
+            <p style={{ fontSize: '.75rem', fontWeight: 700, color: 'var(--accent)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: '.35rem' }}>
+              Bull / Bear Debate
+            </p>
+            <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', lineHeight: 1.55, marginBottom: '1rem' }}>
+              Two adversarial views injected into every agent's context before decision-making.
+              <strong style={{ color: 'var(--text-primary)' }}> Deterministic</strong> uses TA confluence scores (no LLM cost).
+              <strong style={{ color: 'var(--text-primary)' }}> LLM</strong> uses two GPT calls per cycle (higher quality, more tokens).
+            </p>
+            <div style={{ display: 'flex', gap: '.5rem', flexWrap: 'wrap' }}>
+              {['deterministic', 'llm'].map(mode => (
+                <label key={mode} style={{
+                  flex: 1, minWidth: 140, display: 'flex', alignItems: 'center', gap: '.5rem',
+                  padding: '.65rem .85rem', borderRadius: 8, cursor: 'pointer',
+                  border: `1px solid ${(gatesForm as any).bull_bear_mode === mode ? 'var(--accent)' : 'var(--border-mid)'}`,
+                  background: (gatesForm as any).bull_bear_mode === mode ? 'var(--accent-dim)' : 'transparent',
+                  transition: 'all .15s',
+                }}>
+                  <input type="radio" name="bull_bear_mode" value={mode} style={{ accentColor: 'var(--accent)' }}
+                    checked={(gatesForm as any).bull_bear_mode === mode}
+                    onChange={() => setGatesForm(p => ({ ...p, bull_bear_mode: mode }))} />
+                  <div>
+                    <div style={{ fontWeight: 600, fontSize: '.8rem', color: (gatesForm as any).bull_bear_mode === mode ? 'var(--accent)' : 'var(--text-primary)' }}>
+                      {mode === 'deterministic' ? 'Deterministic' : 'LLM Debate'}
+                    </div>
+                    <div style={{ fontSize: '.67rem', color: 'var(--text-secondary)' }}>
+                      {mode === 'deterministic' ? 'TA heuristic, no LLM cost' : '2 GPT calls, max 150 tokens'}
+                    </div>
+                  </div>
+                </label>
+              ))}
             </div>
           </div>
 

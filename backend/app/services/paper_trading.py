@@ -1,4 +1,4 @@
-from typing import Optional, List
+from typing import Optional, List, Dict
 from datetime import datetime
 import uuid
 import logging
@@ -38,13 +38,23 @@ class PaperTradingService:
     CONTRACT_FEE_RATE = 0.0006  # 0.06% — all Phemex perpetual contracts (USDT- and coin-margined)
     HYPERLIQUID_FEE_RATE = 0.00035  # 0.035% HL taker — used for venue-accurate paper simulation
 
+    # Per-agent venue cache, populated by agent_scheduler on startup and toggle.
+    _agent_venues: Dict[str, str] = {}
+
     @classmethod
-    def fee_rate_for(cls, symbol: str, venue: str = "phemex") -> float:
+    def set_agent_venue(cls, agent_id: str, venue: str) -> None:
+        cls._agent_venues[agent_id] = venue or "phemex"
+
+    @classmethod
+    def _venue_for(cls, agent_id: Optional[str]) -> str:
+        if agent_id and agent_id in cls._agent_venues:
+            return cls._agent_venues[agent_id]
+        return "hyperliquid"
+
+    @classmethod
+    def fee_rate_for(cls, symbol: str, venue: str = "hyperliquid") -> float:
         if venue == "hyperliquid":
             return cls.HYPERLIQUID_FEE_RATE
-        # Arrr, all symbols traded here be perpetual contracts (USDT-margined perps like
-        # ETHUSDT, BTCUSDT etc.). The old condition swapped spot and contract rates —
-        # ETHUSDT ends in "USDT" so it got 0.1% (spot) instead of 0.06% (perp). Ye fool.
         return cls.CONTRACT_FEE_RATE
 
     def __init__(self, phemex_client: Optional[PhemexClient] = None):
@@ -138,6 +148,7 @@ class PaperTradingService:
         order_type: str = "Market",
         entry_price: Optional[float] = None,
         pattern_type: Optional[str] = None,
+        venue: Optional[str] = None,
     ):
         """Place a paper trading order using real market price when price is omitted."""
         if not self._enabled:
@@ -167,6 +178,30 @@ class PaperTradingService:
                     f"current={price:.6g} not at entry={entry_price:.6g} "
                     f"(pattern={pattern_type or 'none'}, tol={_tol:.2f}%)"
                 )
+                # Persist pending order before raising so it's visible in the UI
+                try:
+                    async with get_async_session() as _pending_db:
+                        _pending = PaperOrder(
+                            id=str(uuid.uuid4()),
+                            user_id="default-user",
+                            agent_id=agent_id,
+                            trader_id=trader_id,
+                            symbol=symbol,
+                            side=side,
+                            quantity=quantity,
+                            price=float(entry_price),
+                            total=0,
+                            fee=0,
+                            leverage=max(float(leverage or 1.0), 1.0),
+                            margin_used=0,
+                            status=OrderStatus.PENDING,
+                            is_paper=True,
+                            created_at=datetime.now(),
+                        )
+                        _pending_db.add(_pending)
+                        await _pending_db.commit()
+                except Exception as _pe:
+                    self.logger.warning(f"Failed to persist pending order: {_pe}")
                 raise PatternEntryDeferred(
                     symbol=symbol,
                     order_type=order_type,
@@ -206,8 +241,9 @@ class PaperTradingService:
                 db.add(base_balance)
                 await db.flush()
 
+            _venue = venue or self._venue_for(agent_id)
             notional = quantity * price
-            fee = notional * self.fee_rate_for(symbol)
+            fee = notional * self.fee_rate_for(symbol, _venue)
             leverage = max(float(leverage or 1.0), 1.0)
             effective_margin = margin_used if margin_used is not None else (notional / leverage)
 
@@ -539,7 +575,7 @@ class PaperTradingService:
             # Deduct only the entry fee already paid — exit fee is charged when the
             # position actually closes. Pre-charging it here caused trades to show
             # negative P&L the instant they opened (double-counted the entry fee).
-            _fr = self.fee_rate_for(pos.symbol)
+            _fr = self.fee_rate_for(pos.symbol, self._venue_for(pos.agent_id))
             _est_fees = entry * qty * _fr
             if is_short:
                 unrealized = (entry - current_price) * qty - _est_fees
@@ -757,11 +793,12 @@ class PaperTradingService:
         if close_pct == 0.0:
             return None
 
-        fee_rate = self.fee_rate_for
         async with get_async_session() as db:
             pos = await db.get(PaperPosition, position_id)
             if pos is None:
                 return None
+
+            _venue_for_close = self._venue_for(pos.agent_id)
 
             qty_to_close = pos.quantity * close_pct
             if qty_to_close < 1e-12:
@@ -778,7 +815,7 @@ class PaperTradingService:
                 raw_pnl = qty_to_close * (entry - price)
 
             # Fee on the closing notional
-            fr = self.fee_rate_for(pos.symbol)
+            fr = self.fee_rate_for(pos.symbol, _venue_for_close)
             close_fee = qty_to_close * price * fr
             # Proportional entry fee for this slice (paid at open, allocated per unit)
             entry_fee = qty_to_close * entry * fr
@@ -853,12 +890,242 @@ class PaperTradingService:
     # Closed Trades (FIFO-matched buy→sell pairs with realised P&L)
     # ------------------------------------------------------------------
 
-    async def get_closed_trades(self, symbol: Optional[str] = None, limit: int = 100) -> List[dict]:
+    # ── Pending Orders (limit/stop orders waiting to fill) ───────────────
+
+    async def get_pending_orders(self, agent_id: Optional[str] = None) -> List[PaperOrder]:
+        """Return all pending (unfilled) limit/stop orders."""
+        async with get_async_session() as db:
+            q = select(PaperOrder).where(
+                PaperOrder.status == OrderStatus.PENDING,
+                PaperOrder.is_paper == True,
+            ).order_by(PaperOrder.created_at.desc())
+            if agent_id:
+                q = q.where(PaperOrder.agent_id == agent_id)
+            result = await db.execute(q)
+            return list(result.scalars().all())
+
+    async def cancel_pending_order(self, order_id: str) -> bool:
+        """Cancel a pending order by ID. Returns True if cancelled."""
+        async with get_async_session() as db:
+            order = await db.get(PaperOrder, order_id)
+            if order is None or order.status != OrderStatus.PENDING:
+                return False
+            order.status = OrderStatus.CANCELLED
+            await db.commit()
+            return True
+
+    async def cleanup_stale_pending_orders(self, max_age_minutes: int = 120) -> int:
+        """Cancel pending orders older than *max_age_minutes*. Returns count removed."""
+        import datetime as _dt
+        cutoff = _dt.datetime.now() - _dt.timedelta(minutes=max_age_minutes)
+        async with get_async_session() as db:
+            stale = await db.execute(
+                select(PaperOrder).where(
+                    PaperOrder.status == OrderStatus.PENDING,
+                    PaperOrder.is_paper == True,
+                    PaperOrder.created_at < cutoff,
+                )
+            )
+            count = 0
+            for o in stale.scalars().all():
+                o.status = OrderStatus.CANCELLED
+                count += 1
+            await db.commit()
+            return count
+
+    async def fill_pending_orders(self) -> int:
+        """Check all pending orders against current market price and fill those
+        whose entry price has been reached. Returns number of orders filled."""
+        filled = 0
+        orders = await self.get_pending_orders()
+        for o in orders:
+            try:
+                ticker = await self.phemex_client.get_ticker(o.symbol)
+                market_price = float(ticker.get("result", {}).get("closeRp", 0))
+            except Exception:
+                continue
+            if market_price <= 0:
+                continue
+            # Determine whether the order should fill at this price
+            _side = o.side.value if hasattr(o.side, "value") else str(o.side)
+            _entry = o.price
+            _tol = _entry * 0.003  # 0.3% tolerance
+            should_fill = False
+            if _side.lower() == "buy":
+                if market_price <= _entry + _tol:
+                    should_fill = True
+            else:
+                if market_price >= _entry - _tol:
+                    should_fill = True
+            if not should_fill:
+                continue
+            # Fill the order — execute the same logic as place_order would
+            try:
+                await self._execute_pending_fill(o, market_price)
+                filled += 1
+            except Exception as _fill_err:
+                self.logger.warning(f"Failed to fill pending order {o.id}: {_fill_err}")
+        return filled
+
+    async def _execute_pending_fill(self, order: PaperOrder, fill_price: float) -> None:
+        """Execute a pending order at *fill_price* — creates position, deducts balance, etc."""
+        from app.models import Position as PaperPosition, Balance as PaperBalance
+        async with get_async_session() as db:
+            usdt_balance = await db.scalar(
+                select(PaperBalance).where(
+                    PaperBalance.user_id == "default-user",
+                    PaperBalance.asset == "USDT",
+                )
+            )
+            if not usdt_balance:
+                usdt_balance = PaperBalance(
+                    user_id="default-user", asset="USDT", available=50000.0, locked=0.0
+                )
+                db.add(usdt_balance)
+                await db.flush()
+
+            _venue = self._venue_for(order.agent_id)
+            notional = order.quantity * fill_price
+            fee = notional * self.fee_rate_for(order.symbol, _venue)
+
+            # Update the order record
+            order.price = fill_price
+            order.total = notional
+            order.fee = fee
+            order.status = OrderStatus.FILLED
+            order.filled_at = datetime.now()
+
+            # Deduct fee
+            usdt_balance.available -= fee
+
+            side_str = order.side.value if hasattr(order.side, "value") else str(order.side)
+
+            if side_str.upper() == "BUY":
+                short_pos = await db.scalar(
+                    select(PaperPosition).where(
+                        PaperPosition.user_id == "default-user",
+                        PaperPosition.symbol == order.symbol,
+                        PaperPosition.agent_id == order.agent_id,
+                        PaperPosition.side == OrderSide.SELL,
+                    )
+                )
+                if short_pos:
+                    close_qty = min(order.quantity, short_pos.quantity)
+                    realized = (short_pos.entry_price - fill_price) * close_qty
+                    usdt_balance.available += realized
+                    if short_pos.quantity <= close_qty + 1e-12:
+                        await db.delete(short_pos)
+                    else:
+                        short_pos.quantity -= close_qty
+                    remaining = order.quantity - close_qty
+                    if remaining > 1e-12:
+                        existing = await db.scalar(
+                            select(PaperPosition).where(
+                                PaperPosition.user_id == "default-user",
+                                PaperPosition.symbol == order.symbol,
+                                PaperPosition.agent_id == order.agent_id,
+                                PaperPosition.side == OrderSide.BUY,
+                            )
+                        )
+                        if existing:
+                            existing.quantity += remaining
+                        else:
+                            db.add(PaperPosition(
+                                id=str(uuid.uuid4()),
+                                user_id="default-user", agent_id=order.agent_id,
+                                symbol=order.symbol, side=OrderSide.BUY,
+                                quantity=remaining, entry_price=fill_price,
+                                leverage=order.leverage, is_paper=True,
+                            ))
+                else:
+                    existing = await db.scalar(
+                        select(PaperPosition).where(
+                            PaperPosition.user_id == "default-user",
+                            PaperPosition.symbol == order.symbol,
+                            PaperPosition.agent_id == order.agent_id,
+                            PaperPosition.side == OrderSide.BUY,
+                        )
+                    )
+                    if existing:
+                        existing.quantity += order.quantity
+                    else:
+                        db.add(PaperPosition(
+                            id=str(uuid.uuid4()),
+                            user_id="default-user", agent_id=order.agent_id,
+                            symbol=order.symbol, side=OrderSide.BUY,
+                            quantity=order.quantity, entry_price=fill_price,
+                            leverage=order.leverage, is_paper=True,
+                        ))
+            else:
+                long_pos = await db.scalar(
+                    select(PaperPosition).where(
+                        PaperPosition.user_id == "default-user",
+                        PaperPosition.symbol == order.symbol,
+                        PaperPosition.agent_id == order.agent_id,
+                        PaperPosition.side == OrderSide.BUY,
+                    )
+                )
+                if long_pos:
+                    close_qty = min(order.quantity, long_pos.quantity)
+                    realized = (fill_price - long_pos.entry_price) * close_qty
+                    usdt_balance.available += realized + (long_pos.margin_used or 0.0) * (close_qty / max(long_pos.quantity, 1e-12))
+                    if long_pos.quantity <= close_qty + 1e-12:
+                        await db.delete(long_pos)
+                    else:
+                        long_pos.quantity -= close_qty
+                    remaining = order.quantity - close_qty
+                    if remaining > 1e-12:
+                        existing = await db.scalar(
+                            select(PaperPosition).where(
+                                PaperPosition.user_id == "default-user",
+                                PaperPosition.symbol == order.symbol,
+                                PaperPosition.agent_id == order.agent_id,
+                                PaperPosition.side == OrderSide.SELL,
+                            )
+                        )
+                        if existing:
+                            existing.quantity += remaining
+                        else:
+                            db.add(PaperPosition(
+                                id=str(uuid.uuid4()),
+                                user_id="default-user", agent_id=order.agent_id,
+                                symbol=order.symbol, side=OrderSide.SELL,
+                                quantity=remaining, entry_price=fill_price,
+                                leverage=order.leverage, is_paper=True,
+                            ))
+                else:
+                    existing = await db.scalar(
+                        select(PaperPosition).where(
+                            PaperPosition.user_id == "default-user",
+                            PaperPosition.symbol == order.symbol,
+                            PaperPosition.agent_id == order.agent_id,
+                            PaperPosition.side == OrderSide.SELL,
+                        )
+                    )
+                    if existing:
+                        existing.quantity += order.quantity
+                    else:
+                        db.add(PaperPosition(
+                            id=str(uuid.uuid4()),
+                            user_id="default-user", agent_id=order.agent_id,
+                            symbol=order.symbol, side=OrderSide.SELL,
+                            quantity=order.quantity, entry_price=fill_price,
+                            leverage=order.leverage, is_paper=True,
+                        ))
+
+            await db.commit()
+            self.logger.info(f"Pending order {order.id} filled: {order.symbol} @ {fill_price:.6f}")
+
+
+    async def get_closed_trades(self, symbol: Optional[str] = None, limit: int = 100, include_archived: bool = False) -> List[dict]:
         """Return completed round-trip trades with realised P&L.
 
         Uses FIFO matching: for longs, each sell is matched against earliest
         unfilled buy. For shorts, each buy is matched against earliest
         unfilled sell.
+
+        When *include_archived* is True, also includes trades from the
+        archived_trades table (preserved across paper trading resets).
         """
         async with get_async_session() as db:
             query = (
@@ -872,7 +1139,44 @@ class PaperTradingService:
             if symbol:
                 query = query.where(PaperOrder.symbol == symbol)
             result = await db.execute(query)
-            orders = result.scalars().all()
+            orders = list(result.scalars().all())
+
+            # ── Include archived trades if requested ────────────────────────
+            if include_archived:
+                try:
+                    from app.models import ArchivedTrade
+                    from sqlalchemy import select as _arch_sel
+                    _arch_query = _arch_sel(ArchivedTrade).order_by(ArchivedTrade.created_at.asc().nullsfirst())
+                    if symbol:
+                        _arch_query = _arch_query.where(ArchivedTrade.symbol == symbol)
+                    _arch_result = await db.execute(_arch_query)
+                    _arch_rows = _arch_result.scalars().all()
+                    # Wrap ArchivedTrade rows as order-like objects for FIFO matching
+                    _FakeOrder = type("FakeOrder", (), {
+                        "id": property(lambda self: self._id),
+                        "symbol": property(lambda self: self._sym),
+                        "agent_id": property(lambda self: self._aid),
+                        "side": property(lambda self: self._side),
+                        "quantity": property(lambda self: self._qty),
+                        "price": property(lambda self: self._prc),
+                        "fee": property(lambda self: self._fee),
+                        "created_at": property(lambda self: self._cat),
+                        "status": property(lambda self: self._st),
+                    })
+                    for _ar in _arch_rows:
+                        _o = _FakeOrder()
+                        _o._id = _ar.id
+                        _o._sym = _ar.symbol
+                        _o._aid = _ar.agent_id
+                        _o._side = OrderSide.BUY if str(_ar.side).lower() == "buy" else OrderSide.SELL
+                        _o._qty = _ar.quantity
+                        _o._prc = _ar.price
+                        _o._fee = _ar.fee
+                        _o._cat = _ar.created_at or _ar.archived_at
+                        _o._st = OrderStatus.FILLED
+                        orders.append(_o)
+                except Exception as _arch_err:
+                    logger.debug(f"Archived trade query failed (non-fatal): {_arch_err}")
 
         # Group by (symbol, agent_id) for per-agent isolation
         groups: dict[tuple, dict] = {}
@@ -1110,7 +1414,7 @@ class PaperTradingService:
         open_exit_fees = 0.0
         for pos in positions:
             cp = current_prices.get(pos.symbol, pos.entry_price or 0.0)
-            open_exit_fees += (pos.quantity or 0) * cp * self.fee_rate_for(pos.symbol)
+            open_exit_fees += (pos.quantity or 0) * cp * self.fee_rate_for(pos.symbol, self._venue_for(pos.agent_id))
 
         return {
             "total_pnl": closed_pnl + unrealized_pnl - total_fees - open_exit_fees,
@@ -1139,8 +1443,70 @@ class PaperTradingService:
     # ------------------------------------------------------------------
 
     async def reset_trading_session(self):
-        """Wipe all paper trading data and re-seed default balances."""
+        """Archive all paper trades and positions, then wipe and re-seed balances."""
         async with get_async_session() as db:
+            # ── Archive trades before deleting ──────────────────────────────
+            try:
+                from app.models import ArchivedTrade, ArchivedPosition
+                from sqlalchemy import select
+                import uuid as _arch_uuid
+
+                trades_to_archive = (await db.execute(
+                    select(PaperOrder).where(PaperOrder.user_id == "default-user")
+                )).scalars().all()
+                for t in trades_to_archive:
+                    db.add(ArchivedTrade(
+                        id=str(_arch_uuid.uuid4()),
+                        original_id=t.id,
+                        user_id=t.user_id,
+                        agent_id=t.agent_id,
+                        trader_id=t.trader_id,
+                        symbol=t.symbol,
+                        side=t.side.value if hasattr(t.side, "value") else str(t.side),
+                        quantity=t.quantity,
+                        price=t.price,
+                        total=t.total,
+                        fee=t.fee,
+                        leverage=t.leverage,
+                        margin_used=t.margin_used,
+                        status=t.status.value if hasattr(t.status, "value") else str(t.status),
+                        phemex_order_id=t.phemex_order_id,
+                        is_paper=t.is_paper,
+                        created_at=t.created_at,
+                        filled_at=t.filled_at,
+                    ))
+
+                positions_to_archive = (await db.execute(
+                    select(PaperPosition).where(PaperPosition.user_id == "default-user")
+                )).scalars().all()
+                for p in positions_to_archive:
+                    db.add(ArchivedPosition(
+                        id=str(_arch_uuid.uuid4()),
+                        original_id=p.id,
+                        user_id=p.user_id,
+                        agent_id=p.agent_id,
+                        symbol=p.symbol,
+                        side=p.side.value if hasattr(p.side, "value") else str(p.side),
+                        quantity=p.quantity,
+                        entry_price=p.entry_price,
+                        current_price=p.current_price,
+                        unrealized_pnl=p.unrealized_pnl,
+                        realized_pnl=p.realized_pnl,
+                        leverage=p.leverage,
+                        margin_used=p.margin_used,
+                        liquidation_price=p.liquidation_price,
+                        stop_loss_price=p.stop_loss_price,
+                        take_profit_price=p.take_profit_price,
+                        highest_price=p.highest_price,
+                        trailing_stop_pct=p.trailing_stop_pct,
+                        is_paper=p.is_paper,
+                        phemex_order_id=p.phemex_order_id,
+                        scale_out_levels=p.scale_out_levels,
+                        entry_indicators=p.entry_indicators,
+                    ))
+            except Exception as _arch_err:
+                logger.warning(f"Trade archival failed (proceeding with reset): {_arch_err}")
+
             await db.execute(
                 delete(PaperOrder).where(PaperOrder.user_id == "default-user")
             )
@@ -1157,6 +1523,7 @@ class PaperTradingService:
                     )
                 )
             await db.commit()
+            logger.info(f"Paper trading reset: archived {len(trades_to_archive)} trades and {len(positions_to_archive)} positions")
 
 
 paper_trading = PaperTradingService()

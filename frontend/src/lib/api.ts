@@ -220,7 +220,7 @@ export const settingsApi = {
     default_order_type: string;
   }) => api.put('settings/trading', data),
 
-  updateTradingGates: (data: Record<string, number | boolean>) => api.put('settings/gates', data),
+  updateTradingGates: (data: Record<string, number | boolean | string>) => api.put('settings/gates', data),
 
   getGateAutopilot: () => api.get('settings/gates/autopilot').then((r: { data: unknown }) => r.data),
 
@@ -291,6 +291,12 @@ export const traderApi = {
   toggle: (id: string) => api.post(`traders/${id}/toggle`),
   getPerformance: (id: string) => api.get(`traders/${id}/performance`),
   getLeaderboard: () => api.get('fund/traders/leaderboard'),
+};
+
+export const pendingOrderApi = {
+  list: (agentId?: string) => api.get('paper/pending-orders', { params: { agent_id: agentId } }),
+  cancel: (orderId: string) => api.post(`paper/pending-orders/${orderId}/cancel`),
+  cleanup: (maxAgeMinutes = 120) => api.post('paper/pending-orders/cleanup', null, { params: { max_age_minutes: maxAgeMinutes } }),
 };
 
 export default api;

@@ -691,24 +691,21 @@ If no changes needed, return {{"actions": [], "reasoning": "All agents performin
         existing = result.scalars().all()
 
         if existing:
-            # Update names/config if traders still have old Greek names
-            old_to_new = {"Alpha": 0, "Beta": 1, "Gamma": 2}
+            # Ensure all existing traders have assigned_pairs and correct config
+            name_to_defn = {d["name"]: d for d in DEFAULT_TRADERS}
             updated = False
             for t in existing:
-                if t.name in old_to_new:
-                    defn = DEFAULT_TRADERS[old_to_new[t.name]]
-                    t.name = defn["name"]
-                    t.llm_provider = defn["llm_provider"]
-                    t.llm_model = defn["llm_model"]
-                    t.config = defn["config"]
-                    updated = True
+                cfg = t.config or {}
+                if not cfg.get("assigned_pairs"):
+                    defn = name_to_defn.get(t.name)
+                    if defn:
+                        t.config = {**cfg, "assigned_pairs": defn["config"].get("assigned_pairs", [])}
+                        updated = True
+                        logger.info(f"Trader {t.name}: set assigned_pairs={t.config['assigned_pairs']}")
             if updated:
                 await db_session.commit()
                 for t in existing:
                     await db_session.refresh(t)
-                logger.info(f"Trader layer: renamed traders to {[t.name for t in existing]}")
-            else:
-                logger.info(f"Trader layer: loaded {len(existing)} existing traders from DB")
             return [
                 {
                     "id": t.id,

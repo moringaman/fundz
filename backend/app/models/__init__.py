@@ -257,6 +257,74 @@ class Balance(Base):
     user = relationship("User", back_populates="balances")
 
 
+class ArchivedTrade(Base):
+    """Archived trade records preserved when paper trading is reset.
+
+    Same schema as Trade but without FK constraints so they survive agent/user
+    deletion.  The trade retrospective queries this table alongside the live
+    trades table for continuity across paper trading resets.
+    """
+    __tablename__ = "archived_trades"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    original_id = Column(String(36), nullable=True)  # original trade ID before archive
+    user_id = Column(String(36), nullable=False)
+    agent_id = Column(String(36), nullable=True)
+    trader_id = Column(String(36), nullable=True)
+    symbol = Column(String(20), nullable=False)
+    side = Column(String(10), nullable=False)  # stored as string, not enum
+    quantity = Column(Float, nullable=False)
+    price = Column(Float, nullable=False)
+    total = Column(Float, nullable=False)
+    fee = Column(Float, default=0.0)
+    leverage = Column(Float, default=1.0)
+    margin_used = Column(Float, default=0.0)
+    status = Column(String(20), default="filled")
+    phemex_order_id = Column(String(100), nullable=True)
+    is_paper = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), nullable=True)
+    filled_at = Column(DateTime(timezone=True), nullable=True)
+    archived_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("idx_archived_trade_agent", "agent_id"),
+        Index("idx_archived_trade_created", "created_at"),
+    )
+
+
+class ArchivedPosition(Base):
+    """Archived position records preserved when paper trading is reset."""
+    __tablename__ = "archived_positions"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    original_id = Column(String(36), nullable=True)
+    user_id = Column(String(36), nullable=False)
+    agent_id = Column(String(36), nullable=True)
+    symbol = Column(String(20), nullable=False)
+    side = Column(String(10), nullable=False)
+    quantity = Column(Float, default=0.0)
+    entry_price = Column(Float, nullable=True)
+    current_price = Column(Float, nullable=True)
+    unrealized_pnl = Column(Float, default=0.0)
+    realized_pnl = Column(Float, default=0.0)
+    leverage = Column(Float, default=1.0)
+    margin_used = Column(Float, default=0.0)
+    liquidation_price = Column(Float, nullable=True)
+    stop_loss_price = Column(Float, nullable=True)
+    take_profit_price = Column(Float, nullable=True)
+    highest_price = Column(Float, nullable=True)
+    trailing_stop_pct = Column(Float, nullable=True)
+    is_paper = Column(Boolean, default=True)
+    phemex_order_id = Column(String(100), nullable=True)
+    scale_out_levels = Column(Text, nullable=True)
+    entry_indicators = Column(JSON, nullable=True)
+    archived_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("idx_archived_position_agent", "agent_id"),
+    )
+
+
 class Kline(Base):
     __tablename__ = "klines"
 
@@ -295,6 +363,7 @@ class AgentRunRecord(Base):
     strategy_type = Column(String(50), nullable=True)
     use_paper = Column(Boolean, default=True)
     llm_reasoning = Column(Text, nullable=True)  # AI agent reasoning stored for self-learning
+    reflection = Column(Text, nullable=True)     # Post-trade narrative: what happened and what to learn
 
     __table_args__ = (
         Index("idx_agent_run_agent_id_ts", "agent_id", "timestamp"),
@@ -868,4 +937,70 @@ class StrategyInsightRecord(Base):
 
     __table_args__ = (
         UniqueConstraint("strategy_type", "is_paper", name="uq_strategy_insight_type_mode"),
+    )
+
+
+class RetrospectiveSnapshot(Base):
+    """Persisted trade retrospective analysis snapshots for trend tracking.
+
+    Each 20-minute cycle produces a snapshot of the full retrospective result
+    (trade analyses, agent insights, strategy insights, parameter adjustments,
+    R:R erosion).  Kept indefinitely so the dashboard can chart how win rates,
+    adjustment recommendations, and system confidence evolved over time.
+    """
+    __tablename__ = "retrospective_snapshots"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    analyzed_at = Column(DateTime(timezone=True), nullable=False, index=True)
+
+    # Headline summary columns for efficient querying / charting
+    trade_count = Column(Integer, default=0)
+    win_count = Column(Integer, default=0)
+    loss_count = Column(Integer, default=0)
+    total_pnl = Column(Float, default=0.0)
+    overall_win_rate = Column(Float, nullable=True)
+    adjustment_count = Column(Integer, default=0)
+
+    # Full result payload (JSON)
+    trade_analyses = Column(JSON, default=list)
+    agent_insights = Column(JSON, default=dict)
+    strategy_insights = Column(JSON, default=dict)
+    parameter_adjustments = Column(JSON, default=list)
+    rr_erosion = Column(JSON, default=dict)
+    summary = Column(Text, default="")
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("idx_retro_snapshot_analyzed_at", "analyzed_at"),
+    )
+
+
+class RetrospectiveAdjustment(Base):
+    """Audit trail for parameter adjustments applied by the trade retrospective.
+
+    Each row records a single SL/TP change that was actually persisted to an
+    agent's config, so we can correlate adjustment events with subsequent PnL
+    and win-rate changes (tracked in agent_metric_records).
+    """
+    __tablename__ = "retrospective_adjustments"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    agent_id = Column(String(36), ForeignKey("agents.id", ondelete="SET NULL"), nullable=False, index=True)
+    agent_name = Column(String(100), nullable=True)
+
+    # What changed
+    adjustment_type = Column(String(20), nullable=False)  # stop_loss_pct | take_profit_pct
+    old_value = Column(Float, nullable=True)
+    new_value = Column(Float, nullable=False)
+
+    # Context
+    reason = Column(Text, nullable=True)
+    snapshot_id = Column(String(36), nullable=True)  # FK to retrospective_snapshots.id
+    snapshot_analyzed_at = Column(DateTime(timezone=True), nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("idx_retro_adjustment_agent", "agent_id", "created_at"),
     )

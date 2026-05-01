@@ -80,6 +80,22 @@ class TradingPreferences(BaseModel):
     paper_trading_default: bool = True
     auto_confirm_orders: bool = False
     default_order_type: str = "limit"
+    use_limit_orders: bool = Field(
+        default=False,
+        description=(
+            "When True, non-pattern trades default to Limit orders at market price "
+            "adjusted by limit_order_offset_bps instead of Market orders. "
+            "Pattern-based entries still use their own Limit/Stop routing."
+        ),
+    )
+    limit_order_offset_bps: float = Field(
+        default=5.0, ge=0.0, le=100.0,
+        description=(
+            "Basis points away from current price to place limit orders when "
+            "use_limit_orders is True. 5 bps = 0.05% above/below market. "
+            "Higher values improve fill probability but increase slippage."
+        ),
+    )
     trading_pairs: list[str] = Field(
         default=[
             "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT",
@@ -220,6 +236,9 @@ class TradingGates(BaseModel):
         description="Minimum confidence required to enter during dead zone (after penalty)")
     dead_zone_noop_enabled: bool = Field(default=True,
         description="When enabled, scheduler performs no-op during dead zone to conserve LLM/API tokens; only position monitoring continues")
+    # ── Bull/Bear Debate ────────────────────────────────────────────────
+    bull_bear_mode: str = Field(default="deterministic",
+        description="'llm' = two adversarial LLM calls for bull/bear case; 'deterministic' = heuristic from TA indicators")
     # ── Daily Fee Budget Circuit Breaker ──────────────────────────────────────
     # Hard stop that prevents new entries when cumulative daily fees exceed this
     # percentage of starting capital. Prevents fee bleed from consuming profits.
@@ -280,6 +299,38 @@ class TradingGates(BaseModel):
     # churn; high-conviction signals can always override.
     max_trades_per_hour: int = Field(default=4, ge=1, le=20,
         description="Soft hourly trade limit across all agents. Trades above this limit require 0.85+ confidence to proceed. Prevents early fee budget exhaustion from high-frequency churn.")
+    # ── Pullback / Re-entry Logic ──────────────────────────────────────────────
+    # Prevents chasing by detecting when price has moved significantly since the
+    # signal trigger. Instead of entering at market (chasing), waits for a pullback
+    # to a defined level before placing a limit order.
+    pullback_entries_enabled: bool = Field(default=False,
+        description="When enabled, detect price chase and route as Limit at a retracement level instead of Market. Reduces slippage on missed entries.")
+    pullback_strategy: str = Field(default="best",
+        description="Pullback target strategy: 'ema' (wait for EMA touch), 'fib' (Fibonacci retrace), 'fixed' (fixed % offset), 'best' (try ema → fib → fixed).")
+    pullback_max_chase_pct: float = Field(default=0.5, ge=0.1, le=5.0,
+        description="Minimum price move from signal origin (as % of price) that triggers pullback mode. 0.5 = price must move 0.5%+ before we defer.")
+    pullback_ema_period: int = Field(default=20, ge=8, le=200,
+        description="EMA period for EMA-based pullback detection. Price stretched beyond pullback_max_chase_pct from this EMA triggers a limit entry at the EMA.")
+    pullback_fib_level: float = Field(default=0.382, ge=0.236, le=0.786,
+        description="Fibonacci retracement level to target for fib-based pullback entries. 0.382 = shallow retrace, 0.618 = deep retrace.")
+    pullback_fixed_offset_bps: float = Field(default=30, ge=5, le=200,
+        description="Fixed offset in basis points for fixed pullback strategy. 30 = wait for 0.30% pullback from current price.")
+    pullback_atr_mult: float = Field(default=0.5, ge=0.1, le=2.0,
+        description="ATR multiplier for ATR-based pullback depth when using 'fixed' strategy. 0.5 = half-ATR pullback.")
+    pullback_max_wait_cycles: int = Field(default=6, ge=1, le=24,
+        description="Maximum number of scheduler cycles (each ~5 min) to wait for a pullback before giving up. 6 ≈ 30 min max wait.")
+    # ── Fast Entry Mode ────────────────────────────────────────────────────────
+    # Momentum and breakout strategies need to enter DURING a move, not after it
+    # confirms.  The normal gate sequence (TA veto → backtest → pattern routing)
+    # can take 5–30 seconds, by which time the entry candle may have already run.
+    # Fast entry skips the TA veto and pre-trade backtest when confidence is high
+    # enough, reducing latency to ~1 second.
+    fast_entry_enabled: bool = Field(default=False,
+        description="Enable fast entry mode for time-sensitive strategies (momentum, breakout, trend_following, scalping). Skips TA veto and backtest gate when confidence is above the threshold.")
+    fast_entry_confidence_threshold: float = Field(default=0.85, ge=0.70, le=1.0,
+        description="Minimum confidence to trigger fast entry. Higher = safer but fewer fast entries. 0.85 = only very high-conviction signals bypass gates.")
+    fast_entry_strategies: str = Field(default="momentum,breakout,trend_following,scalping,ai",
+        description="Comma-separated list of strategy types eligible for fast entry. Momentum and breakout decay fastest and benefit most.")
     # ── Confidence-Gated Leverage ────────────────────────────────────────────
     leverage_enabled: bool = Field(default=True,
         description="Allow leverage only on high-confidence trades.")

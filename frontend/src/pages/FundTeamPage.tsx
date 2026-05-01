@@ -10,6 +10,8 @@ import {
   useAgents as _useAgents,
   useStrategyActions,
   useTradeRetrospective,
+  useTradeRetrospectiveHistory,
+  useRetroAdjustments,
   useTraderLeaderboard,
 } from '../hooks/useQueries';
 import { DailyReportPanel } from '../components/DailyReportPanel';
@@ -28,6 +30,8 @@ export function FundTeamPage() {
   // agents data available via _useAgents() if needed for future agent-name lookups
   const { data: strategyActions } = useStrategyActions();
   const { data: retroData } = useTradeRetrospective();
+  const { data: retroHistory } = useTradeRetrospectiveHistory(50);
+  const { data: retroAdjustments } = useRetroAdjustments(undefined, 20);
   const { data: traderLeaderboard = [] } = useTraderLeaderboard();
   const [selectedTASymbol, setSelectedTASymbol] = useState<string | null>(null);
 
@@ -111,97 +115,8 @@ export function FundTeamPage() {
       {/* <div style={{ marginBottom: '2rem' }}>
         <WhaleIntelligencePanel />
       </div> */}
-      <div style={{  marginBottom: '2rem' }}>
-      <TeamChatPanel />
-      </div>
-
-      {/* Main Grid */}
+      {/* Main Grid — analyst panels only */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '1.5rem' }}>
-
-        {/* === Trader Leaderboard === */}
-        <div className="panel" style={{ gridColumn: 'span 3' }}>
-          <div className="panel-header">
-            <div style={{ display: 'flex', alignItems: 'center', gap: '.5rem' }}>
-              <span style={{ fontSize: '1.2rem' }}>🏆</span>
-              <span className="panel-title">Competing Traders</span>
-            </div>
-            <span style={{ fontFamily: 'var(--mono)', fontSize: '.65rem', color: 'var(--text-dim)' }}>
-              {(traderLeaderboard as any[]).filter((t: any) => t.is_enabled).length} active
-            </span>
-          </div>
-          <div className="panel-body">
-            {(traderLeaderboard as any[]).length === 0 ? (
-              <p style={{ fontSize: '.78rem', color: 'var(--text-dim)', textAlign: 'center', padding: '1rem 0' }}>
-                No traders configured. Start the scheduler to seed defaults.
-              </p>
-            ) : (
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 320px))', gap: '.75rem', justifyContent: 'start' }}>
-                {(traderLeaderboard as any[]).map((t: any, i: number) => (
-                  <div key={t.id} style={{
-                    padding: '.75rem',
-                    background: 'var(--bg-elevated)',
-                    borderRadius: '8px',
-                    border: `1px solid ${i === 0 ? 'rgba(0,230,118,.3)' : 'var(--border)'}`,
-                  }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '.5rem' }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '.4rem' }}>
-                        <span style={{ fontSize: '1.1rem' }}>{t.config?.avatar || ['🥇','🥈','🥉'][i] || '🏅'}</span>
-                        <div>
-                          <div style={{ fontSize: '.85rem', fontWeight: 700, color: 'var(--text-primary)' }}>{t.name}</div>
-                          <div style={{ fontSize: '.6rem', fontFamily: 'var(--mono)', color: 'var(--text-dim)' }}>
-                            {t.llm_model?.split('/').pop() || 'unknown'}
-                          </div>
-                        </div>
-                      </div>
-                      <span style={{
-                        fontSize: '.6rem', fontFamily: 'var(--mono)', padding: '.15rem .35rem',
-                        borderRadius: '4px',
-                        background: t.is_enabled ? 'var(--green-dim)' : 'var(--bg-hover)',
-                        color: t.is_enabled ? 'var(--green)' : 'var(--text-dim)',
-                      }}>
-                        {t.is_enabled ? 'ACTIVE' : 'OFF'}
-                      </span>
-                    </div>
-                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '.35rem' }}>
-                      <div className="stat-card">
-                        <div className="stat-label">P&L</div>
-                        <div className={`stat-value ${t.total_pnl >= 0 ? 'positive' : 'negative'}`} style={{ fontSize: '.82rem' }}>
-                          {t.total_pnl >= 0 ? '+' : ''}${t.total_pnl?.toFixed(2)}
-                        </div>
-                      </div>
-                      <div className="stat-card">
-                        <div className="stat-label">Win Rate</div>
-                        <div className="stat-value" style={{ fontSize: '.82rem' }}>
-                          {t.win_rate != null ? `${(t.win_rate * 100).toFixed(0)}%` : '—'}
-                        </div>
-                      </div>
-                      <div className="stat-card">
-                        <div className="stat-label">Perf Tier</div>
-                        <div className="stat-value" style={{ fontSize: '.82rem', color: t.perf_mult >= 1.0 ? 'var(--green)' : t.perf_mult >= 0.85 ? 'var(--amber)' : 'var(--red)' }}>
-                          {t.perf_mult != null ? `${t.perf_mult.toFixed(2)}×` : '—'}
-                        </div>
-                        {t.perf_tier && (
-                          <div style={{ fontSize: '.6rem', fontFamily: 'var(--mono)', color: 'var(--text-dim)', marginTop: '.1rem', textTransform: 'uppercase' }}>
-                            {t.perf_tier}
-                          </div>
-                        )}
-                      </div>
-                      <div className="stat-card">
-                        <div className="stat-label">Strategies</div>
-                        <div className="stat-value" style={{ fontSize: '.82rem' }}>
-                          {t.agent_count}
-                        </div>
-                      </div>
-                    </div>
-                    <div style={{ marginTop: '.35rem', fontSize: '.6rem', fontFamily: 'var(--mono)', color: 'var(--text-dim)' }}>
-                      {t.total_trades} trades
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        </div>
 
         {/* === Research Analyst === */}
         <div className="panel" style={{ gridColumn: 'span 2', minWidth: 0 }}>
@@ -765,164 +680,293 @@ export function FundTeamPage() {
 
       </div>
 
-      {/* Strategy Actions — FM + TA Cooperation Log */}
-      <div className="card" style={{ marginTop: '1rem' }}>
-        <div className="card-header">
-          <h3 className="card-title"><GitBranch size={16} /> Strategy Actions</h3>
-          <span style={{ fontSize: '.65rem', color: 'var(--text-dim)' }}>Fund Manager ↔ Technical Analyst Cooperation</span>
-        </div>
-        {strategyActionsList.length > 0 ? (
-          <>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '.5rem', padding: '.5rem' }}>
-              {actionsPager.pageItems.map((action: any) => {
-                const actionColors: Record<string, string> = {
-                  create_agent: '#22c55e',
-                  disable_agent: '#ef4444',
-                  enable_agent: '#3b82f6',
-                  adjust_params: '#f59e0b',
-                };
-                const actionIcons: Record<string, string> = {
-                  create_agent: '➕',
-                  disable_agent: '⛔',
-                  enable_agent: '✅',
-                  adjust_params: '⚙️',
-                };
-                return (
-                  <div key={action.id} style={{
-                    padding: '.6rem .8rem',
-                    borderRadius: '8px',
-                    background: 'var(--surface)',
-                    borderLeft: `3px solid ${actionColors[action.action] || 'var(--border)'}`,
-                    fontSize: '.75rem',
-                  }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '.3rem' }}>
-                      <span style={{ fontWeight: 600, color: actionColors[action.action] || 'var(--text)' }}>
-                        {actionIcons[action.action] || '📋'} {action.action?.replace('_', ' ')}
-                      </span>
-                      <span style={{ color: 'var(--text-dim)', fontSize: '.65rem' }}>
-                        {action.created_at ? new Date(action.created_at).toLocaleString() : ''}
-                      </span>
-                    </div>
-                    <div style={{ color: 'var(--text)', marginBottom: '.2rem' }}>
-                      <strong>{action.target_agent_name || 'New Agent'}</strong>
-                      {action.strategy_type && <span style={{ marginLeft: '.4rem', color: 'var(--text-dim)' }}>({action.strategy_type})</span>}
-                    </div>
-                    <div style={{ color: 'var(--text-dim)', fontSize: '.7rem', lineHeight: 1.4 }}>
-                      {action.rationale?.slice(0, 150)}{action.rationale?.length > 150 ? '…' : ''}
-                    </div>
-                    <div style={{ display: 'flex', gap: '.6rem', marginTop: '.3rem', fontSize: '.65rem', color: 'var(--text-dim)' }}>
-                      {action.confluence_score != null && <span>Confluence: {(action.confluence_score * 100).toFixed(0)}%</span>}
-                      {action.backtest_net_pnl != null && <span>Backtest PnL: ${action.backtest_net_pnl.toFixed(2)}</span>}
-                      <span style={{ color: action.executed ? 'var(--green)' : 'var(--red)' }}>
-                        {action.executed ? '✓ Executed' : '✗ Not executed'}
-                      </span>
-                      <span>By: {action.initiated_by}</span>
-                    </div>
-                  </div>
-                );
-              })}
+      {/* Bottom 2-column grid — operations & retrospective */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1.5rem', marginTop: '1.5rem' }}>
+
+        {/* ── Left column: Team Discussion + Strategy Actions ── */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
+          <TeamChatPanel />
+
+          {/* Strategy Actions — FM + TA Cooperation Log */}
+          <div className="card">
+            <div className="card-header">
+              <h3 className="card-title"><GitBranch size={16} /> Strategy Actions</h3>
+              <span style={{ fontSize: '.65rem', color: 'var(--text-dim)' }}>Fund Manager ↔ Technical Analyst</span>
             </div>
-            <Paginator page={actionsPager.page} totalPages={actionsPager.totalPages} total={actionsPager.total} pageSize={8} onPage={actionsPager.setPage} label="actions" />
-          </>
-        ) : (
-          <div style={{ color: 'var(--text-dim)', fontSize: '.75rem', textAlign: 'center', padding: '1.5rem' }}>
-            <GitBranch size={28} style={{ opacity: .3, display: 'block', margin: '0 auto .5rem' }} />
-            No strategy actions yet. Actions appear when the fund manager and technical analyst cooperate on strategy changes.
+            {strategyActionsList.length > 0 ? (
+              <>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '.5rem', padding: '.5rem' }}>
+                  {actionsPager.pageItems.map((action: any) => {
+                    const actionColors: Record<string, string> = {
+                      create_agent: '#22c55e',
+                      disable_agent: '#ef4444',
+                      enable_agent: '#3b82f6',
+                      adjust_params: '#f59e0b',
+                    };
+                    const actionIcons: Record<string, string> = {
+                      create_agent: '➕',
+                      disable_agent: '⛔',
+                      enable_agent: '✅',
+                      adjust_params: '⚙️',
+                    };
+                    return (
+                      <div key={action.id} style={{
+                        padding: '.6rem .8rem',
+                        borderRadius: '8px',
+                        background: 'var(--surface)',
+                        borderLeft: `3px solid ${actionColors[action.action] || 'var(--border)'}`,
+                        fontSize: '.75rem',
+                      }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '.3rem' }}>
+                          <span style={{ fontWeight: 600, color: actionColors[action.action] || 'var(--text)' }}>
+                            {actionIcons[action.action] || '📋'} {action.action?.replace('_', ' ')}
+                          </span>
+                          <span style={{ color: 'var(--text-dim)', fontSize: '.65rem' }}>
+                            {action.created_at ? new Date(action.created_at).toLocaleString() : ''}
+                          </span>
+                        </div>
+                        <div style={{ color: 'var(--text)', marginBottom: '.2rem' }}>
+                          <strong>{action.target_agent_name || 'New Agent'}</strong>
+                          {action.strategy_type && <span style={{ marginLeft: '.4rem', color: 'var(--text-dim)' }}>({action.strategy_type})</span>}
+                        </div>
+                        <div style={{ color: 'var(--text-dim)', fontSize: '.7rem', lineHeight: 1.4 }}>
+                          {action.rationale?.slice(0, 150)}{action.rationale?.length > 150 ? '…' : ''}
+                        </div>
+                        <div style={{ display: 'flex', gap: '.6rem', marginTop: '.3rem', fontSize: '.65rem', color: 'var(--text-dim)' }}>
+                          {action.confluence_score != null && <span>Confluence: {(action.confluence_score * 100).toFixed(0)}%</span>}
+                          {action.backtest_net_pnl != null && <span>Backtest PnL: ${action.backtest_net_pnl.toFixed(2)}</span>}
+                          <span style={{ color: action.executed ? 'var(--green)' : 'var(--red)' }}>
+                            {action.executed ? '✓ Executed' : '✗ Not executed'}
+                          </span>
+                          <span>By: {action.initiated_by}</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+                <Paginator page={actionsPager.page} totalPages={actionsPager.totalPages} total={actionsPager.total} pageSize={8} onPage={actionsPager.setPage} label="actions" />
+              </>
+            ) : (
+              <div style={{ color: 'var(--text-dim)', fontSize: '.75rem', textAlign: 'center', padding: '1.5rem' }}>
+                <GitBranch size={28} style={{ opacity: .3, display: 'block', margin: '0 auto .5rem' }} />
+                No strategy actions yet. Actions appear when the fund manager and technical analyst cooperate.
+              </div>
+            )}
           </div>
-        )}
+        </div>
+
+        {/* ── Right column: Competing Traders + Retrospective + Trend + Adjustments ── */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
+
+          {/* Competing Traders */}
+          <div className="panel">
+            <div className="panel-header">
+              <div style={{ display: 'flex', alignItems: 'center', gap: '.5rem' }}>
+                <span style={{ fontSize: '1.2rem' }}>🏆</span>
+                <span className="panel-title">Competing Traders</span>
+              </div>
+              <span style={{ fontFamily: 'var(--mono)', fontSize: '.65rem', color: 'var(--text-dim)' }}>
+                {(traderLeaderboard as any[]).filter((t: any) => t.is_enabled).length} active
+              </span>
+            </div>
+            <div className="panel-body">
+              {(traderLeaderboard as any[]).length === 0 ? (
+                <p style={{ fontSize: '.78rem', color: 'var(--text-dim)', textAlign: 'center', padding: '1rem 0' }}>
+                  No traders configured. Start the scheduler to seed defaults.
+                </p>
+              ) : (
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: '.65rem' }}>
+                  {(traderLeaderboard as any[]).map((t: any, i: number) => (
+                    <div key={t.id} style={{
+                      padding: '.65rem',
+                      background: 'var(--bg-elevated)',
+                      borderRadius: '8px',
+                      border: `1px solid ${i === 0 ? 'rgba(0,230,118,.3)' : 'var(--border)'}`,
+                    }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '.4rem' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '.35rem' }}>
+                          <span style={{ fontSize: '1rem' }}>{t.config?.avatar || ['🥇','🥈','🥉'][i] || '🏅'}</span>
+                          <div>
+                            <div style={{ fontSize: '.8rem', fontWeight: 700, color: 'var(--text-primary)' }}>{t.name}</div>
+                            <div style={{ fontSize: '.55rem', fontFamily: 'var(--mono)', color: 'var(--text-dim)' }}>
+                              {t.llm_model?.split('/').pop() || 'unknown'}
+                            </div>
+                          </div>
+                        </div>
+                        <span style={{
+                          fontSize: '.55rem', fontFamily: 'var(--mono)', padding: '.1rem .3rem',
+                          borderRadius: '4px',
+                          background: t.is_enabled ? 'var(--green-dim)' : 'var(--bg-hover)',
+                          color: t.is_enabled ? 'var(--green)' : 'var(--text-dim)',
+                        }}>
+                          {t.is_enabled ? 'ON' : 'OFF'}
+                        </span>
+                      </div>
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '.3rem' }}>
+                        <div className="stat-card" style={{ padding: '.3rem .4rem' }}>
+                          <div className="stat-label" style={{ fontSize: '.55rem' }}>P&L</div>
+                          <div className={`stat-value ${t.total_pnl >= 0 ? 'positive' : 'negative'}`} style={{ fontSize: '.75rem' }}>
+                            {t.total_pnl >= 0 ? '+' : ''}${t.total_pnl?.toFixed(0)}
+                          </div>
+                        </div>
+                        <div className="stat-card" style={{ padding: '.3rem .4rem' }}>
+                          <div className="stat-label" style={{ fontSize: '.55rem' }}>WR</div>
+                          <div className="stat-value" style={{ fontSize: '.75rem' }}>
+                            {t.win_rate != null ? `${(t.win_rate * 100).toFixed(0)}%` : '—'}
+                          </div>
+                        </div>
+                        <div className="stat-card" style={{ padding: '.3rem .4rem' }}>
+                          <div className="stat-label" style={{ fontSize: '.55rem' }}>Perf</div>
+                          <div className="stat-value" style={{ fontSize: '.75rem', color: t.perf_mult >= 1.0 ? 'var(--green)' : t.perf_mult >= 0.85 ? 'var(--amber)' : 'var(--red)' }}>
+                            {t.perf_mult != null ? `${t.perf_mult.toFixed(2)}×` : '—'}
+                          </div>
+                        </div>
+                        <div className="stat-card" style={{ padding: '.3rem .4rem' }}>
+                          <div className="stat-label" style={{ fontSize: '.55rem' }}>Agents</div>
+                          <div className="stat-value" style={{ fontSize: '.75rem' }}>{t.agent_count}</div>
+                        </div>
+                      </div>
+                      <div style={{ marginTop: '.25rem', fontSize: '.55rem', fontFamily: 'var(--mono)', color: 'var(--text-dim)' }}>
+                        {t.total_trades} trades · {t.consistency_flag || '—'}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Trade Retrospective */}
+          {retroData && retroData.trade_count > 0 && (
+            <div style={{ background: 'var(--bg-card)', borderRadius: '.75rem', border: '1px solid var(--border)', padding: '1.25rem' }}>
+              <h3 style={{ margin: '0 0 1rem', display: 'flex', alignItems: 'center', gap: '.5rem', fontSize: '.85rem' }}>
+                <BarChart3 size={16} /> Trade Retrospective
+                <span style={{ fontSize: '.7rem', color: 'var(--text-dim)', fontWeight: 400 }}>
+                  {retroData.trade_count} trades
+                </span>
+              </h3>
+
+              {retroData.summary && (
+                <p style={{ fontSize: '.8rem', color: 'var(--text-secondary)', margin: '0 0 1rem', lineHeight: 1.5 }}>
+                  {retroData.summary}
+                </p>
+              )}
+
+              {retroData.agent_insights && Object.keys(retroData.agent_insights).length > 0 && (
+                <div style={{ display: 'grid', gap: '.75rem' }}>
+                  {Object.entries(retroData.agent_insights).map(([agentId, insight]: [string, any]) => (
+                    <div key={agentId} style={{
+                      background: 'var(--bg-primary)',
+                      borderRadius: '.5rem',
+                      padding: '.65rem .8rem',
+                      border: '1px solid var(--border)',
+                      fontSize: '.75rem',
+                    }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '.35rem' }}>
+                        <span style={{ fontWeight: 600 }}>{insight.agent_name}</span>
+                        <span style={{ color: insight.win_rate >= 0.5 ? '#4ade80' : '#f87171', fontWeight: 600 }}>
+                          {(insight.win_rate * 100).toFixed(0)}% WR ({insight.total_trades} trades)
+                        </span>
+                      </div>
+                      {insight.strengths?.length > 0 && <div style={{ color: '#4ade80' }}>✅ {insight.strengths.join(' • ')}</div>}
+                      {insight.weaknesses?.length > 0 && <div style={{ color: '#fbbf24' }}>⚠️ {insight.weaknesses.join(' • ')}</div>}
+                      <div style={{ display: 'flex', gap: '.75rem', marginTop: '.35rem', color: 'var(--text-dim)' }}>
+                        {insight.avg_exit_efficiency !== null && <span>Exit: {(insight.avg_exit_efficiency * 100).toFixed(0)}%</span>}
+                        {insight.best_pattern && <span>Best: {insight.best_pattern}</span>}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {retroData.parameter_adjustments?.length > 0 && (
+                <div style={{ marginTop: '1rem' }}>
+                  <h4 style={{ fontSize: '.7rem', margin: '0 0 .4rem', color: 'var(--text-secondary)' }}>🔧 Recommended Adjustments</h4>
+                  {retroData.parameter_adjustments.slice(0, 4).map((adj: any, i: number) => (
+                    <div key={i} style={{
+                      fontSize: '.7rem',
+                      background: 'rgba(251, 191, 36, .08)',
+                      border: '1px solid rgba(251, 191, 36, .2)',
+                      borderRadius: '.4rem',
+                      padding: '.4rem .6rem',
+                      marginBottom: '.3rem',
+                    }}>
+                      <strong>{adj.agent_name}</strong>: {adj.reason}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Win Rate Trend */}
+          {retroHistory?.snapshots?.length > 1 && (
+            <div style={{ background: 'var(--bg-card)', borderRadius: '.75rem', border: '1px solid var(--border)', padding: '1rem' }}>
+              <h3 style={{ margin: '0 0 .5rem', display: 'flex', alignItems: 'center', gap: '.4rem', fontSize: .8 }}>
+                <BarChart3 size={14} /> WR Trend
+                <span style={{ fontSize: '.6rem', color: 'var(--text-dim)', fontWeight: 400 }}>
+                  {retroHistory.snapshots.length} cycles
+                </span>
+              </h3>
+              <div style={{ display: 'flex', alignItems: 'flex-end', gap: '2px', height: '36px', marginBottom: '.35rem' }}>
+                {[...retroHistory.snapshots].reverse().map((s: any, i: number) => {
+                  const wr = s.overall_win_rate ?? 0;
+                  return (
+                    <div key={i}
+                      title={`${(wr * 100).toFixed(0)}% WR (${s.trade_count} trades)`}
+                      style={{
+                        flex: 1, height: `${Math.max(3, wr * 36)}px`,
+                        background: wr >= 0.5 ? '#4ade80' : '#f87171',
+                        borderRadius: '2px 2px 0 0', opacity: 0.7 + 0.3 * wr,
+                        minWidth: '3px',
+                      }}
+                    />
+                  );
+                })}
+              </div>
+              <div style={{ display: 'flex', gap: '1rem', fontSize: '.65rem', color: 'var(--text-secondary)', flexWrap: 'wrap' }}>
+                <span>Avg: {((retroHistory.snapshots.reduce((a: number, s: any) => a + (s.overall_win_rate ?? 0), 0) / retroHistory.snapshots.length) * 100).toFixed(0)}%</span>
+                <span>Latest: {(retroHistory.snapshots[0].overall_win_rate != null ? (retroHistory.snapshots[0].overall_win_rate * 100).toFixed(0) : '—')}%</span>
+                <span>PnL: ${retroHistory.snapshots.reduce((a: number, s: any) => a + (s.total_pnl ?? 0), 0).toFixed(0)}</span>
+              </div>
+            </div>
+          )}
+
+          {/* Applied Adjustments */}
+          {retroAdjustments?.adjustments?.length > 0 && (
+            <div style={{ background: 'var(--bg-card)', borderRadius: '.75rem', border: '1px solid var(--border)', padding: '1rem' }}>
+              <h3 style={{ margin: '0 0 .5rem', display: 'flex', alignItems: 'center', gap: '.4rem', fontSize: .8 }}>
+                <GitBranch size={14} /> Applied Adj.
+                <span style={{ fontSize: '.6rem', color: 'var(--text-dim)', fontWeight: 400 }}>
+                  last {retroAdjustments.adjustments.length} changes
+                </span>
+              </h3>
+              <div style={{ display: 'grid', gap: '.35rem' }}>
+                {retroAdjustments.adjustments.slice(0, 6).map((adj: any) => (
+                  <div key={adj.id} style={{
+                    fontSize: '.7rem',
+                    background: adj.new_value > (adj.old_value ?? 0) ? 'rgba(74, 222, 128, .06)' : 'rgba(251, 191, 36, .06)',
+                    border: '1px solid var(--border)',
+                    borderRadius: '.4rem',
+                    padding: '.4rem .6rem',
+                  }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '.15rem' }}>
+                      <strong>{adj.agent_name}</strong>
+                      <span style={{ color: 'var(--text-dim)' }}>
+                        {adj.adjustment_type === 'stop_loss_pct' ? 'SL' : 'TP'}: {adj.old_value ?? '—'}→{adj.new_value}
+                      </span>
+                    </div>
+                    <div style={{ color: 'var(--text-secondary)', lineHeight: 1.3 }}>{adj.reason || ''}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Daily Report Panel */}
       <DailyReportPanel />
-
-      {/* Trade Retrospective Panel */}
-      {retroData && retroData.trade_count > 0 && (
-        <div style={{ background: 'var(--bg-card)', borderRadius: '.75rem', border: '1px solid var(--border)', padding: '1.25rem' }}>
-          <h3 style={{ margin: '0 0 1rem', display: 'flex', alignItems: 'center', gap: '.5rem' }}>
-            <BarChart3 size={18} /> Trade Retrospective
-            <span style={{ fontSize: '.7rem', color: 'var(--text-dim)', fontWeight: 400 }}>
-              {retroData.trade_count} trades analysed
-            </span>
-          </h3>
-
-          {retroData.summary && (
-            <p style={{ fontSize: '.8rem', color: 'var(--text-secondary)', margin: '0 0 1rem', lineHeight: 1.5 }}>
-              {retroData.summary}
-            </p>
-          )}
-
-          {/* Per-agent insights */}
-          {retroData.agent_insights && Object.keys(retroData.agent_insights).length > 0 && (
-            <div style={{ display: 'grid', gap: '.75rem' }}>
-              {Object.entries(retroData.agent_insights).map(([agentId, insight]: [string, any]) => (
-                <div
-                  key={agentId}
-                  style={{
-                    background: 'var(--bg-primary)',
-                    borderRadius: '.5rem',
-                    padding: '.75rem 1rem',
-                    border: '1px solid var(--border)',
-                  }}
-                >
-                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '.5rem' }}>
-                    <span style={{ fontWeight: 600, fontSize: '.8rem' }}>{insight.agent_name}</span>
-                    <span style={{
-                      fontSize: '.7rem',
-                      color: insight.win_rate >= 0.5 ? '#4ade80' : '#f87171',
-                      fontWeight: 600,
-                    }}>
-                      {(insight.win_rate * 100).toFixed(0)}% WR ({insight.total_trades} trades)
-                    </span>
-                  </div>
-
-                  {insight.strengths?.length > 0 && (
-                    <div style={{ fontSize: '.75rem', color: '#4ade80', marginBottom: '.25rem' }}>
-                      ✅ {insight.strengths.join(' • ')}
-                    </div>
-                  )}
-                  {insight.weaknesses?.length > 0 && (
-                    <div style={{ fontSize: '.75rem', color: '#fbbf24', marginBottom: '.25rem' }}>
-                      ⚠️ {insight.weaknesses.join(' • ')}
-                    </div>
-                  )}
-
-                  <div style={{ display: 'flex', gap: '1rem', fontSize: '.7rem', color: 'var(--text-dim)', marginTop: '.5rem' }}>
-                    {insight.avg_exit_efficiency !== null && (
-                      <span>Exit Efficiency: {(insight.avg_exit_efficiency * 100).toFixed(0)}%</span>
-                    )}
-                    {insight.best_pattern && <span>Best: {insight.best_pattern}</span>}
-                    {insight.worst_pattern && <span>Worst: {insight.worst_pattern}</span>}
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-
-          {/* Parameter adjustments */}
-          {retroData.parameter_adjustments?.length > 0 && (
-            <div style={{ marginTop: '1rem' }}>
-              <h4 style={{ fontSize: '.75rem', margin: '0 0 .5rem', color: 'var(--text-secondary)' }}>
-                🔧 Recommended Adjustments
-              </h4>
-              {retroData.parameter_adjustments.map((adj: any, i: number) => (
-                <div
-                  key={i}
-                  style={{
-                    fontSize: '.75rem',
-                    background: 'rgba(251, 191, 36, .08)',
-                    border: '1px solid rgba(251, 191, 36, .2)',
-                    borderRadius: '.4rem',
-                    padding: '.5rem .75rem',
-                    marginBottom: '.4rem',
-                  }}
-                >
-                  <strong>{adj.agent_name}</strong>: {adj.reason}
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
     </div>
   );
 }

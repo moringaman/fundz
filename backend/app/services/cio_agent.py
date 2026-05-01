@@ -106,29 +106,29 @@ class CIOAgent:
         timestamp = datetime.utcnow()
         agent_metrics = agent_metrics or []
 
+        # Pre-compute these outside the try block so they survive any LLM failure
+        fund_perf = self._calculate_fund_performance(
+            agent_metrics,
+            fund_performance,
+            current_positions
+        )
+        leaderboard = self._generate_leaderboard(agent_metrics, fund_perf)
+        strategy_perf = self._analyze_strategy_performance(agent_metrics)
+        risk_metrics = self._extract_risk_metrics(risk_assessment, current_positions)
+
         try:
-            # Calculate fund performance metrics
-            fund_perf = self._calculate_fund_performance(
-                agent_metrics,
-                fund_performance,
-                current_positions
-            )
-
-            # Generate agent leaderboard
-            leaderboard = self._generate_leaderboard(agent_metrics, fund_perf)
-
-            # Analyze strategy performance
-            strategy_perf = self._analyze_strategy_performance(agent_metrics)
-
-            # Extract risk metrics
-            risk_metrics = self._extract_risk_metrics(risk_assessment, current_positions)
 
             # Generate strategic recommendations using LLM
-            strategic_recs = await self._generate_strategic_recommendations(
-                fund_perf, leaderboard, strategy_perf, risk_metrics,
-                analyst_report, portfolio_decision, agent_metrics,
-                trade_insights=trade_insights
-            )
+            strategic_recs = []
+            try:
+                strategic_recs = await self._generate_strategic_recommendations(
+                    fund_perf, leaderboard, strategy_perf, risk_metrics,
+                    analyst_report, portfolio_decision, agent_metrics,
+                    trade_insights=trade_insights
+                )
+            except Exception as _llm_err:
+                logger.warning(f"LLM strategic recommendations failed (using defaults): {_llm_err}")
+                strategic_recs = self._default_recommendations(fund_perf, leaderboard)
 
             # Build executive summary
             executive_summary = self._build_executive_summary(
@@ -159,8 +159,19 @@ class CIOAgent:
             return report
 
         except Exception as e:
-            logger.error(f"Fund report generation failed: {e}")
-            return self._default_report(timestamp, period)
+            logger.error(f"Fund report LLM/analysis failed: {e}", exc_info=True)
+            return FundHealthReport(
+                timestamp=timestamp,
+                period=period,
+                fund_performance=fund_perf,
+                agent_leaderboard=leaderboard,
+                strategy_performance=strategy_perf,
+                risk_metrics=risk_metrics,
+                strategic_recommendations=[],
+                executive_summary="LLM analysis unavailable. Leaderboard data shown.",
+                cio_sentiment="neutral",
+                cio_reasoning="Fund performance data available. Strategic analysis pending."
+            )
 
     def _calculate_fund_performance(
         self,
@@ -176,7 +187,7 @@ class CIOAgent:
         total_pnl = sum(m.get('total_pnl', 0) for m in agent_metrics)
         total_runs = sum(m.get('total_runs', 0) for m in agent_metrics)
         winning_runs = sum(
-            int(m.get('win_rate', 0) * m.get('total_runs', 0))
+            int((m.get('win_rate') or 0) * m.get('total_runs', 0))
             for m in agent_metrics
         )
 
@@ -216,7 +227,7 @@ class CIOAgent:
                 agent_id=agent_id,
                 agent_name=agent_name,
                 total_pnl=metric.get('total_pnl', 0),
-                win_rate=metric.get('win_rate', 0),
+                win_rate=metric.get('win_rate', 0) or 0,
                 total_runs=metric.get('total_runs', 0),
                 contribution_pct=contribution_pct,
                 rank=rank

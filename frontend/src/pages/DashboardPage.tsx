@@ -25,6 +25,8 @@ import { MiniChart } from '../components/common/MiniChart';
 import { PerformanceCharts } from '../components/PerformanceCharts';
 import { WhaleIntelligencePanel } from '../components/WhaleIntelligencePanel';
 import PositionsTableComponent from '../components/PositionsTable';
+import PendingOrders from '../components/PendingOrders';
+import LearningDashboard from '../components/LearningDashboard';
 import { timeAgo } from '../utils/timeAgo';
 import { Skeleton, SkeletonCard, SkeletonChart, SkeletonRows, SkeletonStats } from '../components/common/Skeleton';
 
@@ -272,6 +274,9 @@ export function DashboardPage() {
         })}
       </div>
 
+      {/* ── Pending orders ── */}
+      <PendingOrders />
+
       {/* ── Open positions ── */}
       <PositionsTableComponent />
 
@@ -504,6 +509,8 @@ export function DashboardPage() {
 
           <PerformanceCharts />
 
+          <LearningDashboard />
+
           {/* Agent Performance */}
           <div className="panel">
             <div className="panel-header">
@@ -675,29 +682,29 @@ export function DashboardPage() {
               {paperEnabled && paperPnl ? (
                 <>
                   <div className="pnl-display">
-                    <div className="pnl-label">Net Total P&L (After Fees)</div>
+                    <div className="pnl-label" title="Realized P&L minus entry & exit fees. This is your true net profit/loss.">Net Total P&L After Fees</div>
                     <div className={`pnl-value ${paperPnl.total_pnl > 0 ? 'positive' : paperPnl.total_pnl < 0 ? 'negative' : 'neutral'}`}>
                       {paperPnl.total_pnl >= 0 ? '+' : ''}${paperPnl.total_pnl?.toFixed(2) ?? '0.00'}
                     </div>
                     <div className="pnl-subtext">
-                      Gross Realized: {(paperPnl.realized_pnl ?? 0) >= 0 ? '+' : ''}${(paperPnl.realized_pnl ?? 0).toFixed(2)} · {paperPnl.trade_count ?? 0} orders filled
+                      Realized: {(paperPnl.realized_pnl ?? 0) >= 0 ? '+' : ''}${(paperPnl.realized_pnl ?? 0).toFixed(2)} · {paperPnl.trade_count ?? 0} orders filled
                     </div>
                   </div>
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '.5rem', marginTop: '.5rem' }}>
                     <div className="stat-card">
-                      <div className="stat-label">Gross Realized</div>
+                      <div className="stat-label" title="Sum of all entry-to-exit price differences. Does not include fees.">Realized P&L (Gross)</div>
                       <div className={`stat-value ${(paperPnl.realized_pnl ?? 0) >= 0 ? 'positive' : 'negative'}`} style={{ fontSize: '.88rem' }}>
                         {(paperPnl.realized_pnl ?? 0) >= 0 ? '+' : ''}${(paperPnl.realized_pnl ?? 0).toFixed(2)}
                       </div>
                     </div>
                     <div className="stat-card">
-                      <div className="stat-label">Unrealized (Net Exit Fees)</div>
+                      <div className="stat-label" title="Unrealized P&L on open positions, net of estimated exit fees.">Unrealized P&L</div>
                       <div className={`stat-value ${(paperPnl.unrealized_pnl ?? 0) >= 0 ? 'positive' : 'negative'}`} style={{ fontSize: '.88rem' }}>
                         {(paperPnl.unrealized_pnl ?? 0) >= 0 ? '+' : ''}${(paperPnl.unrealized_pnl ?? 0).toFixed(2)}
                       </div>
                     </div>
                     <div className="stat-card">
-                      <div className="stat-label">Total Fees</div>
+                      <div className="stat-label" title="Total entry + exit fees paid across all closed trades.">Total Fees (Paid)</div>
                       <div className="stat-value" style={{ fontSize: '.88rem' }}>${paperPnl.total_fees?.toFixed(2) ?? '0.00'}</div>
                     </div>
                     <div className="stat-card">

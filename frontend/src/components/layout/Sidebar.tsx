@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react';
-import { Activity, Bot, Wallet, Settings, X, TrendingUp, History, Zap, Users, MessageCircle, BarChart2, GitBranch } from 'lucide-react';
+import { Activity, Bot, Wallet, Settings, X, TrendingUp, History, Zap, Users, MessageCircle, BarChart2, GitBranch, Clock } from 'lucide-react';
 import { useAppSelector, useAppDispatch } from '../../store/hooks';
 import { setSidebarOpen } from '../../store/slices/uiSlice';
 import { useAutomationStatus, useAgents, usePaperOrders, useTradeHistory, useFundTeamStatus } from '../../hooks/useQueries';
+import { pendingOrderApi } from '../../lib/api';
 import { NavBadge } from '../common/NavBadge';
 import { SidebarTicker } from '../common/SidebarTicker';
 import { SidebarTeamFeed } from '../common/SidebarTeamFeed';
@@ -86,6 +87,22 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
   );
   const trades24h = liveTrades24h.length + paperTrades24h.length;
 
+  const [pendingCount, setPendingCount] = useState(0);
+
+  useEffect(() => {
+    const fetch = async () => {
+      try {
+        const res = await pendingOrderApi.list();
+        setPendingCount(Array.isArray(res.data) ? res.data.length : 0);
+      } catch {
+        setPendingCount(0);
+      }
+    };
+    fetch();
+    const iv = setInterval(fetch, 15000);
+    return () => clearInterval(iv);
+  }, []);
+
   const sigAction = signal?.action;
 
   const closeSidebar = () => dispatch(setSidebarOpen(false));
@@ -149,6 +166,9 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
           <button type="button" onClick={() => navigate('dashboard')} className={`nav-item ${activePage === 'dashboard' ? 'active' : ''}`}>
             <Activity size={16} />
             <span>Overview</span>
+            {pendingCount > 0 && (
+              <NavBadge variant="amber"><Clock size={10} style={{ marginRight: 2 }} />{pendingCount}</NavBadge>
+            )}
             {sigAction && sigAction !== 'hold' && (
               <NavBadge variant={sigAction === 'buy' ? 'green' : 'red'}>{sigAction.toUpperCase()}</NavBadge>
             )}

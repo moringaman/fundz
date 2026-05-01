@@ -1,3 +1,4 @@
+from datetime import datetime
 from fastapi import APIRouter, HTTPException
 from typing import Optional, List
 from pydantic import BaseModel
@@ -47,7 +48,7 @@ class AgentMetricsResponse(BaseModel):
     sell_signals: int
     hold_signals: int
     last_run: Optional[str]
-    win_rate: float
+    win_rate: Optional[float] = None  # None until at least 1 trade closes
     avg_pnl: float
 
 
@@ -295,3 +296,34 @@ async def unregister_agent_from_automation(agent_id: str):
 @router.get("/registered-agents")
 async def get_registered_agents():
     return {"agents": list(agent_scheduler._enabled_agents.values())}
+
+
+# ── Strategy Learner ─────────────────────────────────────────────────
+
+
+@router.get("/learner/summary")
+async def get_learner_summary():
+    from app.services.strategy_learner import strategy_learner
+    return {"buckets": strategy_learner.summary()}
+
+
+@router.post("/learner/tune")
+async def run_learner_tune(hours: int = 168):
+    from app.services.strategy_learner import strategy_learner
+    changes = await strategy_learner.tune_agents(hours=hours)
+    return {"applied": changes}
+
+
+@router.get("/learner/rl-dataset")
+async def get_rl_dataset(days: int = 30, min_confidence: float = 0.0):
+    from app.services.strategy_learner import build_rl_dataset
+    dataset = await build_rl_dataset(days=days, min_confidence=min_confidence)
+    return {"count": len(dataset), "samples": dataset[:50]}
+
+
+@router.post("/learner/export-openai")
+async def export_openai_dataset(days: int = 30, min_confidence: float = 0.5):
+    from app.services.strategy_learner import export_openai_finetuning_jsonl
+    path = f"/tmp/rl_dataset_{datetime.now().strftime('%Y%m%d')}.jsonl"
+    count = await export_openai_finetuning_jsonl(days=days, output_path=path, min_confidence=min_confidence)
+    return {"path": path, "count": count}

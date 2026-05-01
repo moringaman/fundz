@@ -171,7 +171,8 @@ async def get_team_roster():
     Get the fund management team roster with member info
     """
     try:
-        roles = ['research_analyst', 'technical_analyst', 'portfolio_manager', 'risk_manager', 'execution_coordinator', 'cio_agent']
+        roles = ['research_analyst', 'technical_analyst', 'portfolio_manager', 'risk_manager',
+                  'execution_coordinator', 'cio_agent', 'bullish_researcher', 'bearish_researcher']
         roster = []
 
         for role in roles:
@@ -932,6 +933,68 @@ async def get_trade_retrospective():
 
     fresh = await trade_retrospective.analyze_recent_trades(agents_list)
     return fresh or {"trade_analyses": [], "agent_insights": {}, "parameter_adjustments": [], "summary": "No trades to analyse yet."}
+
+
+@router.get("/trade-retrospective/history")
+async def get_trade_retrospective_history(limit: int = 50, offset: int = 0):
+    """Get historical trade retrospective snapshots for trend dashboard.
+
+    Returns snapshots ordered by analyzed_at descending, each containing
+    headline summary fields (win_rate, trade_count, total_pnl, adjustment_count)
+    plus the full analysis payloads.  Use limit/offset for pagination.
+    """
+    from app.services.trade_retrospective import trade_retrospective
+    snapshots = await trade_retrospective.get_snapshot_history(limit=limit, offset=offset)
+    return {
+        "snapshots": snapshots,
+        "limit": limit,
+        "offset": offset,
+        "count": len(snapshots),
+    }
+
+
+@router.get("/trade-retrospective/adjustments")
+async def get_retro_adjustments(
+    agent_id: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+):
+    """Get parameter adjustment audit trail from the trade retrospective.
+
+    Each entry records an SL/TP change that was actually persisted to an agent's
+    config, with old/new values and the reasoning.  Filter by agent_id to see
+    adjustments for a specific agent.  Useful for correlating adjustments with
+    subsequent PnL / win-rate changes (tracked via agent_metric_records).
+    """
+    from app.database import get_async_session
+    from app.models import RetrospectiveAdjustment
+    from sqlalchemy import select, desc
+
+    async with get_async_session() as db:
+        q = select(RetrospectiveAdjustment)
+        if agent_id:
+            q = q.where(RetrospectiveAdjustment.agent_id == agent_id)
+        q = q.order_by(desc(RetrospectiveAdjustment.created_at)).offset(offset).limit(limit)
+        rows = await db.execute(q)
+        adjustments = rows.scalars().all()
+        return {
+            "adjustments": [
+                {
+                    "id": a.id,
+                    "agent_id": a.agent_id,
+                    "agent_name": a.agent_name,
+                    "adjustment_type": a.adjustment_type,
+                    "old_value": a.old_value,
+                    "new_value": a.new_value,
+                    "reason": a.reason,
+                    "created_at": a.created_at.isoformat() if a.created_at else None,
+                }
+                for a in adjustments
+            ],
+            "limit": limit,
+            "offset": offset,
+            "count": len(adjustments),
+        }
 
 
 # ==================== Trader Endpoints ====================

@@ -440,15 +440,16 @@ class GateAutopilot:
             _set("dead_zone_penalty",      _clamp(defaults.dead_zone_penalty    - 0.04, 0.04, 0.20))
             _set("sr_proximity_block_pct", _clamp(defaults.sr_proximity_block_pct - 0.0015, 0.0025, 0.015))
             _set("circuit_breaker_max_trades", _clamp(defaults.circuit_breaker_max_trades + 5, 20, 60))
+            _set("fast_entry_enabled", True)
             reason = (f"Win rate {wr:.0%} with positive daily PnL → loosened gates to "
-                      f"capture more of the current edge. {trade_sample_summary}")
+                      f"capture more of the current edge. Fast entry enabled. {trade_sample_summary}")
 
         elif regime == REGIME_BALANCED:
             # Restore to defaults
             for field in (
                 "min_entry_confidence", "mtf_mixed_penalty", "mtf_opposed_penalty",
                 "ta_penalty_multiplier", "dead_zone_penalty", "sr_proximity_block_pct",
-                "circuit_breaker_max_trades",
+                "circuit_breaker_max_trades", "fast_entry_enabled",
             ):
                 _set(field, getattr(defaults, field))
             reason = (f"Win rate {wr:.0%} is within balanced range → "
@@ -463,8 +464,9 @@ class GateAutopilot:
             _set("sr_proximity_block_pct", _clamp(defaults.sr_proximity_block_pct + 0.0015, 0.003, 0.02))
             _set("max_position_size_pct",  _clamp(defaults.max_position_size_pct - 1.0, 2.0, 5.0))
             _set("max_open_positions",     max(3, int(defaults.max_open_positions - 1)))
+            _set("fast_entry_enabled", False)
             reason = (f"Win rate {wr:.0%} below target or negative daily PnL → "
-                      f"tightened gates to reduce low-quality entries. {trade_sample_summary}")
+                      f"tightened gates to reduce low-quality entries. Fast entry disabled. {trade_sample_summary}")
 
         elif regime == REGIME_HIGH_CHURN:
             _trades_1h = metrics.get("trades_last_hour", 0)
@@ -472,15 +474,14 @@ class GateAutopilot:
             _set("min_entry_confidence",       _clamp(defaults.min_entry_confidence + 0.10, 0.65, 0.78))
             _set("circuit_breaker_max_trades", _clamp(defaults.circuit_breaker_max_trades - 8, 8, 15))
             _set("fee_coverage_min_ratio",     _clamp(defaults.fee_coverage_min_ratio + 0.5, 3.0, 4.0))
-            # Raise per-trade EV coverage requirement to force higher-quality entries only.
-            # Reads the current gate value (default 3.0) and bumps it upward.
             _current_ev = d.get("min_trade_ev_coverage_ratio", 3.0)
             _set("min_trade_ev_coverage_ratio", _clamp(_current_ev + 2.0, 5.0, 12.0))
             _set("mtf_mixed_penalty",          _clamp(defaults.mtf_mixed_penalty + 0.05, 0.20, 0.35))
+            _set("fast_entry_enabled", False)
             reason = (
                 f"High churn: {_trades_1h} trades in last hour with fee coverage "
                 f"{_coverage:.2f}× — raising entry quality to enforce fewer, larger, "
-                f"higher-quality trades. {trade_sample_summary}"
+                f"higher-quality trades. Fast entry disabled. {trade_sample_summary}"
             )
 
         elif regime == REGIME_FEE_DRAG_MODERATE:
@@ -495,11 +496,12 @@ class GateAutopilot:
             _set("min_notional",               _clamp(defaults.min_notional + 5.0, 10.0, 50.0))
             _set("max_position_size_pct",      _clamp(defaults.max_position_size_pct - 1.0, 2.0, 5.0))
             _set("max_daily_loss_pct",         _clamp(defaults.max_daily_loss_pct - 1.0, 2.0, 5.0))
+            _set("fast_entry_enabled", False)
             reason = (
                 f"Fee drag MODERATE: coverage ratio {_coverage:.2f}x "
                 f"(avg gross ${_avg_gross:.2f} vs avg fee ${_avg_fee:.2f}) — "
                 f"raised entry confidence and fee-coverage guard, reduced daily trade cap "
-                f"to favour fewer higher-quality setups. {trade_sample_summary}"
+                f"to favour fewer higher-quality setups. Fast entry disabled. {trade_sample_summary}"
             )
 
         elif regime == REGIME_FEE_DRAG_SEVERE:
@@ -518,12 +520,13 @@ class GateAutopilot:
             _set("max_position_size_pct",      _clamp(defaults.max_position_size_pct - 2.0, 1.0, 4.0))
             _set("max_daily_loss_pct",         _clamp(defaults.max_daily_loss_pct - 2.0, 1.0, 3.0))
             _set("max_open_positions",         max(2, int(defaults.max_open_positions - 2)))
+            _set("fast_entry_enabled", False)
             reason = (
                 f"Fee drag SEVERE: coverage ratio {_coverage:.2f}x "
                 f"(avg gross ${_avg_gross:.2f} vs avg fee ${_avg_fee:.2f}) — "
                 f"gates aggressively tightened for fewer, larger, higher-conviction trades only. "
                 f"Fee coverage guard raised to {d.get('fee_coverage_min_ratio', 4.0):.1f}x. "
-                f"Daily trade cap → {d.get('circuit_breaker_max_trades', 10)}. {trade_sample_summary}"
+                f"Daily trade cap → {d.get('circuit_breaker_max_trades', 10)}. Fast entry disabled. {trade_sample_summary}"
             )
 
         else:  # DEFENSIVE
@@ -537,8 +540,9 @@ class GateAutopilot:
             _set("max_position_size_pct",  _clamp(defaults.max_position_size_pct - 2.0, 1.0, 3.0))
             _set("max_daily_loss_pct",     _clamp(defaults.max_daily_loss_pct - 2.0, 1.0, 3.0))
             _set("max_open_positions",     max(2, int(defaults.max_open_positions - 2)))
+            _set("fast_entry_enabled", False)
             reason = (f"Win rate {wr:.0%} critically low or {cld} consecutive losing day(s) → "
-                      f"gates significantly tightened. Capital preservation priority. {trade_sample_summary}")
+                      f"gates significantly tightened. Capital preservation priority. Fast entry disabled. {trade_sample_summary}")
 
         # ── Consecutive-loss override (additive on top of regime) ─────────────
         if cld >= 2:

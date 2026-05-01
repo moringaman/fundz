@@ -415,6 +415,24 @@ export function useTradeRetrospective() {
   });
 }
 
+export function useTradeRetrospectiveHistory(limit = 50) {
+  return useQuery({
+    queryKey: ['tradeRetrospectiveHistory', limit],
+    queryFn: () => safeFetch(`/api/fund/trade-retrospective/history?limit=${limit}`),
+    staleTime: 300_000,
+  });
+}
+
+export function useRetroAdjustments(agentId?: string, limit = 50) {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (agentId) params.set('agent_id', agentId);
+  return useQuery({
+    queryKey: ['retroAdjustments', agentId, limit],
+    queryFn: () => safeFetch(`/api/fund/trade-retrospective/adjustments?${params}`),
+    staleTime: 300_000,
+  });
+}
+
 // ─── Settings ────────────────────────────────────────────────────────────────
 export function useSettings() {
   return useQuery({

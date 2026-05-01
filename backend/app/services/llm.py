@@ -91,6 +91,24 @@ class LLMRegistry:
             'max_tokens': 800,
             'avatar': 'https://api.dicebear.com/7.x/avataaars/svg?seed=Jordan%20Blake&gender=male',
             'bio': 'Quantitative trader executing algorithmic strategies and generating entry/exit signals across all pairs.'
+        },
+        'bullish_researcher': {
+            'name': 'Kai Nakamura',
+            'title': 'Bullish Researcher',
+            'model': 'mistralai/mixtral-8x7b-instruct',
+            'temperature': 0.5,
+            'max_tokens': 400,
+            'avatar': 'https://api.dicebear.com/7.x/avataaars/svg?seed=Kai%20Nakamura&gender=male',
+            'bio': 'Constructive market analyst focused on identifying upside potential, momentum catalysts, and bullish narratives. Argues for the thesis.'
+        },
+        'bearish_researcher': {
+            'name': 'Priya Sharma',
+            'title': 'Bearish Researcher',
+            'model': 'mistralai/mixtral-8x7b-instruct',
+            'temperature': 0.5,
+            'max_tokens': 400,
+            'avatar': 'https://api.dicebear.com/7.x/avataaars/svg?seed=Priya%20Sharma&gender=female',
+            'bio': 'Sceptical market analyst specialised in risk identification, downside scenarios, and weak signals. Challenges the thesis.'
         }
     }
 
@@ -665,6 +683,31 @@ IMPORTANT: Weight your decision using team intelligence:
                     f"this is a re-entry opportunity — not a reason to stand down. "
                     f"Re-entries after tight stop-outs are a normal part of mean-reversion and trend strategies. "
                     f"Evaluate the current setup on its own merits.\n"
+                )
+
+            # Trade reflections — narrative lessons from recent closed trades
+            _refs = team_context.get("trade_reflections") if team_context else None
+            if _refs:
+                _ref_lines = []
+                for _r in _refs:
+                    _emoji = "🟢" if (_r.get("pnl") or 0) >= 0 else "🔴"
+                    _ago = f"{_r['days_ago']}d ago" if _r.get("days_ago") else "recent"
+                    _ref_lines.append(f"{_emoji} [{_ago}] {_r['reflection']}")
+                team_section += (
+                    "\n📓 YOUR RECENT TRADE REFLECTIONS (learn from past outcomes):\n"
+                    + "\n".join(f"  {l}" for l in _ref_lines)
+                    + "\n\nReflect on these outcomes before deciding. Identify what worked, "
+                    "what didn't, and whether current market conditions resemble your past wins or losses.\n"
+                )
+
+            # Bull/Bear debate — adversarial market assessment
+            _debate = team_context.get("bull_bear_debate") if team_context else None
+            if _debate:
+                team_section += (
+                    "\n⚔️ BULL vs BEAR RESEARCHER DEBATE (current market outlook):\n"
+                    f"{_debate}\n\n"
+                    "Weigh both sides. If the bear case raises a specific risk you can't "
+                    "dismiss, reduce your confidence or skip the trade.\n"
                 )
 
         return f"""PRICE ACTION:

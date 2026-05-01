@@ -131,9 +131,12 @@ class HyperliquidLiveTradingService:
         leverage: float = 1.0,
         margin_used: Optional[float] = None,
         liquidation_price: Optional[float] = None,
+        order_type: str = "Market",
+        entry_price: Optional[float] = None,
+        pattern_type: Optional[str] = None,
     ) -> Optional[dict]:
         """
-        Place a real Hyperliquid market-open order.
+        Place a real Hyperliquid order (market or limit).
         Creates a local Position record with is_paper=False.
         SL/TP are stored in DB and enforced by the monitoring loop.
         Returns an order result dict or None on failure.
@@ -164,9 +167,27 @@ class HyperliquidLiveTradingService:
         except Exception as exc:
             logger.warning(f"HLTrading: balance check failed (proceeding): {exc}")
 
-        # ── Place Hyperliquid market order ─────────────────────────────────
+        # ── Resolve order type / limit price ───────────────────────────────
+        _use_order_type = order_type or "Market"
+        _limit_price = entry_price if entry_price and _use_order_type != "Market" else None
+        if _use_order_type != "Market" and _limit_price is None:
+            from app.api.routes.settings import get_trading_prefs as _tp_fn
+            _tp = _tp_fn()
+            _offset_bps = float(getattr(_tp, "limit_order_offset_bps", 5.0) or 5.0)
+            _offset_fraction = _offset_bps / 10000.0
+            _limit_price = price * (1 - _offset_fraction) if is_buy else price * (1 + _offset_fraction)
+            _use_order_type = "Limit"
+            logger.info(f"HLTrading: computed limit price {_limit_price:.4f} ({_offset_bps} bps {'below' if is_buy else 'above'} market {price})")
+
+        # ── Place Hyperliquid order ────────────────────────────────────────
         try:
-            result = exchange.market_open(coin, is_buy, quantity, None, slippage=0.01)
+            if _use_order_type == "Market":
+                result = exchange.market_open(coin, is_buy, quantity, None, slippage=0.01)
+            else:
+                result = exchange.order(
+                    coin, is_buy, quantity, _limit_price,
+                    {"limit": {"tif": "Gtc"}},
+                )
             status = (result or {}).get("status", "")
             if status != "ok":
                 logger.error(f"HLTrading: order rejected for {coin}: {result}")

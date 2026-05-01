@@ -358,3 +358,35 @@ async def get_performance_chart(limit: int = 2000):
         })
 
     return rows
+
+
+# ── Pending Orders ─────────────────────────────────────────────────────
+
+
+@router.get("/pending-orders")
+async def list_pending_orders(agent_id: Optional[str] = None):
+    """List all pending (unfilled) limit/stop orders."""
+    return await paper_trading.get_pending_orders(agent_id=agent_id)
+
+
+@router.post("/pending-orders/{order_id}/cancel")
+async def cancel_pending_order(order_id: str):
+    """Cancel a pending order by ID."""
+    ok = await paper_trading.cancel_pending_order(order_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Pending order not found or already filled")
+    return {"status": "cancelled"}
+
+
+@router.post("/pending-orders/cleanup")
+async def cleanup_stale_pending_orders(max_age_minutes: int = 120):
+    """Cancel pending orders older than *max_age_minutes*."""
+    count = await paper_trading.cleanup_stale_pending_orders(max_age_minutes=max_age_minutes)
+    return {"cleaned": count}
+
+
+@router.post("/pending-orders/fill-check")
+async def run_fill_check():
+    """Check all pending orders against current market prices and fill any that have been reached."""
+    count = await paper_trading.fill_pending_orders()
+    return {"filled": count}
