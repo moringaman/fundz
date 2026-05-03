@@ -247,11 +247,22 @@ def snap_to_psychological(
     toward_entry = 1 if entry_price > candidate_price else -1
 
     if is_sl:
-        # SL: move further from entry (past the level)
-        snapped = nearest_psych - margin if toward_entry > 0 else nearest_psych + margin
+        # SL: moved further from entry (past the level).
+        if toward_entry > 0:  # long SL, below entry
+            snapped = nearest_psych - margin
+            snapped = min(snapped, candidate_price)
+        else:                  # short SL, above entry
+            snapped = nearest_psych + margin
+            snapped = max(snapped, candidate_price)
     else:
-        # TP: move closer to entry (just before the level)
-        snapped = nearest_psych + margin if toward_entry > 0 else nearest_psych - margin
+        # TP: moved closer to entry (just before the level).
+        # If the candidate is on the wrong side of entry (shouldn't happen),
+        # don't snap — leave it for the post-snap gate to reject cleanly.
+        if toward_entry == -1:  # candidate above entry — normal long TP / short SL
+            snapped = nearest_psych - margin
+            snapped = max(snapped, entry_price * 1.0005)
+        else:                   # candidate below entry — should be impossible for
+            return candidate_price          # a valid TP. Don't try to fix it.
 
     return round(snapped, 8)
 
@@ -1202,25 +1213,7 @@ class TechnicalAnalyst:
                     reasoning="Descending triangle breakdown: entry at support. Target = triangle height.",
                     timeframe=timeframe,
                 ))
-        
-        # Descending Triangle: falling top, flat bottom -> bearish breakdown
-        elif upper_slope < -0.001 and abs(lower_slope) < 0.001:
-            flat_bottom = min(lows[-5:])
-            if current_price < flat_bottom * 1.002:
-                target = flat_bottom - (current_high - flat_bottom)
-                patterns.append(PatternSignal(
-                    pattern_type="descending_triangle",
-                    direction="bearish",
-                    confidence=0.70,
-                    entry_price=round(flat_bottom * 1.0015, 8),  # Entry at breakdown level
-                    stop_loss=round(current_high * 1.03, 8),
-                    take_profit_1=round(target * 1.002, 8),
-                    take_profit_2=round(target * 0.99, 8),
-                    risk_reward=round((flat_bottom - target) / (current_high - flat_bottom), 2),
-                    reasoning="Descending triangle breakdown: entry at support. Target = triangle height.",
-                    timeframe=timeframe,
-                ))
-        
+
         # Symmetrical Triangle: converging lines -> breakout either way
         elif abs(upper_slope) < 0.002 and abs(lower_slope) < 0.002 and upper_slope * lower_slope < 0:
             triangle_high = max(highs[-5:])
@@ -1256,40 +1249,6 @@ class TechnicalAnalyst:
                         risk_reward=round((triangle_low - target) / (triangle_high - triangle_low), 2),
                         reasoning="Symmetrical triangle breakdown: entry at support. Target = range height.",
                         timeframe=timeframe,
-                    ))
-        
-        # Symmetrical Triangle: converging lines -> breakout either way
-        elif abs(upper_slope) < 0.002 and abs(lower_slope) < 0.002 and upper_slope * lower_slope < 0:
-            triangle_high = max(highs[-5:])
-            triangle_low = min(lows[-5:])
-            range_pct = (triangle_high - triangle_low) / current_price
-            
-            if range_pct < 0.03:  # Tight triangle
-                # Determine breakout direction based on recent momentum
-                recent_move = closes.iloc[-1] - closes.iloc[-5]
-                if recent_move > 0:
-                    patterns.append(PatternSignal(
-                        pattern_type="symmetrical_triangle",
-                        direction="bullish",
-                        confidence=0.60,
-                        entry_price=current_price,
-                        stop_loss=round(triangle_low * 0.98, 8),
-                        take_profit_1=round(triangle_high + range_pct * current_price, 8),
-                        take_profit_2=round(triangle_high + range_pct * 1.5 * current_price, 8),
-                        risk_reward=1.2,
-                        reasoning="Symmetrical triangle converging. Recent momentum up, breakout expected.",
-                    ))
-                else:
-                    patterns.append(PatternSignal(
-                        pattern_type="symmetrical_triangle",
-                        direction="bearish",
-                        confidence=0.60,
-                        entry_price=current_price,
-                        stop_loss=round(triangle_high * 1.02, 8),
-                        take_profit_1=round(triangle_low - range_pct * current_price, 8),
-                        take_profit_2=round(triangle_low - range_pct * 1.5 * current_price, 8),
-                        risk_reward=1.2,
-                        reasoning="Symmetrical triangle converging. Recent momentum down, breakdown expected.",
                     ))
         
         return patterns

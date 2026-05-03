@@ -37,6 +37,7 @@ class PaperTradingService:
     SPOT_FEE_RATE = 0.001    # 0.10% — spot only (not used in this system)
     CONTRACT_FEE_RATE = 0.0006  # 0.06% — all Phemex perpetual contracts (USDT- and coin-margined)
     HYPERLIQUID_FEE_RATE = 0.00035  # 0.035% HL taker — used for venue-accurate paper simulation
+    ALPACA_FEE_RATE = 0.0  # $0 stock/ETF trades on Alpaca
 
     # Per-agent venue cache, populated by agent_scheduler on startup and toggle.
     _agent_venues: Dict[str, str] = {}
@@ -55,7 +56,15 @@ class PaperTradingService:
     def fee_rate_for(cls, symbol: str, venue: str = "hyperliquid") -> float:
         if venue == "hyperliquid":
             return cls.HYPERLIQUID_FEE_RATE
+        if venue == "alpaca":
+            return cls.ALPACA_FEE_RATE
         return cls.CONTRACT_FEE_RATE
+
+    @staticmethod
+    def quote_currency(symbol: str) -> str:
+        """Return the quote currency for a symbol.
+        Crypto pairs end in USDT; stocks (alpaca) don't."""
+        return "USDT" if symbol.endswith("USDT") else "USD"
 
     def __init__(self, phemex_client: Optional[PhemexClient] = None):
         self.logger = logging.getLogger(__name__)
@@ -84,10 +93,13 @@ class PaperTradingService:
     # ------------------------------------------------------------------
 
     async def get_all_balances(self) -> List[PaperBalance]:
-        """Return all paper-trading balances for the default user."""
+        """Return all paper-trading balances for the default user (trading fund only)."""
         async with get_async_session() as db:
             result = await db.execute(
-                select(PaperBalance).where(PaperBalance.user_id == "default-user")
+                select(PaperBalance).where(
+                    PaperBalance.user_id == "default-user",
+                    PaperBalance.fund_type != "accumulation",
+                )
             )
             return result.scalars().all()
 
@@ -197,6 +209,7 @@ class PaperTradingService:
                             status=OrderStatus.PENDING,
                             is_paper=True,
                             created_at=datetime.now(),
+                            phemex_order_id=order_type,  # store "Limit" or "Stop" for fill logic
                         )
                         _pending_db.add(_pending)
                         await _pending_db.commit()
@@ -212,16 +225,17 @@ class PaperTradingService:
             price = float(entry_price)
 
         async with get_async_session() as db:
-            # Ensure USDT balance exists
+            _quote = self.quote_currency(symbol)
             usdt_balance = await db.scalar(
                 select(PaperBalance).where(
                     PaperBalance.user_id == "default-user",
-                    PaperBalance.asset == "USDT",
+                    PaperBalance.asset == _quote,
+                    PaperBalance.fund_type != "accumulation",
                 )
             )
             if not usdt_balance:
                 usdt_balance = PaperBalance(
-                    user_id="default-user", asset="USDT", available=50000.0, locked=0.0
+                    user_id="default-user", asset=_quote, available=50000.0, locked=0.0
                 )
                 db.add(usdt_balance)
                 await db.flush()
@@ -831,11 +845,13 @@ class PaperTradingService:
                 margin_release = (pos.margin_used or 0.0) * close_ratio
                 pos.margin_used = max((pos.margin_used or 0.0) - margin_release, 0.0)
 
-            # Credit USDT balance with the proceeds from closing this slice
+            # Credit quote balance with the proceeds from closing this slice
+            _close_quote = self.quote_currency(pos.symbol)
             usdt_balance = await db.scalar(
                 select(PaperBalance).where(
                     PaperBalance.user_id == pos.user_id,
-                    PaperBalance.asset == "USDT",
+                    PaperBalance.asset == _close_quote,
+                    PaperBalance.fund_type != "accumulation",
                 )
             )
             if usdt_balance is not None:
@@ -946,17 +962,29 @@ class PaperTradingService:
                 continue
             if market_price <= 0:
                 continue
-            # Determine whether the order should fill at this price
+            # Determine whether the order should fill at this price.
+            # Respect the original order type (Limit vs Stop) stored in phemex_order_id.
             _side = o.side.value if hasattr(o.side, "value") else str(o.side)
             _entry = o.price
+            _order_type = getattr(o, 'phemex_order_id', 'Limit') or 'Limit'
             _tol = _entry * 0.003  # 0.3% tolerance
             should_fill = False
-            if _side.lower() == "buy":
-                if market_price <= _entry + _tol:
-                    should_fill = True
+            if _order_type == "Limit":
+                # Limit: price must REACH the entry level
+                if _side.lower() == "buy":
+                    if market_price <= _entry + _tol:
+                        should_fill = True
+                else:
+                    if market_price >= _entry - _tol:
+                        should_fill = True
             else:
-                if market_price >= _entry - _tol:
-                    should_fill = True
+                # Stop: price must BREAK THROUGH the entry level
+                if _side.lower() == "buy":
+                    if market_price >= _entry - _tol:
+                        should_fill = True
+                else:
+                    if market_price <= _entry + _tol:
+                        should_fill = True
             if not should_fill:
                 continue
             # Fill the order — execute the same logic as place_order would
@@ -970,16 +998,18 @@ class PaperTradingService:
     async def _execute_pending_fill(self, order: PaperOrder, fill_price: float) -> None:
         """Execute a pending order at *fill_price* — creates position, deducts balance, etc."""
         from app.models import Position as PaperPosition, Balance as PaperBalance
+        _pend_quote = self.quote_currency(order.symbol)
         async with get_async_session() as db:
             usdt_balance = await db.scalar(
                 select(PaperBalance).where(
                     PaperBalance.user_id == "default-user",
-                    PaperBalance.asset == "USDT",
+                    PaperBalance.asset == _pend_quote,
+                    PaperBalance.fund_type != "accumulation",
                 )
             )
             if not usdt_balance:
                 usdt_balance = PaperBalance(
-                    user_id="default-user", asset="USDT", available=50000.0, locked=0.0
+                    user_id="default-user", asset=_pend_quote, available=50000.0, locked=0.0
                 )
                 db.add(usdt_balance)
                 await db.flush()
@@ -995,7 +1025,8 @@ class PaperTradingService:
             order.status = OrderStatus.FILLED
             order.filled_at = datetime.now()
 
-            # Deduct fee
+            # Deduct notional + fee from quote balance
+            usdt_balance.available -= notional
             usdt_balance.available -= fee
 
             side_str = order.side.value if hasattr(order.side, "value") else str(order.side)
@@ -1513,13 +1544,35 @@ class PaperTradingService:
             await db.execute(
                 delete(PaperPosition).where(PaperPosition.user_id == "default-user")
             )
+            # Preserve accumulation fund balances — don't wipe on trading reset.
+            _acc_balances = {}
+            for _ab in (await db.execute(
+                select(PaperBalance).where(
+                    PaperBalance.user_id == "default-user",
+                    PaperBalance.fund_type == "accumulation",
+                )
+            )).scalars().all():
+                _acc_balances[_ab.asset] = {"available": _ab.available, "locked": _ab.locked}
             await db.execute(
-                delete(PaperBalance).where(PaperBalance.user_id == "default-user")
+                delete(PaperBalance).where(
+                    PaperBalance.user_id == "default-user",
+                    PaperBalance.fund_type != "accumulation",
+                )
             )
-            for asset, amount in [("BTC", 1.0), ("USDT", 50000.0), ("ETH", 10.0), ("SOL", 100.0)]:
+            # Re-seed trading balances
+            for asset, amount in [("BTC", 1.0), ("USDT", 50000.0), ("ETH", 10.0), ("SOL", 100.0), ("USD", 50000.0)]:
                 db.add(
                     PaperBalance(
                         user_id="default-user", asset=asset, available=amount, locked=0.0
+                    )
+                )
+            # Restore accumulation balances
+            for _asset, _bal in _acc_balances.items():
+                db.add(
+                    PaperBalance(
+                        user_id="default-user", asset=_asset,
+                        available=_bal["available"], locked=_bal["locked"],
+                        fund_type="accumulation",
                     )
                 )
             await db.commit()

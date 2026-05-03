@@ -78,6 +78,7 @@ class TradingPreferences(BaseModel):
     default_symbol: str = "BTCUSDT"
     default_timeframe: str = "1h"
     paper_trading_default: bool = True
+    accumulation_live_enabled: bool = False
     auto_confirm_orders: bool = False
     default_order_type: str = "limit"
     use_limit_orders: bool = Field(
@@ -99,8 +100,6 @@ class TradingPreferences(BaseModel):
     trading_pairs: list[str] = Field(
         default=[
             "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT",
-            "DOGEUSDT", "BNBUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT",
-            "MATICUSDT", "LTCUSDT", "UNIUSDT", "ATOMUSDT", "NEARUSDT",
         ]
     )
 
@@ -239,6 +238,9 @@ class TradingGates(BaseModel):
     # ── Bull/Bear Debate ────────────────────────────────────────────────
     bull_bear_mode: str = Field(default="deterministic",
         description="'llm' = two adversarial LLM calls for bull/bear case; 'deterministic' = heuristic from TA indicators")
+    # ── Minimum Net TP ─────────────────────────────────────────────────
+    min_net_tp_pct: float = Field(default=0.50, ge=0.10, le=5.0,
+        description="Minimum net TP % after fees. Trades with smaller net profit are rejected. Lower for HL (0.035% fees), higher for Phemex (0.06%).")
     # ── Daily Fee Budget Circuit Breaker ──────────────────────────────────────
     # Hard stop that prevents new entries when cumulative daily fees exceed this
     # percentage of starting capital. Prevents fee bleed from consuming profits.

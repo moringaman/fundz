@@ -252,3 +252,6 @@ Subtle audio cues to give the dashboard a live trading-floor feel. Sounds play i
 - [ ] WebSocket-based real-time P&L streaming
 - [ ] Role-based access control and multi-user support
 - [ ] Telegram / Discord alert integration
+- [ ] **Trading idea overlay on positions** — show entry rationale + MiniChart on position hover. Carry `signal_reasoning` and `entry_indicators` from signals onto Position/Trade models; add tooltip popover (`@floating-ui/react` or similar) on position rows in `PositionsTable` showing the original reasoning, entry zone, and a MiniChart of price action around entry.
+- [ ] **Modular refactor: split `agent_scheduler.py` (~7,700 lines)** into focused modules: gates/ (fee, concentration, risk, TA, backtest gates), position_sizing.py, position_monitor.py, team_analysis.py, agent_context.py, strategy_actions.py, metrics_persistence.py
+- [ ] **Modular refactor: split `technical_analyst.py` (~1,800 lines)** into: patterns.py (7 pattern detectors), indicators.py (RSI/MACD/EMA/candle signals), levels.py (S/R, fib, pivot, round numbers), snapping.py (psychological/structural snap functions)

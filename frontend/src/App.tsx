@@ -16,6 +16,7 @@ import { TradingPage } from './pages/TradingPage';
 import { AgentsPage } from './pages/AgentsPage';
 import { AutomationPage } from './pages/AutomationPage';
 import { HistoryPage } from './pages/HistoryPage';
+import AccumulationPage from './pages/AccumulationPage';
 import { FundTeamPage } from './pages/FundTeamPage';
 import { TradersPage } from './pages/TradersPage';
 import { FirmAdvisorPage } from './pages/FirmAdvisorPage';
@@ -32,6 +33,7 @@ const routeToPage: Record<string, string> = {
   '/trading': 'trading',
   '/agents': 'agents',
   '/automation': 'automation',
+  '/accumulation': 'accumulation',
   '/history': 'history',
   '/fund-team': 'fundteam',
   '/traders': 'traders',
@@ -83,6 +85,7 @@ function App() {
           <Route path="/trading" element={<TradingPage timeframe={timeframe} onTimeframeChange={setTimeframe} />} />
           <Route path="/agents" element={<AgentsPage />} />
           <Route path="/automation" element={<AutomationPage />} />
+          <Route path="/accumulation" element={<AccumulationPage />} />
           <Route path="/history" element={<HistoryPage />} />
           <Route path="/fund-team" element={<FundTeamPage />} />
           <Route path="/traders" element={<TradersPage />} />

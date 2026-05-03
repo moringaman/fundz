@@ -580,7 +580,10 @@ IMPORTANT: Respond with ONLY the JSON array, no markdown fences, no preamble tex
         """Return safe default recommendations"""
         recommendations = []
 
-        if fund_perf.get('total_pnl', 0) < 0:
+        # Only flag drawdown when losses are material (>$50) — small negatives
+        # from historical fee bleed (wrong fee rate era) aren't active drawdown.
+        _pnl = fund_perf.get('total_pnl', 0) or 0
+        if _pnl < -50:
             recommendations.append(StrategicRecommendation(
                 recommendation="reduce_risk",
                 target="portfolio",

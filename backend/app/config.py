@@ -54,6 +54,10 @@ class Settings(BaseSettings):
     hyperliquid_wallet_address: Optional[str] = None
     hyperliquid_wallet_key: Optional[str] = None
 
+    alpaca_api_key: Optional[str] = None
+    alpaca_secret_key: Optional[str] = None
+    alpaca_paper: bool = True
+
     llm_provider: str = "openrouter"
     openai_api_key: Optional[str] = None
     anthropic_api_key: Optional[str] = None

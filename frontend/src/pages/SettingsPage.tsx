@@ -171,6 +171,7 @@ export function SettingsPage() {
     dead_zone_noop_enabled: true,
     dead_zone_penalty: 0.15,
     bull_bear_mode: 'deterministic',
+    min_net_tp_pct: 0.50,
   });
 
   // Hydrate forms from server data
@@ -1426,6 +1427,15 @@ export function SettingsPage() {
                 <input type="number" step="0.1" min="0.5" max="10.0" className="settings-input"
                   value={gatesForm.fee_coverage_min_ratio}
                   onChange={e => setGatesForm(p => ({ ...p, fee_coverage_min_ratio: parseFloat(e.target.value) }))} />
+              </div>
+               <div>
+                <label className="settings-label">Minimum Net TP %</label>
+                <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', marginBottom: '.3rem' }}>
+                  Trades with net profit below this % after fees are rejected. Lower for HL (0.035% fees), higher for Phemex (0.06%).
+                </p>
+                <input type="number" step="0.05" min="0.10" max="5.0" className="settings-input"
+                  value={gatesForm.min_net_tp_pct}
+                  onChange={e => setGatesForm(p => ({ ...p, min_net_tp_pct: parseFloat(e.target.value) }))} />
               </div>
               <div>
                 <label className="settings-label">Guard Activation Fees (USD)</label>

@@ -63,6 +63,7 @@ logs/
 # Database
 *.db
 *.sqlite3
+fundz_backup.sql
 
 # Docker
 *.pid

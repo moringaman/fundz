@@ -1175,6 +1175,43 @@ class AgentScheduler:
                 except Exception as _tune_err:
                     logger.debug(f"Bayesian tuning failed: {_tune_err}")
 
+                # ACCUMULATION FUND: Run DCA / value-averaging / dip checks daily
+                try:
+                    from app.services.accumulation_service import accumulation_service as _acc
+                    _acc_results = await _acc.run_dca()
+                    if _acc_results:
+                        logger.info(f"Accumulation DCA: {len(_acc_results)} buys executed")
+                    _va_results = await _acc.run_value_averaging()
+                    if _va_results:
+                        logger.info(f"Accumulation VA: {len(_va_results)} buys executed")
+                    _dip_results = await _acc.run_dip_checks()
+                    if _dip_results:
+                        logger.info(f"Accumulation dip buys: {len(_dip_results)} executed")
+                    _so_results = await _acc.check_scale_outs()
+                    if _so_results:
+                        for _so in _so_results:
+                            logger.info(
+                                f"Scale-out: sold {_so['quantity']:.4f} {_so['asset']} "
+                                f"→ transferred ${_so['transferred']:.2f} to trading fund"
+                            )
+                            from app.services.telegram_service import telegram_service as _tg_sc
+                            asyncio.create_task(_send_telegram(_tg_sc.send(
+                                f"📤 *Scale-Out Executed*\n\n"
+                                f"Sold {_so['quantity']:.4f} {_so['asset']} @ ${_so['price']:.4f}\n"
+                                f"Gain: +{_so['gain_pct']:.1f}%\n"
+                                f"Transferred ${_so['transferred']:.2f} → Trading Fund"
+                            )))
+                    _low_bal = await _acc.check_low_balance(min_usdt=200.0)
+                    if _low_bal is not None:
+                        from app.services.telegram_service import telegram_service as _tg_lb
+                        asyncio.create_task(_send_telegram(_tg_lb.send(
+                            f"⚠️ *Accumulation Fund Low Balance*\n\n"
+                            f"USDT remaining: `${_low_bal:.2f}`\n"
+                            f"Deposit more funds for upcoming DCA buys."
+                        )))
+                except Exception as _acc_err:
+                    logger.error(f"Accumulation cycle failed: {_acc_err}")
+
                 # DAILY REPORT TIER: Generate once per hour (catches end-of-day)
                 await self._maybe_generate_daily_report()
 
@@ -1652,10 +1689,11 @@ class AgentScheduler:
         def _hhmm_to_mins(h: int) -> int:
             return (h // 100) * 60 + (h % 100)
 
-        in_blackout          = blackout_enabled and blackout_start <= hhmm < blackout_end
-        in_confirmation      = blackout_end <= hhmm < confirm_end
-        in_preopen           = preopen_tighten and preopen_tighten_t <= hhmm < blackout_start
-        in_london_fakeout    = london_fakeout_enabled and london_fakeout_start <= hhmm < london_fakeout_end
+        _is_weekday = now_utc.weekday() < 5
+        in_blackout          = blackout_enabled and _is_weekday and blackout_start <= hhmm < blackout_end
+        in_confirmation      = _is_weekday and blackout_end <= hhmm < confirm_end
+        in_preopen           = preopen_tighten and _is_weekday and preopen_tighten_t <= hhmm < blackout_start
+        in_london_fakeout    = london_fakeout_enabled and _is_weekday and london_fakeout_start <= hhmm < london_fakeout_end
         if dead_zone_start <= dead_zone_end:
             in_dead_zone = dead_zone_enabled and dead_zone_start <= hhmm < dead_zone_end
         else:
@@ -1679,8 +1717,10 @@ class AgentScheduler:
             session = "us_open_confirmation"
         elif hhmm < dead_zone_start:
             session = "us_session"
-        else:
+        elif dead_zone_noop_enabled:
             session = "dead_zone"
+        else:
+            session = "overnight"
 
         return {
             "session": session,
@@ -3273,6 +3313,10 @@ class AgentScheduler:
             except Exception as e:
                 logger.error(f"Team Tier: perf/consistency update failed: {e}")
 
+            # Agent count cap: run before strategy actions so newly-enabled agents
+            # aren't immediately re-disabled by the cap in the same cycle.
+            await self._apply_agent_count_cap(agents_list)
+
             # 2.5 Strategy Review: FM + TA joint evaluation (every 20 minutes)
             try:
                 if self._last_team_analysis is None or \
@@ -3486,7 +3530,6 @@ class AgentScheduler:
             except Exception as e:
                 logger.error(f"Team Tier: CIO report failed: {e}")
 
-            await self._apply_agent_count_cap(agents_list)
             await self._refresh_calibration()
 
             try:
@@ -4811,12 +4854,11 @@ class AgentScheduler:
             pnl = None
             _effective_min_entry_conf = None
             _effective_conf_floor = None
-            _min_net_tp_pct = 0.50
-
             try:
                 from app.api.routes.settings import get_trading_gates as _get_gates
                 _entry_gates = _get_gates()
                 _min_entry_conf = _entry_gates.min_entry_confidence
+                _min_net_tp_pct = getattr(_entry_gates, 'min_net_tp_pct', 0.50)
                 _ta_veto_conf = _entry_gates.ta_veto_confidence
                 _conf_ref = _entry_gates.confidence_size_reference
                 _conf_floor = _entry_gates.confidence_size_floor
@@ -5064,7 +5106,7 @@ class AgentScheduler:
             if signal in ('buy', 'sell') and confidence > 0:
                 _dz_sess = _us_gate_sess  # reuse session info
                 _dz_trending_strategies = ('momentum', 'breakout', 'ema_crossover', 'ai', 'default')
-                if _dz_sess.get("in_dead_zone") and strategy_type in _dz_trending_strategies:
+                if _dz_sess.get("in_dead_zone") and _dz_sess.get("dead_zone_noop_enabled", True) and strategy_type in _dz_trending_strategies:
                     _dz_penalty  = _dz_sess["dead_zone_penalty"]
                     _dz_min_conf = _dz_sess["dead_zone_min_conf"]
                     _pre_dz_conf = confidence
@@ -5319,6 +5361,8 @@ class AgentScheduler:
                 _is_spot = symbol.endswith("USDT")
                 if _agent_fee_venue == "hyperliquid":
                     _taker_fee_pct = 0.035  # HL perps: 0.035% taker (flat, all pairs)
+                elif _agent_fee_venue == "alpaca":
+                    _taker_fee_pct = 0.0  # $0 stock/ETF trades on Alpaca
                 else:
                     _taker_fee_pct = 0.10 if _is_spot else 0.06
                 round_trip_fee_pct = _taker_fee_pct * 2
@@ -5484,6 +5528,14 @@ class AgentScheduler:
 
                 # Cap at 95% of available USDT to avoid overdrafts
                 position_value = min(target_position_value, usdt_balance * 0.95)
+                # Hard cap: single trade's margin must not exceed max exposure % of total fund
+                from app.api.routes.settings import get_risk_limits as _get_rl
+                _max_exposure_pct = getattr(_get_rl(), 'exposure_threshold_pct', 80.0)
+                position_value = min(position_value, total_fund * _max_exposure_pct / 100)
+                # Also cap by base directional concentration limit so the position
+                # doesn't get immediately rejected by the concentration gate.
+                _base_conc = getattr(_get_rl(), 'max_directional_concentration_pct', 40.0)
+                position_value = min(position_value, total_fund * _base_conc / 100)
                 current_positions = await self._get_current_positions()
                 leverage_meta = await self._determine_leverage(
                     side=signal,
@@ -5739,25 +5791,37 @@ class AgentScheduler:
                     for _p in _all_open:
                         if _p.side == _target_side:
                             _dir_value += await _p_margin_async(_p)
+                    _existing_dir_pct = _dir_value / total_fund * 100 if total_fund > 0 else 0
                     _new_dir_pct = (_dir_value + position_value) / total_fund * 100 if total_fund > 0 else 0
                     if _new_dir_pct > _max_conc_pct:
-                        _conc_reason = (
-                            f"Directional concentration limit: adding this position would put "
-                            f"{_new_dir_pct:.0f}% of fund in {_direction_label} (max {_max_conc_pct:.0f}%)"
-                        )
-                        if _conc_boost_source:
-                            _conc_reason += f" [dynamic: {_conc_boost_source}]"
-                        logger.info(f"Concentration gate: {_conc_reason}")
-                        self._record_run(agent_id, symbol, signal, confidence, current_price, False, error=_conc_reason)
-                        await team_chat.log_trade_blocked(
-                            trader_name=_trader_name, trader_avatar=_trader_avatar,
-                            agent_name=name, symbol=symbol, side=signal,
-                            reason=_conc_reason,
-                        )
-                        return AgentRun(
-                            agent_id=agent_id, timestamp=datetime.now(), symbol=symbol,
-                            signal="hold", confidence=0, price=current_price,
-                            executed=False, error=_conc_reason,
+                        _remaining_pct = max(0.0, _max_conc_pct - _existing_dir_pct)
+                        if _remaining_pct <= 0.5:
+                            _conc_reason = (
+                                f"Directional concentration limit: already {_existing_dir_pct:.0f}% "
+                                f"in {_direction_label} (max {_max_conc_pct:.0f}%)"
+                            )
+                            logger.info(f"Concentration gate: {_conc_reason}")
+                            self._record_run(agent_id, symbol, signal, confidence, current_price, False, error=_conc_reason)
+                            await team_chat.log_trade_blocked(
+                                trader_name=_trader_name, trader_avatar=_trader_avatar,
+                                agent_name=name, symbol=symbol, side=signal,
+                                reason=_conc_reason,
+                            )
+                            return AgentRun(
+                                agent_id=agent_id, timestamp=datetime.now(), symbol=symbol,
+                                signal="hold", confidence=0, price=current_price,
+                                executed=False, error=_conc_reason,
+                            )
+                        # Downsize the trade to fit within the concentration limit
+                        _old_val = position_value
+                        position_value = total_fund * _remaining_pct / 100
+                        quantity = position_value / current_price if current_price > 0 else 0
+                        margin_used = position_value
+                        leveraged_notional = position_value
+                        logger.info(
+                            f"Concentration resize: {_direction_label} {symbol} "
+                            f"${_old_val:.0f}→${position_value:.0f} "
+                            f"({_remaining_pct:.1f}% room, max {_max_conc_pct:.0f}%)"
                         )
 
                     _max_corr_pct = getattr(_limits, "max_correlated_exposure_pct", 30.0) or 30.0
@@ -5786,18 +5850,41 @@ class AgentScheduler:
                         max_correlated_exposure_pct=_max_corr_pct,
                     )
                     if not _corr_check.allowed:
-                        logger.info(f"Correlation gate: {_corr_check.reason}")
-                        self._record_run(agent_id, symbol, signal, confidence, current_price, False, error=_corr_check.reason)
-                        await team_chat.log_trade_blocked(
-                            trader_name=_trader_name, trader_avatar=_trader_avatar,
-                            agent_name=name, symbol=symbol, side=signal,
-                            reason=_corr_check.reason,
-                        )
-                        return AgentRun(
-                            agent_id=agent_id, timestamp=datetime.now(), symbol=symbol,
-                            signal="hold", confidence=0, price=current_price,
-                            executed=False, error=_corr_check.reason,
-                        )
+                        # Calculate room remaining within the correlation limit
+                        _existing_margin = 0.0
+                        for _cp in _current_for_corr:
+                            _cm = float(_cp.get("margin_used") or 0)
+                            if _cm <= 0:
+                                _cq = float(_cp.get("quantity") or 0)
+                                _cp_ = float(_cp.get("current_price") or _cp.get("entry_price") or 0)
+                                _cl = max(float(_cp.get("leverage") or 1.0), 1.0)
+                                _cm = _cq * _cp_ / _cl
+                            _existing_margin += _cm
+                        _corr_room = max(0.0, total_fund * _max_corr_pct / 100 - _existing_margin)
+                        if _corr_room > 10:
+                            _old_margin = position_value
+                            position_value = min(position_value, _corr_room)
+                            quantity = position_value / current_price if current_price > 0 else 0
+                            margin_used = position_value
+                            leveraged_notional = position_value
+                            logger.info(
+                                f"Correlation resize: {_direction_label} {symbol} "
+                                f"${_old_margin:.0f}→${position_value:.0f} "
+                                f"(room={_corr_room:.0f}, max_corr={_max_corr_pct:.0f}%)"
+                            )
+                        else:
+                            logger.info(f"Correlation gate: {_corr_check.reason}")
+                            self._record_run(agent_id, symbol, signal, confidence, current_price, False, error=_corr_check.reason)
+                            await team_chat.log_trade_blocked(
+                                trader_name=_trader_name, trader_avatar=_trader_avatar,
+                                agent_name=name, symbol=symbol, side=signal,
+                                reason=_corr_check.reason,
+                            )
+                            return AgentRun(
+                                agent_id=agent_id, timestamp=datetime.now(), symbol=symbol,
+                                signal="hold", confidence=0, price=current_price,
+                                executed=False, error=_corr_check.reason,
+                            )
                 # ── End correlation limit ─────────────────────────────────────
                 # (technical_report already fetched above for dynamic limits)
                 # Only veto if TA has OPPOSITE signal (not just different) with high confidence
@@ -5895,8 +5982,22 @@ class AgentScheduler:
                 _is_short_signal = signal.lower() == 'sell'
 
                 if technical_report.patterns:
-                    best_pattern = max(technical_report.patterns, key=lambda p: p.confidence)
-                    if best_pattern.stop_loss and best_pattern.take_profit_1:
+                    # Filter patterns by direction — only use patterns that
+                    # match the trade signal. A bearish pattern's TP below
+                    # entry makes no sense for a long position.
+                    _target_dir = "bearish" if signal == "sell" else "bullish"
+                    _aligned = [p for p in technical_report.patterns if getattr(p, "direction", "") == _target_dir]
+                    if not _aligned:
+                        best_pattern = None
+                    else:
+                        best_pattern = max(_aligned, key=lambda p: p.confidence)
+                        _target_dir_label = "bullish" if not _is_short_signal else "bearish"
+                        logger.info(
+                            f"Pattern override: selected {best_pattern.pattern_type} "
+                            f"({best_pattern.confidence:.0%} conf, {_target_dir_label}) "
+                            f"for {signal.upper()} {symbol}"
+                        )
+                    if best_pattern and best_pattern.stop_loss and best_pattern.take_profit_1:
                         # SL: take the MORE CONSERVATIVE of TA vs risk manager
                         # For longs SL is below entry → tighter = higher → max()
                         # For shorts SL is above entry → tighter = lower → min()
@@ -6884,7 +6985,7 @@ class AgentScheduler:
             target_id = None
             target_name = rec.target
             # Resolve target to agent id — try exact match first, then by strategy_type
-            if rec.target and rec.target != "portfolio":
+            if rec.target:
                 agent = agents_by_id.get(rec.target) or agents_by_name.get(rec.target.lower())
                 if not agent:
                     # Target may be a strategy type (e.g. "ai", "momentum") — pick the
@@ -7571,7 +7672,7 @@ class AgentScheduler:
                                     _new_venue = params["venue"]
                                     # Hyperliquid is always valid for paper trading;
                                     # live execution gates on the wallet key at order time.
-                                    _new_venue = _new_venue if _new_venue in ("phemex", "hyperliquid") else "phemex"
+                                    _new_venue = _new_venue if _new_venue in ("phemex", "hyperliquid", "alpaca") else "phemex"
                                     agent.venue = _new_venue
                                     changed.append(f"venue={_new_venue}")
                                     # Update in-memory routing immediately

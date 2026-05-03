@@ -50,6 +50,9 @@ class TradingService:
         if venue == "hyperliquid":
             from app.services.hl_live_trading import hl_live_trading
             return hl_live_trading
+        if venue == "alpaca":
+            from app.services.alpaca_live_trading import alpaca_live_trading
+            return alpaca_live_trading
         from app.services.live_trading import live_trading
         return live_trading
 

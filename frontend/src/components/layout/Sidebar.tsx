@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Activity, Bot, Wallet, Settings, X, TrendingUp, History, Zap, Users, MessageCircle, BarChart2, GitBranch, Clock } from 'lucide-react';
+import { Activity, Bot, Wallet, Settings, X, TrendingUp, History, Zap, Users, MessageCircle, BarChart2, GitBranch, Clock, PiggyBank } from 'lucide-react';
 import { useAppSelector, useAppDispatch } from '../../store/hooks';
 import { setSidebarOpen } from '../../store/slices/uiSlice';
 import { useAutomationStatus, useAgents, usePaperOrders, useTradeHistory, useFundTeamStatus } from '../../hooks/useQueries';
@@ -247,6 +247,12 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
           <button type="button" onClick={() => navigate('workflows')} className={`nav-item ${activePage === 'workflows' ? 'active' : ''}`}>
             <GitBranch size={16} />
             <span>Workflows</span>
+          </button>
+
+          {/* Accumulation */}
+          <button type="button" onClick={() => navigate('accumulation')} className={`nav-item ${activePage === 'accumulation' ? 'active' : ''}`}>
+            <PiggyBank size={16} />
+            <span>Accumulation</span>
           </button>
 
           {/* Settings */}

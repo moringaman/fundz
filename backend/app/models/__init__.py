@@ -252,9 +252,41 @@ class Balance(Base):
     asset = Column(String(10), nullable=False)
     available = Column(Float, default=0.0)
     locked = Column(Float, default=0.0)
+    fund_type = Column(String(20), default="trading")  # "trading" | "accumulation"
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     user = relationship("User", back_populates="balances")
+
+
+class AccumulationConfig(Base):
+    """Persistent config for the accumulation fund — DCA schedules, targets, scale-out rules."""
+    __tablename__ = "accumulation_config"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    user_id = Column(String(36), ForeignKey("users.id"), nullable=False)
+    asset = Column(String(20), nullable=False)
+    enabled = Column(Boolean, default=True)
+    # DCA
+    dca_enabled = Column(Boolean, default=False)
+    dca_amount_usd = Column(Float, default=50.0)
+    dca_interval_hours = Column(Integer, default=168)    # 7 days
+    dca_next_at = Column(DateTime(timezone=True), nullable=True)
+    # Value averaging
+    va_enabled = Column(Boolean, default=False)
+    va_target_growth_rate = Column(Float, default=1.0)   # % per period
+    va_period_hours = Column(Integer, default=168)
+    va_next_at = Column(DateTime(timezone=True), nullable=True)
+    # Dip buying
+    dip_enabled = Column(Boolean, default=False)
+    dip_levels = Column(JSON, default=list)               # [{-5%, $50}, {-10%, $100}]
+    # Scale-out (bull market profit-taking → trading fund)
+    scale_out_enabled = Column(Boolean, default=False)
+    scale_out_target_pct = Column(Float, default=30.0)   # portfolio gain % to trigger
+    scale_out_tranche_pct = Column(Float, default=10.0)  # % of position to sell
+    scale_out_max_transfers = Column(Integer, default=4) # max times to scale out per asset
+    scale_out_count = Column(Integer, default=0)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
 class ArchivedTrade(Base):

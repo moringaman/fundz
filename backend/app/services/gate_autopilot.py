@@ -474,6 +474,7 @@ class GateAutopilot:
             _set("min_entry_confidence",       _clamp(defaults.min_entry_confidence + 0.10, 0.65, 0.78))
             _set("circuit_breaker_max_trades", _clamp(defaults.circuit_breaker_max_trades - 8, 8, 15))
             _set("fee_coverage_min_ratio",     _clamp(defaults.fee_coverage_min_ratio + 0.5, 3.0, 4.0))
+            _set("min_net_tp_pct",             _clamp(defaults.min_net_tp_pct + 0.25, 0.60, 1.50))
             _current_ev = d.get("min_trade_ev_coverage_ratio", 3.0)
             _set("min_trade_ev_coverage_ratio", _clamp(_current_ev + 2.0, 5.0, 12.0))
             _set("mtf_mixed_penalty",          _clamp(defaults.mtf_mixed_penalty + 0.05, 0.20, 0.35))
@@ -490,6 +491,7 @@ class GateAutopilot:
             _avg_fee   = metrics.get("avg_fee_per_trade", 0.0) or 0.0
             _set("min_entry_confidence",       _clamp(defaults.min_entry_confidence + 0.08, 0.62, 0.75))
             _set("fee_coverage_min_ratio",     _clamp(defaults.fee_coverage_min_ratio + 0.5, 3.0, 4.0))
+            _set("min_net_tp_pct",             _clamp(defaults.min_net_tp_pct + 0.15, 0.55, 1.00))
             _set("circuit_breaker_max_trades", _clamp(defaults.circuit_breaker_max_trades - 5, 12, 20))
             _set("confidence_size_floor",      _clamp(defaults.confidence_size_floor + 0.05, 0.30, 0.45))
             _set("mtf_mixed_penalty",          _clamp(defaults.mtf_mixed_penalty + 0.05, 0.20, 0.35))
@@ -510,6 +512,7 @@ class GateAutopilot:
             _avg_fee   = metrics.get("avg_fee_per_trade", 0.0) or 0.0
             _set("min_entry_confidence",       _clamp(defaults.min_entry_confidence + 0.15, 0.72, 0.82))
             _set("fee_coverage_min_ratio",     _clamp(defaults.fee_coverage_min_ratio + 1.5, 4.0, 6.0))
+            _set("min_net_tp_pct",             _clamp(defaults.min_net_tp_pct + 0.50, 0.75, 2.00))
             _set("circuit_breaker_max_trades", _clamp(defaults.circuit_breaker_max_trades - 10, 8, 15))
             _set("confidence_size_floor",      _clamp(defaults.confidence_size_floor + 0.10, 0.35, 0.50))
             _set("confidence_size_reference",  _clamp(defaults.confidence_size_reference - 0.05, 0.72, 0.85))
@@ -536,6 +539,7 @@ class GateAutopilot:
             _set("ta_penalty_multiplier",  _clamp(defaults.ta_penalty_multiplier + 0.12, 0.48, 0.70))
             _set("dead_zone_penalty",      _clamp(defaults.dead_zone_penalty    + 0.08, 0.20, 0.40))
             _set("sr_proximity_block_pct", _clamp(defaults.sr_proximity_block_pct + 0.003, 0.004, 0.03))
+            _set("min_net_tp_pct",         _clamp(defaults.min_net_tp_pct + 0.35, 0.65, 1.75))
             _set("circuit_breaker_max_trades", _clamp(defaults.circuit_breaker_max_trades - 10, 10, 30))
             _set("max_position_size_pct",  _clamp(defaults.max_position_size_pct - 2.0, 1.0, 3.0))
             _set("max_daily_loss_pct",     _clamp(defaults.max_daily_loss_pct - 2.0, 1.0, 3.0))

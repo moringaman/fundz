@@ -592,9 +592,16 @@ class TelegramService:
             await self.send(f"⚠️ TP update failed: `{exc}`")
 
     async def _cmd_ack(self, _args: list[str]) -> None:
-        """Acknowledge active API error alert, silencing further repeats."""
-        reply = self.acknowledge_api_error()
-        await self.send(reply)
+        """Acknowledge active alerts: API error + accumulation low balance."""
+        replies = []
+        replies.append(self.acknowledge_api_error())
+        try:
+            from app.services.accumulation_service import accumulation_service
+            accumulation_service.ack_low_balance()
+            replies.append("✅ Accumulation low-balance alert acknowledged — suppressed for 24h.")
+        except Exception:
+            replies.append("ℹ️ No accumulation alert to acknowledge.")
+        await self.send("\n".join(replies))
 
 
 # Singleton

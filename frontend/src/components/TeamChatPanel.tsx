@@ -268,7 +268,7 @@ export function TeamChatPanel() {
           )}
           {msgs.map((msg, i) => {
             const prev = msgs[i - 1];
-            const isContinuation = prev?.agent_name === msg.agent_name;
+            const isContinuation = prev?.agent_name === msg.agent_name && prev?.message_type === msg.message_type;
             const color = getRoleColor(msg.agent_role, msg.agent_name);
             const typeColor = TYPE_COLORS[msg.message_type] || 'var(--text-secondary)';
 

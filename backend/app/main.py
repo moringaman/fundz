@@ -14,6 +14,7 @@ from app.api.routes import whale as whale_routes
 from app.api.routes import grid as grid_routes
 from app.api.routes import live_trading as live_trading_routes
 from app.api.routes import strategies as strategies_routes
+from app.api.routes import accumulation as accumulation_routes
 
 # Configure root logger so app.* loggers are visible
 logging.basicConfig(
@@ -81,6 +82,7 @@ api_router.include_router(whale_routes.router)
 api_router.include_router(grid_routes.router)
 api_router.include_router(live_trading_routes.router)
 api_router.include_router(strategies_routes.router)
+api_router.include_router(accumulation_routes.router)
 
 
 class ConnectionManager:
@@ -476,18 +478,21 @@ async def lifespan(app: FastAPI):
     # ── Step 3b: deduplicate balances and add unique constraint on (user_id, asset) ─
     try:
         async with engine.begin() as conn:
-            # Remove duplicate balance rows, keeping the one with the highest available value
+            # Remove duplicate balance rows (same user, asset, fund_type),
+            # keeping the one with the highest available value.
+            # GROUP BY includes fund_type so accumulation and trading balances
+            # are treated as separate rows, not duplicates.
             await conn.execute(text("""
                 DELETE FROM balances
                 WHERE id NOT IN (
-                    SELECT DISTINCT ON (user_id, asset) id
+                    SELECT DISTINCT ON (user_id, asset, COALESCE(fund_type, 'trading')) id
                     FROM balances
-                    ORDER BY user_id, asset, available DESC
+                    ORDER BY user_id, asset, COALESCE(fund_type, 'trading'), available DESC
                 )
             """))
             await conn.execute(text(
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_balance_user_asset "
-                "ON balances (user_id, asset)"
+                "ON balances (user_id, asset, COALESCE(fund_type, 'trading'))"
             ))
     except Exception as e:
         logger.warning(f"Balance dedup/unique index failed (non-fatal): {e}")
