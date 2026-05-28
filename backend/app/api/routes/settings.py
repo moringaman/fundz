@@ -4,13 +4,17 @@ Risk limits and trading preferences are persisted to the database so
 they survive service restarts.
 """
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 from typing import Optional
 import logging
 
 from app.config import settings as app_settings
 from app.database import get_async_session
+from app.auth import get_current_user_id
+from app.services.credential_service import (
+    save_credential, get_credential, delete_credential, list_credentials,
+)
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 logger = logging.getLogger(__name__)
@@ -896,3 +900,148 @@ async def test_telegram(req: TelegramSettingsModel):
     if result["ok"]:
         return {"status": "ok", "message": result["message"]}
     raise HTTPException(status_code=502, detail=result["message"])
+
+
+# ── Exchange credentials ──────────────────────────────────────────────────────
+
+class ExchangeCredentialSaveRequest(BaseModel):
+    provider: str  # "phemex", "hyperliquid", "alpaca"
+    credentials: dict[str, str]  # e.g., {"api_key": "...", "api_secret": "..."}
+
+
+@router.put("/exchange-credentials")
+async def save_exchange_credentials(
+    req: ExchangeCredentialSaveRequest,
+    tenant_id: str = Depends(get_current_user_id),
+):
+    """Save exchange API credentials for the current tenant (encrypted at rest)."""
+    if req.provider not in ("phemex", "hyperliquid", "alpaca"):
+        raise HTTPException(status_code=400, detail=f"Unknown provider: {req.provider}")
+    for key, value in req.credentials.items():
+        if not value:
+            continue
+        await save_credential(tenant_id, req.provider, key, value)
+    return {"status": "ok", "provider": req.provider}
+
+
+@router.get("/exchange-credentials")
+async def list_exchange_credentials(
+    tenant_id: str = Depends(get_current_user_id),
+):
+    """List saved exchange credentials (values not returned)."""
+    all_creds = await list_credentials(tenant_id)
+    exchange_providers = {"phemex", "hyperliquid", "alpaca"}
+    result = {}
+    for cred in all_creds:
+        if cred["provider"] in exchange_providers:
+            if cred["provider"] not in result:
+                result[cred["provider"]] = []
+            result[cred["provider"]].append({
+                "key": cred["credential_key"],
+                "has_value": cred["has_value"],
+            })
+    return result
+
+
+@router.delete("/exchange-credentials/{provider}")
+async def delete_exchange_credentials(
+    provider: str,
+    tenant_id: str = Depends(get_current_user_id),
+):
+    """Delete all stored credentials for a specific exchange provider."""
+    known_keys = {
+        "phemex": ["api_key", "api_secret"],
+        "hyperliquid": ["wallet_address", "wallet_key"],
+        "alpaca": ["api_key", "api_secret"],
+    }
+    for key in known_keys.get(provider, []):
+        await delete_credential(tenant_id, provider, key)
+    return {"status": "ok", "provider": provider}
+
+
+# ── LLM credentials (cloud + local providers) ──────────────────────────────────
+
+LLM_PROVIDERS = {
+    # Cloud — require api_key
+    "openai":     {"needs_key": True,  "default_endpoint": "https://api.openai.com/v1"},
+    "anthropic":  {"needs_key": True,  "default_endpoint": "https://api.anthropic.com/v1"},
+    "openrouter": {"needs_key": True,  "default_endpoint": "https://openrouter.ai/api/v1"},
+    "azure":      {"needs_key": True,  "default_endpoint": None},
+    "opencode":   {"needs_key": True,  "default_endpoint": "https://api.opencode.ai/v1"},
+    # Local — no API key, just endpoint URL
+    "ollama":     {"needs_key": False, "default_endpoint": "http://localhost:11434/v1"},
+    "vllm":       {"needs_key": False, "default_endpoint": "http://localhost:8000/v1"},
+    "llama_cpp":  {"needs_key": False, "default_endpoint": "http://localhost:8080/v1"},
+    "custom":     {"needs_key": False, "default_endpoint": None},
+}
+
+
+class LLMCredentialSaveRequest(BaseModel):
+    provider: str
+    api_key: Optional[str] = None
+    endpoint_url: Optional[str] = None
+    model_name: Optional[str] = None
+
+
+@router.put("/llm-credentials")
+async def save_llm_credential(
+    req: LLMCredentialSaveRequest,
+    tenant_id: str = Depends(get_current_user_id),
+):
+    """Save LLM provider config (cloud API key + local endpoint URL)."""
+    if req.provider not in LLM_PROVIDERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown provider: {req.provider}. Valid: {list(LLM_PROVIDERS.keys())}",
+        )
+    meta = LLM_PROVIDERS[req.provider]
+    if meta["needs_key"] and not req.api_key:
+        raise HTTPException(status_code=400, detail=f"Provider '{req.provider}' requires an API key")
+
+    if req.api_key:
+        await save_credential(tenant_id, req.provider, "api_key", req.api_key)
+    endpoint = req.endpoint_url or meta["default_endpoint"]
+    if endpoint:
+        await save_credential(tenant_id, req.provider, "endpoint_url", endpoint)
+    if req.model_name:
+        await save_credential(tenant_id, req.provider, "model_name", req.model_name)
+
+    return {"status": "ok", "provider": req.provider}
+
+
+@router.get("/llm-credentials")
+async def list_llm_credentials(
+    tenant_id: str = Depends(get_current_user_id),
+):
+    """List configured LLM providers (values not shown)."""
+    all_creds = await list_credentials(tenant_id)
+    llm_providers = set(LLM_PROVIDERS.keys())
+    result: dict[str, dict] = {}
+    for cred in all_creds:
+        if cred["provider"] in llm_providers:
+            p = cred["provider"]
+            if p not in result:
+                result[p] = {"has_key": False, "has_endpoint": False, "has_model": False}
+            if cred["credential_key"] == "api_key" and cred["has_value"]:
+                result[p]["has_key"] = True
+            if cred["credential_key"] == "endpoint_url" and cred["has_value"]:
+                result[p]["has_endpoint"] = True
+            if cred["credential_key"] == "model_name" and cred["has_value"]:
+                result[p]["has_model"] = True
+    for p in llm_providers:
+        if p not in result:
+            result[p] = {"has_key": False, "has_endpoint": False, "has_model": False}
+    return result
+
+
+@router.delete("/llm-credentials/{provider}")
+async def delete_llm_credential(
+    provider: str,
+    tenant_id: str = Depends(get_current_user_id),
+):
+    """Delete all stored credentials for an LLM provider."""
+    if provider not in LLM_PROVIDERS:
+        raise HTTPException(status_code=400, detail=f"Unknown provider: {provider}")
+    for key in ("api_key", "endpoint_url", "model_name"):
+        await delete_credential(tenant_id, provider, key)
+    return {"status": "ok", "provider": provider}

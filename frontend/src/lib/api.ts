@@ -9,6 +9,25 @@ const api = axios.create({
   },
 });
 
+// ── Clerk token injection ─────────────────────────────────────────────────────
+// Call setAuthTokenGetter once from a component that has access to Clerk's
+// useAuth() hook.  The interceptor calls the getter before every request.
+let _getToken: (() => Promise<string | null>) | null = null;
+
+export function setAuthTokenGetter(getToken: () => Promise<string | null>) {
+  _getToken = getToken;
+}
+
+api.interceptors.request.use(async (config) => {
+  if (_getToken) {
+    const token = await _getToken();
+    if (token) {
+      config.headers.Authorization = `Bearer ${token}`;
+    }
+  }
+  return config;
+});
+
 export const marketApi = {
   getKlines: (symbol: string, interval = '1h', limit = 100) =>
     api.get(`market/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`),
@@ -245,6 +264,20 @@ export const settingsApi = {
   updateTelegramSettings: (data: object) => api.put('settings/telegram', data).then((r: { data: unknown }) => r.data),
 
   testTelegram: (data: object) => api.post('settings/test-telegram', data).then((r: { data: unknown }) => r.data),
+
+  // Exchange credentials (encrypted, per-tenant)
+  listExchangeCredentials: () => api.get('settings/exchange-credentials').then(r => r.data),
+  saveExchangeCredentials: (provider: string, credentials: Record<string, string>) =>
+    api.put('settings/exchange-credentials', { provider, credentials }),
+  deleteExchangeCredentials: (provider: string) =>
+    api.delete(`settings/exchange-credentials/${provider}`),
+
+  // LLM credentials (encrypted, per-tenant — cloud + local providers)
+  listLlmCredentials: () => api.get('settings/llm-credentials').then(r => r.data),
+  saveLlmCredential: (provider: string, apiKey?: string, endpointUrl?: string, modelName?: string) =>
+    api.put('settings/llm-credentials', { provider, api_key: apiKey || null, endpoint_url: endpointUrl || null, model_name: modelName || null }),
+  deleteLlmCredential: (provider: string) =>
+    api.delete(`settings/llm-credentials/${provider}`),
 };
 
 export const fundApi = {

@@ -7,6 +7,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
+        extra="ignore",  # allow env vars not declared in this class (e.g. CREDENTIAL_ENCRYPTION_KEY)
     )
 
     app_name: str = "phemex-ai-trader"
@@ -68,6 +69,11 @@ class Settings(BaseSettings):
     llm_model: str = "mistralai/mixtral-8x7b-instruct"
     llm_temperature: float = 0.7
     llm_max_tokens: int = 1000
+
+    # Clerk authentication
+    clerk_secret_key: Optional[str] = None
+    clerk_publishable_key: Optional[str] = None
+    clerk_jwks_url: str = "https://clerk.com"
 
     jwt_secret: str = "change-me-in-production"
     jwt_algorithm: str = "HS256"

@@ -981,7 +981,10 @@ class AgentScheduler:
             from sqlalchemy import select
             async with get_async_session() as session:
                 rows = (await session.execute(
-                    select(StrategyInsightRecord).where(StrategyInsightRecord.is_paper == is_paper)
+                    select(StrategyInsightRecord).where(
+                        StrategyInsightRecord.is_paper == is_paper
+                    ).order_by(StrategyInsightRecord.tenant_id.nullsfirst())
+                    # ^ baseline (NULL) first, tenant (non-NULL) overwrites below
                 )).scalars().all()
 
             if not rows:
@@ -1103,10 +1106,17 @@ class AgentScheduler:
                 from app.models import BacktestRecord as _BtRec
                 from app.services.backtest import BacktestResult as _BtRes
                 async with get_async_session() as _bt_db:
+                    # Tenant-specific backtests (per agent_id)
                     _bt_rows = (await _bt_db.execute(
                         select(_BtRec)
                         .where(_BtRec.agent_id.in_([a["id"] for a in agents if a.get("trading_pairs")]))
                         .order_by(_BtRec.created_at.desc())
+                    )).scalars().all()
+                    # Baseline backtests (shared warm-start, no agent_id)
+                    _bt_baseline = (await _bt_db.execute(
+                        select(_BtRec)
+                        .where(_BtRec.tenant_id == None, _BtRec.agent_id == None)
+                        .order_by(_BtRec.strategy, _BtRec.symbol, _BtRec.interval)
                     )).scalars().all()
                 # Keep only the most recent record per agent_id
                 _seen: set = set()

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
-import { Activity, Bot, Wallet, Settings, TrendingUp, History, Zap, Users, MessageCircle, BarChart2, GitBranch, Clock, PiggyBank, PanelLeftClose, PanelLeftOpen } from 'lucide-react';
+import { Activity, Bot, Wallet, Settings, TrendingUp, History, Zap, Users, MessageCircle, BarChart2, GitBranch, Clock, PiggyBank, PanelLeftClose, PanelLeftOpen, LogOut } from 'lucide-react';
+import { useClerk } from '@clerk/clerk-react';
 import { useAppSelector, useAppDispatch } from '../../store/hooks';
 import { setSidebarOpen, toggleSidebarCollapsed } from '../../store/slices/uiSlice';
 import { useAutomationStatus, useAgents, usePaperOrders, useTradeHistory, useFundTeamStatus } from '../../hooks/useQueries';
@@ -58,6 +59,7 @@ function fmtVolume(volume24h: number | undefined): string {
 export function Sidebar({ activePage, onNavigate }: SidebarProps) {
   const [clockNow, setClockNow] = useState(() => new Date());
   const dispatch = useAppDispatch();
+  const { signOut } = useClerk();
   const sidebarOpen = useAppSelector((s) => s.ui.sidebarOpen);
   const signal = useAppSelector((s) => s.market.signal);
   const selectedSymbol = useAppSelector((s) => s.market.selectedSymbol);
@@ -282,6 +284,17 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
         <div className="sidebar-footer">
           <SidebarTeamFeed onNavigate={navigate} />
           <SidebarTicker />
+
+          <button
+            type="button"
+            onClick={() => signOut()}
+            className="collapse-btn header-btn"
+            title="Sign Out"
+            style={{ marginBottom: '0.25rem', color: 'var(--text-dim)' }}
+          >
+            <LogOut size={14} />
+            {!sidebarCollapsed && <span style={{ marginLeft: '0.5rem', fontSize: '0.75rem' }}>Sign Out</span>}
+          </button>
 
           <button type="button" onClick={toggleCollapsed} className="collapse-btn header-btn" title={sidebarCollapsed ? 'Expand' : 'Collapse'}>
             {sidebarCollapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}

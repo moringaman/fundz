@@ -33,6 +33,7 @@ class ApiKey(Base):
     __tablename__ = "api_keys"
 
     id = Column(String(36), primary_key=True, default=generate_uuid)
+    tenant_id = Column(String(255), nullable=True, index=True)
     user_id = Column(String(36), ForeignKey("users.id"), nullable=False)
     name = Column(String(100), nullable=False)
     phemex_api_key = Column(String(255), nullable=False)
@@ -106,6 +107,7 @@ class Agent(Base):
     __tablename__ = "agents"
 
     id = Column(String(36), primary_key=True, default=generate_uuid)
+    tenant_id = Column(String(255), nullable=True, index=True)
     user_id = Column(String(36), ForeignKey("users.id"), nullable=False)
     trader_id = Column(String(36), ForeignKey("traders.id", ondelete="SET NULL"), nullable=True)
     name = Column(String(100), nullable=False)
@@ -185,6 +187,7 @@ class Trade(Base):
     __tablename__ = "trades"
 
     id = Column(String(36), primary_key=True, default=generate_uuid)
+    tenant_id = Column(String(255), nullable=True, index=True)
     user_id = Column(String(36), ForeignKey("users.id"), nullable=False)
     agent_id = Column(String(36), ForeignKey("agents.id"), nullable=True)
     trader_id = Column(String(36), ForeignKey("traders.id", ondelete="SET NULL"), nullable=True)
@@ -215,6 +218,7 @@ class Position(Base):
     __tablename__ = "positions"
 
     id = Column(String(36), primary_key=True, default=generate_uuid)
+    tenant_id = Column(String(255), nullable=True, index=True)
     user_id = Column(String(36), ForeignKey("users.id"), nullable=False)
     agent_id = Column(String(36), ForeignKey("agents.id"), nullable=True)
     symbol = Column(String(20), nullable=False)
@@ -257,6 +261,7 @@ class Balance(Base):
     __tablename__ = "balances"
 
     id = Column(String(36), primary_key=True, default=generate_uuid)
+    tenant_id = Column(String(255), nullable=True, index=True)
     user_id = Column(String(36), ForeignKey("users.id"), nullable=False)
     asset = Column(String(10), nullable=False)
     available = Column(Float, default=0.0)
@@ -272,6 +277,7 @@ class AccumulationConfig(Base):
     __tablename__ = "accumulation_config"
 
     id = Column(String(36), primary_key=True, default=generate_uuid)
+    tenant_id = Column(String(255), nullable=True, index=True)
     user_id = Column(String(36), ForeignKey("users.id"), nullable=False)
     asset = Column(String(20), nullable=False)
     enabled = Column(Boolean, default=True)
@@ -861,6 +867,7 @@ class AccumulationExecutionRecord(Base):
     __tablename__ = "accumulation_execution_records"
 
     id = Column(String(36), primary_key=True, default=generate_uuid)
+    tenant_id = Column(String(255), nullable=True, index=True)
     user_id = Column(String(36), ForeignKey("users.id"), nullable=False)
     asset = Column(String(20), nullable=False)
     strategy = Column(String(20), nullable=False)  # dca, value_averaging, dip_buy, scale_out
@@ -1074,4 +1081,25 @@ class RetrospectiveAdjustment(Base):
 
     __table_args__ = (
         Index("idx_retro_adjustment_agent", "agent_id", "created_at"),
+    )
+
+
+class TenantCredential(Base):
+    """Encrypted key-value store for per-tenant credentials (exchange keys, LLM keys)."""
+    __tablename__ = "tenant_credentials"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    tenant_id = Column(String(255), nullable=False, index=True)
+    provider = Column(String(50), nullable=False)  # "phemex", "hyperliquid", "openai", etc.
+    credential_key = Column(String(100), nullable=False)  # "api_key", "api_secret", "endpoint_url"
+    encrypted_value = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        Index("idx_credential_tenant_provider", "tenant_id", "provider"),
+        UniqueConstraint(
+            "tenant_id", "provider", "credential_key",
+            name="uq_credential_tenant_provider_key",
+        ),
     )

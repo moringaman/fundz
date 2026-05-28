@@ -3,6 +3,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from typing import Optional, List
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.auth import get_current_user_id
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from datetime import datetime, timezone
@@ -134,10 +136,10 @@ async def adjust_paper_balance(req: AdjustBalanceRequest):
 
 
 @router.get("/portfolio")
-async def get_paper_portfolio():
+async def get_paper_portfolio(tenant_id: str = Depends(get_current_user_id)):
     """Canonical portfolio summary — single source of truth for balances,
     positions value, total capital, and exposure."""
-    balances = await paper_trading.get_all_balances()
+    balances = await paper_trading.get_all_balances(tenant_id)
     positions = await paper_trading.get_positions_live()
 
     # Cash balances — only show USDT (this is a futures system, not spot;

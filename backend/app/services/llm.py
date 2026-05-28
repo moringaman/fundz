@@ -160,28 +160,79 @@ class LLMService:
         self.temperature = settings.llm_temperature
         self.max_tokens = settings.llm_max_tokens
         self._client = None
-    
+        self._available = False  # set True when creds are valid
+
     async def initialize(self):
+        """Initialize the LLM client. Prefers encrypted credential store, falls back to env.
+        Sets ``self._available = False`` gracefully when no credentials are found."""
+        from app.services.credential_service import get_llm_config
+
+        api_key = None
+        endpoint_url = None
+        try:
+            config = await get_llm_config(
+                "user_3EMbdZ9YSddOxmMWin0cAT5ep8t", self.provider,
+            )
+            api_key = config.get("api_key")
+            endpoint_url = config.get("endpoint_url")
+        except Exception:
+            pass
+
+        # Fall back to env keys
+        if not api_key and self.provider == "openrouter":
+            api_key = settings.openrouter_api_key
+        elif not api_key and self.provider == "openai":
+            api_key = settings.openai_api_key
+        elif not api_key and self.provider == "anthropic":
+            api_key = settings.anthropic_api_key
+        elif not api_key and self.provider == "azure":
+            api_key = settings.azure_openai_key
+
+        # Check if we have usable credentials
+        needs_key = self.provider in ("openrouter", "openai", "anthropic", "azure", "opencode")
+        has_creds = bool(api_key) if needs_key else bool(endpoint_url)
+
+        if not has_creds:
+            self._available = False
+            logger.warning(
+                "LLM Service UNAVAILABLE — provider '%s' has no credentials configured. "
+                "Add a key via Settings → AI / LLM or set it in .env.",
+                self.provider
+            )
+            return
+
+        self._available = True
+
         if self.provider == "openrouter":
             from openai import AsyncOpenAI
             self._client = AsyncOpenAI(
-                api_key=settings.openrouter_api_key,
-                base_url="https://openrouter.ai/api/v1",
+                api_key=api_key or settings.openrouter_api_key,
+                base_url=endpoint_url or "https://openrouter.ai/api/v1",
             )
         elif self.provider == "openai":
             from openai import AsyncOpenAI
-            self._client = AsyncOpenAI(api_key=settings.openai_api_key)
+            self._client = AsyncOpenAI(
+                api_key=api_key or settings.openai_api_key,
+                base_url=endpoint_url or None,
+            )
         elif self.provider == "anthropic":
             from anthropic import AsyncAnthropic
-            self._client = AsyncAnthropic(api_key=settings.anthropic_api_key)
+            self._client = AsyncAnthropic(api_key=api_key or settings.anthropic_api_key)
         elif self.provider == "azure":
             from openai import AsyncOpenAI
             self._client = AsyncOpenAI(
-                api_key=settings.azure_openai_key,
+                api_key=api_key or settings.azure_openai_key,
                 azure_endpoint=settings.azure_openai_endpoint,
-                api_version="2024-02-01",
+                api_version="2024-10-21",
             )
             self.model = settings.azure_openai_deployment or self.model
+        # Local/custom providers
+        elif self.provider in ("ollama", "vllm", "llama_cpp", "custom", "opencode"):
+            from openai import AsyncOpenAI
+            url = endpoint_url or settings.llm_endpoint_url or None
+            key = api_key or "not-needed"
+            if url:
+                self._client = AsyncOpenAI(api_key=key, base_url=url)
         logger.info(f"LLM Service initialized with provider: {self.provider}, model: {self.model}")
 
     async def analyze_market(self, market_data: Dict[str, Any]) -> LLMResponse:
@@ -254,6 +305,12 @@ Provide your analysis in JSON format:
     async def _call_llm(self, prompt: str, system_prompt: Optional[str] = None, role: Optional[str] = None) -> LLMResponse:
         if self._client is None:
             await self.initialize()
+
+        if not self._available:
+            return LLMResponse(
+                content="", reasoning="LLM unavailable — no credentials configured",
+                confidence=0.0, action="hold",
+            )
 
         model, temperature, max_tokens = self._resolve_call_config(role)
 

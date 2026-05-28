@@ -1,5 +1,7 @@
 import { useState } from 'react';
 import { Routes, Route, useLocation, useNavigate } from 'react-router-dom';
+import { SignedIn, SignedOut, RedirectToSignIn, useAuth } from '@clerk/clerk-react';
+import { useOnboarding, OnboardingOverlay } from './components/OnboardingPanel';
 import { Menu } from 'lucide-react';
 import { useWebSocket } from './hooks/useWebSocket';
 import { useMarketStream } from './hooks/useMarketStream';
@@ -24,8 +26,12 @@ import { WalletPage } from './pages/WalletPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { WhalePage } from './pages/WhalePage';
 import { WorkflowsPage } from './pages/WorkflowsPage';
+import { SignInPage } from './pages/SignInPage';
+import { SignUpPage } from './pages/SignUpPage';
 import { useAppSelector, useAppDispatch } from './store/hooks';
 import { setSidebarOpen, toggleSidebarCollapsed } from './store/slices/uiSlice';
+import { setAuthTokenGetter } from './lib/api';
+import { useEffect } from 'react';
 import './index.css';
 
 const routeToPage: Record<string, string> = {
@@ -44,12 +50,18 @@ const routeToPage: Record<string, string> = {
   '/settings': 'settings',
 };
 
-function App() {
+function AppRoutes() {
   const [timeframe, setTimeframe] = useState('1h');
   useAppSelector((s) => s.ui.sidebarOpen);
   const dispatch = useAppDispatch();
   const location = useLocation();
   const navigate = useNavigate();
+
+  // Attach Clerk session token to every API request
+  const { getToken } = useAuth();
+  useEffect(() => {
+    setAuthTokenGetter(() => getToken());
+  }, [getToken]);
 
   useWebSocket();
   useMarketStream(timeframe);
@@ -76,7 +88,7 @@ function App() {
           <button type="button" onClick={() => dispatch(toggleSidebarCollapsed())} className="mobile-menu-btn">
             <Menu size={22} />
           </button>
-          <span className="sidebar-logo">AAAAAAAI</span>PX
+          <span className="sidebar-logo">PX</span>
           <WsIndicator />
         </div>
 
@@ -97,6 +109,49 @@ function App() {
         </Routes>
       </main>
     </div>
+  );
+}
+
+function App() {
+  const onboarding = useOnboarding();
+  const [showLiveGate, setShowLiveGate] = useState(false);
+  const navigate = useNavigate();
+
+  useEffect(() => {
+    const handler = () => setShowLiveGate(true);
+    const dismiss = () => setShowLiveGate(false);
+    window.addEventListener('live-gate-trigger', handler);
+    window.addEventListener('live-gate-dismiss', dismiss);
+    return () => {
+      window.removeEventListener('live-gate-trigger', handler);
+      window.removeEventListener('live-gate-dismiss', dismiss);
+    };
+  }, []);
+
+  return (
+    <>
+      <Routes>
+        <Route path="/sign-in" element={<SignInPage />} />
+        <Route path="/sign-up" element={<SignUpPage />} />
+      </Routes>
+
+      <SignedIn>
+        <AppRoutes />
+        <OnboardingOverlay
+          hasLlm={onboarding.hasLlm}
+          hasExchange={onboarding.hasExchange}
+          acceptedDisclaimer={onboarding.acceptedDisclaimer}
+          onAcceptDisclaimer={onboarding.acceptDisclaimer}
+          onRefresh={onboarding.refresh}
+          onNavigate={navigate}
+          showLiveGate={showLiveGate}
+        />
+      </SignedIn>
+
+      <SignedOut>
+        <RedirectToSignIn />
+      </SignedOut>
+    </>
   );
 }
 

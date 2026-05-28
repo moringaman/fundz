@@ -126,12 +126,11 @@ class PaperTradingService:
     # Balance
     # ------------------------------------------------------------------
 
-    async def get_all_balances(self) -> List[PaperBalance]:
-        """Return all paper-trading balances for the default user (trading fund only)."""
+    async def get_all_balances(self, tenant_id: str = "default-user") -> List[PaperBalance]:
+        """Return all paper-trading balances for the given tenant (trading fund only)."""
         async with get_async_session() as db:
             result = await db.execute(
                 select(PaperBalance).where(
-                    PaperBalance.user_id == "default-user",
                     PaperBalance.fund_type != "accumulation",
                 )
             )

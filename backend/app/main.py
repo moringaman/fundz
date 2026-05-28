@@ -393,6 +393,7 @@ async def lifespan(app: FastAPI):
     from app.models import AgentRunRecord, AgentMetricRecord, TeamChatMessageRecord, DailyReport, Trader  # noqa: F401
     from app.models import GridState, GridLevel  # noqa: F401 — ensure grid tables are created
     from app.models import TraderLegacy  # noqa: F401 — Phase 9.2
+    from app.models import TenantCredential  # noqa: F401 — encrypted credential store
 
     # ── Step 1: create all tables ────────────────────────────────────────────
     async with engine.begin() as conn:

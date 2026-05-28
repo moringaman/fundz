@@ -508,105 +508,11 @@ export function SettingsPage() {
         {/* Content area */}
         <div style={{ flex: 1, minWidth: 0 }}>
 
-      {/* ── API Keys Tab ── */}
-      {activeTab === 'api' && (
-        <div className="settings-card space-y-4">
-          <div style={{ display: 'flex', alignItems: 'center', gap: '.5rem', marginBottom: '.5rem' }}>
-            <Key size={16} style={{ color: 'var(--accent)' }} />
-            <h2 className="settings-title" style={{ marginBottom: 0 }}>Phemex API Configuration</h2>
-          </div>
+      {/* ── API Keys Tab (multi-exchange) ── */}
+      {activeTab === 'api' && <ExchangeCredentialsTab />}
 
-          {/* Current key status */}
-          {settingsData?.api_keys && (
-            <div style={{
-              padding: '.75rem 1rem', borderRadius: 8,
-              background: settingsData.api_keys.has_phemex_key ? 'var(--green-dim)' : 'var(--amber-dim)',
-              border: `1px solid ${settingsData.api_keys.has_phemex_key ? 'rgba(0,230,118,.2)' : 'rgba(255,179,0,.2)'}`,
-              display: 'flex', alignItems: 'center', gap: '.6rem',
-              fontSize: '.78rem',
-            }}>
-              <Info size={14} style={{ color: settingsData.api_keys.has_phemex_key ? 'var(--green)' : 'var(--amber)', flexShrink: 0 }} />
-              <span style={{ color: settingsData.api_keys.has_phemex_key ? 'var(--green)' : 'var(--amber)' }}>
-                {settingsData.api_keys.has_phemex_key
-                  ? `API key configured (${settingsData.api_keys.key_hint}) — ${settingsData.api_keys.phemex_testnet ? 'Testnet' : 'Mainnet'}`
-                  : 'No API key configured — set your Phemex credentials below'}
-              </span>
-            </div>
-          )}
-
-          <div className="form-group">
-            <label className="form-label">API Key</label>
-            <input
-              type="text"
-              className="settings-input"
-              placeholder="Enter your Phemex API key"
-              value={apiForm.phemex_api_key}
-              onChange={e => setApiForm({ ...apiForm, phemex_api_key: e.target.value })}
-              autoComplete="off"
-            />
-          </div>
-
-          <div className="form-group">
-            <label className="form-label">API Secret</label>
-            <div style={{ position: 'relative' }}>
-              <input
-                type={showSecret ? 'text' : 'password'}
-                className="settings-input"
-                style={{ paddingRight: '2.5rem' }}
-                placeholder="Enter your Phemex API secret"
-                value={apiForm.phemex_api_secret}
-                onChange={e => setApiForm({ ...apiForm, phemex_api_secret: e.target.value })}
-                autoComplete="off"
-              />
-              <button
-                type="button"
-                onClick={() => setShowSecret(!showSecret)}
-                style={{
-                  position: 'absolute', right: '.6rem', top: '.55rem',
-                  background: 'none', border: 'none', cursor: 'pointer',
-                  color: 'var(--text-secondary)', padding: 0,
-                }}
-              >
-                {showSecret ? <EyeOff size={15} /> : <Eye size={15} />}
-              </button>
-            </div>
-          </div>
-
-          <div className="form-group">
-            <label className="form-label">Network</label>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '.75rem', marginTop: '.25rem' }}>
-              <label className="toggle-switch">
-                <input
-                  type="checkbox"
-                  checked={apiForm.phemex_testnet}
-                  onChange={e => setApiForm({ ...apiForm, phemex_testnet: e.target.checked })}
-                />
-                <span className="toggle-slider" />
-              </label>
-              <span style={{ fontSize: '.8rem', color: apiForm.phemex_testnet ? 'var(--amber)' : 'var(--green)' }}>
-                {apiForm.phemex_testnet ? '⚠ Testnet Mode' : '● Live / Mainnet'}
-              </span>
-            </div>
-          </div>
-
-          {!apiForm.phemex_testnet && (
-            <div className="warning-banner" style={{ display: 'flex', alignItems: 'center', gap: '.5rem' }}>
-              <AlertTriangle size={14} />
-              <span>Mainnet mode uses real funds. Ensure your credentials are correct before trading.</span>
-            </div>
-          )}
-
-          <button
-            type="button"
-            className="settings-btn"
-            onClick={handleSaveApiKeys}
-            disabled={saving}
-            style={{ display: 'flex', alignItems: 'center', gap: '.35rem', opacity: saving ? 0.6 : 1 }}
-          >
-            <Save size={13} /> {saving ? 'Saving…' : 'Save API Keys'}
-          </button>
-        </div>
-      )}
+      {/* ── LLM Config Tab ── */}
+      {activeTab === 'llm' && <LlmCredentialsTab />}
 
       {/* ── Risk Limits Tab ── */}
       {activeTab === 'risk' && (
@@ -1092,157 +998,6 @@ export function SettingsPage() {
             style={{ display: 'flex', alignItems: 'center', gap: '.35rem', opacity: saving ? 0.6 : 1 }}
           >
             <Save size={13} /> {saving ? 'Saving…' : 'Save Preferences'}
-          </button>
-        </div>
-      )}
-
-      {/* ── LLM / AI Tab ── */}
-      {activeTab === 'llm' && (
-        <div className="settings-card space-y-4">
-          <div style={{ display: 'flex', alignItems: 'center', gap: '.5rem', marginBottom: '.5rem' }}>
-            <Brain size={16} style={{ color: 'var(--accent)' }} />
-            <h2 className="settings-title" style={{ marginBottom: 0 }}>AI / LLM Configuration</h2>
-          </div>
-
-          <div className="form-group">
-            <label className="form-label">Provider</label>
-            <div style={{ display: 'flex', gap: '.35rem' }}>
-              {llmProviders.map(p => (
-                <button
-                  key={p}
-                  type="button"
-                  onClick={() => setLlmForm({ ...llmForm, provider: p })}
-                  style={{
-                    flex: 1, padding: '.5rem .5rem', borderRadius: 7,
-                    border: '1px solid',
-                    borderColor: llmForm.provider === p ? 'var(--accent)' : 'var(--border-mid)',
-                    background: llmForm.provider === p ? 'var(--accent-dim)' : 'var(--bg-elevated)',
-                    color: llmForm.provider === p ? 'var(--accent)' : 'var(--text-secondary)',
-                    fontSize: '.75rem', fontWeight: 600, cursor: 'pointer',
-                    fontFamily: 'var(--sans)', textTransform: 'capitalize',
-                    transition: 'all .15s',
-                  }}
-                >
-                  {p === 'openrouter' ? 'OpenRouter' : p === 'openai' ? 'OpenAI' : p === 'anthropic' ? 'Anthropic' : 'Azure'}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div className="form-group">
-            <label className="form-label">Model</label>
-            <input
-              type="text"
-              className="settings-input"
-              value={llmForm.model}
-              onChange={e => setLlmForm({ ...llmForm, model: e.target.value })}
-              placeholder="e.g. openai/gpt-4o-mini"
-            />
-          </div>
-
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
-            <div className="form-group">
-              <label className="form-label">Temperature: {llmForm.temperature.toFixed(1)}</label>
-              <input
-                type="range" min="0" max="2" step="0.1"
-                className="slider"
-                value={llmForm.temperature}
-                onChange={e => setLlmForm({ ...llmForm, temperature: parseFloat(e.target.value) })}
-              />
-              <div className="slider-labels"><span>Precise (0)</span><span>Creative (2)</span></div>
-            </div>
-
-            <div className="form-group">
-              <label className="form-label">Max Tokens</label>
-              <input
-                type="number" min="100" max="32000" step="100"
-                className="settings-input"
-                style={{ marginBottom: 0 }}
-                value={llmForm.max_tokens}
-                onChange={e => setLlmForm({ ...llmForm, max_tokens: parseInt(e.target.value) || 1000 })}
-              />
-            </div>
-          </div>
-
-          {/* Provider API key status indicators */}
-          <div style={{
-            padding: '.75rem 1rem', borderRadius: 8,
-            background: 'var(--bg-elevated)', border: '1px solid var(--border)',
-          }}>
-            <div style={{ fontSize: '.68rem', color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '.07em', marginBottom: '.6rem' }}>
-              Provider Key Status
-            </div>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '.4rem' }}>
-              {[
-                { label: 'OpenAI', has: settingsData?.llm?.has_openai_key },
-                { label: 'Anthropic', has: settingsData?.llm?.has_anthropic_key },
-                { label: 'OpenRouter', has: settingsData?.llm?.has_openrouter_key },
-                { label: 'Azure', has: settingsData?.llm?.has_azure_key },
-              ].map(({ label, has }) => (
-                <div key={label} style={{ display: 'flex', alignItems: 'center', gap: '.4rem', fontSize: '.75rem' }}>
-                  <span style={{
-                    width: 8, height: 8, borderRadius: '50%',
-                    background: has ? 'var(--green)' : 'var(--text-dim)',
-                    flexShrink: 0,
-                  }} />
-                  <span style={{ color: has ? 'var(--text-primary)' : 'var(--text-secondary)' }}>{label}</span>
-                  <span style={{ color: has ? 'var(--green)' : 'var(--text-dim)', fontSize: '.7rem' }}>
-                    {has ? 'Configured' : 'Not set'}
-                  </span>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          {/* Conditional API key input based on selected provider */}
-          {llmForm.provider === 'openai' && (
-            <div className="form-group">
-              <label className="form-label">OpenAI API Key</label>
-              <input
-                type="password"
-                className="settings-input"
-                placeholder={settingsData?.llm?.has_openai_key ? 'Key already set — enter new value to update' : 'sk-...'}
-                value={llmForm.openai_api_key}
-                onChange={e => setLlmForm({ ...llmForm, openai_api_key: e.target.value })}
-                autoComplete="off"
-              />
-            </div>
-          )}
-          {llmForm.provider === 'anthropic' && (
-            <div className="form-group">
-              <label className="form-label">Anthropic API Key</label>
-              <input
-                type="password"
-                className="settings-input"
-                placeholder={settingsData?.llm?.has_anthropic_key ? 'Key already set — enter new value to update' : 'sk-ant-...'}
-                value={llmForm.anthropic_api_key}
-                onChange={e => setLlmForm({ ...llmForm, anthropic_api_key: e.target.value })}
-                autoComplete="off"
-              />
-            </div>
-          )}
-          {llmForm.provider === 'openrouter' && (
-            <div className="form-group">
-              <label className="form-label">OpenRouter API Key</label>
-              <input
-                type="password"
-                className="settings-input"
-                placeholder={settingsData?.llm?.has_openrouter_key ? 'Key already set — enter new value to update' : 'sk-or-...'}
-                value={llmForm.openrouter_api_key}
-                onChange={e => setLlmForm({ ...llmForm, openrouter_api_key: e.target.value })}
-                autoComplete="off"
-              />
-            </div>
-          )}
-
-          <button
-            type="button"
-            className="settings-btn"
-            onClick={handleSaveLlmConfig}
-            disabled={saving}
-            style={{ display: 'flex', alignItems: 'center', gap: '.35rem', opacity: saving ? 0.6 : 1 }}
-          >
-            <Save size={13} /> {saving ? 'Saving…' : 'Save LLM Config'}
           </button>
         </div>
       )}
@@ -2406,6 +2161,276 @@ export function SettingsPage() {
 
         </div>{/* end content */}
       </div>{/* end two-column */}
+    </div>
+  );
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Exchange Credentials Tab — per-exchange cards (Phemex, Hyperliquid, Alpaca)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const EXCHANGES = [
+  { provider: 'phemex' as const, label: 'Phemex', fields: [{ key: 'api_key', label: 'API Key' }, { key: 'api_secret', label: 'API Secret' }] },
+  { provider: 'hyperliquid' as const, label: 'Hyperliquid', fields: [{ key: 'wallet_address', label: 'Wallet Address' }, { key: 'wallet_key', label: 'Private Key' }] },
+  { provider: 'alpaca' as const, label: 'Alpaca', fields: [{ key: 'api_key', label: 'API Key' }, { key: 'api_secret', label: 'Secret Key' }] },
+];
+
+function ExchangeCredentialsTab() {
+  const [creds, setCreds] = useState<Record<string, Record<string, boolean>>>({});
+  const [fields, setFields] = useState<Record<string, Record<string, string>>>({});
+  const [saving, setSaving] = useState<Record<string, boolean>>({});
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [toast, setToast] = useState<{ msg: string; type: 'success' | 'error' } | null>(null);
+
+  const reload = useCallback(async () => {
+    try {
+      const data = await settingsApi.listExchangeCredentials() as Record<string, Array<{ key: string; has_value: boolean }>>;
+      const map: Record<string, Record<string, boolean>> = {};
+      for (const [provider, entries] of Object.entries(data || {})) {
+        map[provider] = {};
+        if (Array.isArray(entries)) {
+          for (const e of entries as Array<{ key: string; has_value: boolean }>) map[provider][e.key] = e.has_value;
+        }
+      }
+      setCreds(map);
+    } catch { /* non-fatal */ }
+  }, []);
+
+  useEffect(() => { reload(); }, [reload]);
+
+  const configured = (provider: string) =>
+    EXCHANGES.find(e => e.provider === provider)?.fields.some(f => creds[provider]?.[f.key]) ?? false;
+
+  const handleSave = async (provider: string) => {
+    const vals = fields[provider] || {};
+    const payload: Record<string, string> = {};
+    for (const [k, v] of Object.entries(vals)) { if (v.trim()) payload[k] = v.trim(); }
+    if (Object.keys(payload).length === 0) return;
+    setSaving(s => ({ ...s, [provider]: true }));
+    try {
+      await settingsApi.saveExchangeCredentials(provider, payload);
+      setToast({ msg: `${EXCHANGES.find(e => e.provider === provider)?.label || provider} keys saved`, type: 'success' });
+      setFields(f => ({ ...f, [provider]: {} }));
+      reload();
+    } catch { setToast({ msg: `Failed to save`, type: 'error' }); }
+    finally { setSaving(s => ({ ...s, [provider]: false })); setTimeout(() => setToast(null), 3000); }
+  };
+
+  const handleClear = async (provider: string) => {
+    setSaving(s => ({ ...s, [provider]: true }));
+    try { await settingsApi.deleteExchangeCredentials(provider); setToast({ msg: `${EXCHANGES.find(e => e.provider === provider)?.label || provider} keys removed`, type: 'success' }); reload(); }
+    catch { setToast({ msg: `Failed to remove`, type: 'error' }); }
+    finally { setSaving(s => ({ ...s, [provider]: false })); setTimeout(() => setToast(null), 3000); }
+  };
+
+  return (
+    <div className="settings-card" style={{ gap: '1rem', display: 'flex', flexDirection: 'column' }}>
+      {toast && <div style={{ padding: '.5rem 1rem', borderRadius: 6, fontSize: '.78rem', background: toast.type === 'success' ? 'var(--green-dim)' : 'var(--red-dim)', color: toast.type === 'success' ? 'var(--green)' : 'var(--red)' }}>{toast.msg}</div>}
+
+      <div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '.5rem', marginBottom: '.3rem' }}>
+          <Key size={16} style={{ color: 'var(--accent)' }} />
+          <h2 className="settings-title" style={{ marginBottom: 0 }}>Exchange API Keys</h2>
+        </div>
+        <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', margin: 0, lineHeight: 1.5 }}>
+          Add your exchange credentials to enable live trading. Keys are encrypted at rest — nothing is stored in plaintext.
+          Each exchange needs its own API key pair created from the exchange dashboard with trading permissions.
+        </p>
+      </div>
+
+      {EXCHANGES.map(ex => {
+        const isCfg = configured(ex.provider);
+        const isOpen = expanded[ex.provider] ?? false;
+        return (
+          <div key={ex.provider} style={{ background: 'var(--bg-elevated)', borderRadius: 10, border: `1px solid ${isCfg ? 'rgba(0,230,118,.15)' : 'var(--border)'}`, overflow: 'hidden' }}>
+            <div onClick={() => setExpanded(e => ({ ...e, [ex.provider]: !isOpen }))}
+              style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '.75rem 1rem', cursor: 'pointer', userSelect: 'none' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '.6rem' }}>
+                <span style={{ width: 9, height: 9, borderRadius: '50%', background: isCfg ? 'var(--green)' : 'var(--text-dim)', flexShrink: 0 }} />
+                <div>
+                  <span style={{ fontSize: '.85rem', fontWeight: 600 }}>{ex.label}</span>
+                  <div style={{ fontSize: '.65rem', color: 'var(--text-dim)', marginTop: '.1rem' }}>
+                    {ex.provider === 'phemex' ? 'Perpetual futures — 0.06% maker/taker. Needs trade+read permissions.' :
+                     ex.provider === 'hyperliquid' ? 'Perpetual futures — 0.035% maker/taker. EVM wallet with trading permissions.' :
+                     'Stocks & crypto — 0% commission. Needs trading API key from Alpaca dashboard.'}
+                  </div>
+                </div>
+                {isCfg && <span style={{ fontSize: '.68rem', color: 'var(--green)', fontWeight: 600 }}>Configured</span>}
+              </div>
+              <span style={{ fontSize: '.7rem', color: 'var(--text-dim)', transform: isOpen ? 'rotate(180deg)' : 'none', transition: 'transform .15s' }}>▼</span>
+            </div>
+            {isOpen && (
+              <div style={{ padding: '0 1rem 1rem', borderTop: '1px solid var(--border)' }}>
+                {ex.fields.map(f => (
+                  <div key={f.key} style={{ marginTop: '.75rem' }}>
+                    <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-primary)', display: 'block', marginBottom: '.3rem' }}>{f.label}</label>
+                    <input type="password" className="settings-input" style={{ marginBottom: 0, padding: '.55rem .75rem', fontSize: '.78rem' }}
+                      placeholder={isCfg ? '•••••••• (stored — paste new value to replace)' : `Enter ${
+                        ex.provider === 'hyperliquid' && f.key === 'wallet_address' ? '0x address' :
+                        ex.provider === 'hyperliquid' && f.key === 'wallet_key' ? 'hex private key' : f.label.toLowerCase()}`}
+                      value={(fields[ex.provider] || {})[f.key] || ''}
+                      onChange={e => setFields(fld => ({ ...fld, [ex.provider]: { ...(fld[ex.provider] || {}), [f.key]: e.target.value } }))}
+                      autoComplete="off" />
+                  </div>
+                ))}
+                <div style={{ display: 'flex', gap: '.5rem', marginTop: '.85rem' }}>
+                  <button type="button" className="settings-btn" onClick={() => handleSave(ex.provider)} disabled={saving[ex.provider]}
+                    style={{ display: 'flex', alignItems: 'center', gap: '.35rem', fontSize: '.78rem', padding: '.5rem 1rem' }}>
+                    <Save size={13} /> {saving[ex.provider] ? 'Saving…' : 'Save'}
+                  </button>
+                  {isCfg && (
+                    <button type="button" className="settings-btn" onClick={() => { if (confirm(`Remove all ${ex.label} keys? This cannot be undone.`)) handleClear(ex.provider); }} disabled={saving[ex.provider]}
+                      style={{ display: 'flex', alignItems: 'center', gap: '.35rem', fontSize: '.78rem', padding: '.5rem 1rem', background: 'var(--red-dim)', borderColor: 'rgba(255,61,96,.2)', color: 'var(--red)' }}>
+                      <Minus size={13} /> Clear
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LLM Credentials Tab
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function LlmCredentialsTab() {
+  const [creds, setCreds] = useState<Record<string, { has_key: boolean; has_endpoint: boolean }>>({});
+  const [apiKey, setApiKey] = useState<Record<string, string>>({});
+  const [endpointUrl, setEndpointUrl] = useState<Record<string, string>>({});
+  const [modelName, setModelName] = useState<Record<string, string>>({});
+  const [saving, setSaving] = useState<Record<string, boolean>>({});
+  const [toast, setToast] = useState<{ msg: string; type: 'success' | 'error' } | null>(null);
+
+  const CLOUD = [
+    { id: 'openai', label: 'OpenAI', desc: 'GPT-4o, GPT-4.1 — https://api.openai.com/v1' },
+    { id: 'anthropic', label: 'Anthropic', desc: 'Claude Sonnet 4, Opus — https://api.anthropic.com/v1' },
+    { id: 'openrouter', label: 'OpenRouter', desc: 'Unified API for 200+ models. Single key, any provider.' },
+    { id: 'azure', label: 'Azure OpenAI', desc: 'Enterprise-grade. Needs endpoint URL + deployment name.' },
+    { id: 'opencode', label: 'OpenCode', desc: 'OpenCode-compatible API endpoint for coding models.' },
+  ];
+  const LOCAL = [
+    { id: 'ollama', label: 'Ollama', desc: 'Local LLMs via Ollama. Default: http://localhost:11434/v1' },
+    { id: 'vllm', label: 'vLLM', desc: 'High-throughput local serving. Default: http://localhost:8000/v1' },
+    { id: 'llama_cpp', label: 'llama.cpp', desc: 'Lightweight local inference. Default: http://localhost:8080/v1' },
+    { id: 'custom', label: 'Custom', desc: 'Any OpenAI-compatible endpoint (LM Studio, Groq, Together, etc.)' },
+  ];
+
+  const reload = useCallback(async () => {
+    try { const data = await settingsApi.listLlmCredentials() as Record<string, { has_key: boolean; has_endpoint: boolean }>; setCreds(data || {}); }
+    catch { /* */ }
+  }, []);
+  useEffect(() => { reload(); }, [reload]);
+
+  const configured = (p: string) => creds[p]?.has_key || creds[p]?.has_endpoint;
+
+  const handleSave = async (provider: string) => {
+    setSaving(s => ({ ...s, [provider]: true }));
+    try {
+      await settingsApi.saveLlmCredential(provider, apiKey[provider] || undefined, endpointUrl[provider] || undefined, modelName[provider] || undefined);
+      setToast({ msg: `${provider} saved`, type: 'success' });
+      setApiKey(a => ({ ...a, [provider]: '' })); setEndpointUrl(a => ({ ...a, [provider]: '' })); setModelName(a => ({ ...a, [provider]: '' }));
+      reload();
+    } catch { setToast({ msg: `Failed to save ${provider}`, type: 'error' }); }
+    finally { setSaving(s => ({ ...s, [provider]: false })); setTimeout(() => setToast(null), 3000); }
+  };
+
+  const handleClear = async (provider: string) => {
+    setSaving(s => ({ ...s, [provider]: true }));
+    try { await settingsApi.deleteLlmCredential(provider); setToast({ msg: `${provider} removed`, type: 'success' }); reload(); }
+    catch { setToast({ msg: `Failed to remove ${provider}`, type: 'error' }); }
+    finally { setSaving(s => ({ ...s, [provider]: false })); setTimeout(() => setToast(null), 3000); }
+  };
+
+  return (
+    <div className="settings-card" style={{ gap: '1rem', display: 'flex', flexDirection: 'column' }}>
+      {toast && <div style={{ padding: '.5rem 1rem', borderRadius: 6, fontSize: '.78rem', background: toast.type === 'success' ? 'var(--green-dim)' : 'var(--red-dim)', color: toast.type === 'success' ? 'var(--green)' : 'var(--red)' }}>{toast.msg}</div>}
+
+      <div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '.5rem', marginBottom: '.3rem' }}>
+          <Brain size={16} style={{ color: 'var(--accent)' }} />
+          <h2 className="settings-title" style={{ marginBottom: 0 }}>LLM Providers</h2>
+        </div>
+        <p style={{ fontSize: '.72rem', color: 'var(--text-secondary)', margin: 0, lineHeight: 1.5 }}>
+          Configure which AI models your trading agents use. Cloud providers need an API key.
+          Local providers run on your hardware — just point to the endpoint URL. All keys encrypted at rest.
+        </p>
+      </div>
+
+      <div style={{ fontSize: '.65rem', color: 'var(--text-dim)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '.1em' }}>Cloud Providers (require API key)</div>
+      {CLOUD.map(p => {
+        const isCfg = configured(p.id);
+        return (
+          <div key={p.id} style={{ background: 'var(--bg-elevated)', borderRadius: 10, border: `1px solid ${isCfg ? 'rgba(0,230,118,.15)' : 'var(--border)'}`, padding: '.85rem 1rem' }}>
+            <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: '.6rem' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '.5rem' }}>
+                <span style={{ width: 9, height: 9, borderRadius: '50%', background: isCfg ? 'var(--green)' : 'var(--text-dim)', flexShrink: 0 }} />
+                <div>
+                  <span style={{ fontSize: '.82rem', fontWeight: 600 }}>{p.label}</span>
+                  {isCfg && <span style={{ fontSize: '.7rem', color: 'var(--green)', marginLeft: '.4rem' }}>Configured</span>}
+                  <div style={{ fontSize: '.65rem', color: 'var(--text-dim)', marginTop: '.15rem' }}>{p.desc}</div>
+                </div>
+              </div>
+            </div>
+            <div style={{ display: 'flex', gap: '.5rem', flexWrap: 'wrap', alignItems: 'center' }}>
+              <input type="password" className="settings-input" style={{ flex: 1, minWidth: 160, marginBottom: 0, fontSize: '.78rem', padding: '.5rem .7rem' }}
+                placeholder={isCfg ? '•••••••• (stored)' : 'API Key'} value={apiKey[p.id] || ''}
+                onChange={e => setApiKey(a => ({ ...a, [p.id]: e.target.value }))} autoComplete="off" />
+              <input type="text" className="settings-input" style={{ flex: 1, minWidth: 120, marginBottom: 0, fontSize: '.78rem', padding: '.5rem .7rem' }}
+                placeholder="Default model (e.g. gpt-4o)" value={modelName[p.id] || ''}
+                onChange={e => setModelName(a => ({ ...a, [p.id]: e.target.value }))} />
+              <button type="button" className="settings-btn" onClick={() => handleSave(p.id)} disabled={saving[p.id]}
+                style={{ fontSize: '.76rem', padding: '.45rem .9rem', display: 'flex', alignItems: 'center', gap: '.3rem' }}>
+                <Save size={12} /> {saving[p.id] ? '…' : 'Save'}
+              </button>
+              {isCfg && <button type="button" onClick={() => { if (confirm(`Remove ${p.label}?`)) handleClear(p.id); }}
+                style={{ fontSize: '.72rem', color: 'var(--red)', background: 'none', border: 'none', cursor: 'pointer', padding: '.3rem' }}>Clear</button>}
+            </div>
+          </div>
+        );
+      })}
+
+      <div style={{ fontSize: '.65rem', color: 'var(--text-dim)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '.1em', marginTop: '.25rem' }}>Local / Self-Hosted (no API key needed — just an endpoint URL)</div>
+      {LOCAL.map(p => {
+        const isCfg = configured(p.id);
+        return (
+          <div key={p.id} style={{ background: 'var(--bg-elevated)', borderRadius: 10, border: `1px solid ${isCfg ? 'rgba(0,230,118,.15)' : 'var(--border)'}`, padding: '.85rem 1rem' }}>
+            <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: '.6rem' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '.5rem' }}>
+                <span style={{ width: 9, height: 9, borderRadius: '50%', background: isCfg ? 'var(--green)' : 'var(--text-dim)', flexShrink: 0 }} />
+                <div>
+                  <span style={{ fontSize: '.82rem', fontWeight: 600 }}>{p.label}</span>
+                  {isCfg && <span style={{ fontSize: '.7rem', color: 'var(--green)', marginLeft: '.4rem' }}>Configured</span>}
+                  <div style={{ fontSize: '.65rem', color: 'var(--text-dim)', marginTop: '.15rem' }}>{p.desc}</div>
+                </div>
+              </div>
+            </div>
+            <div style={{ display: 'flex', gap: '.5rem', flexWrap: 'wrap', alignItems: 'center' }}>
+              <input type="text" className="settings-input" style={{ flex: 2, minWidth: 200, marginBottom: 0, fontSize: '.78rem', padding: '.5rem .7rem' }}
+                placeholder="Endpoint URL (e.g. http://localhost:11434/v1)" value={endpointUrl[p.id] || ''}
+                onChange={e => setEndpointUrl(a => ({ ...a, [p.id]: e.target.value }))} />
+              <input type="text" className="settings-input" style={{ flex: 1, minWidth: 100, marginBottom: 0, fontSize: '.78rem', padding: '.5rem .7rem' }}
+                placeholder="Model name" value={modelName[p.id] || ''}
+                onChange={e => setModelName(a => ({ ...a, [p.id]: e.target.value }))} />
+              {p.id === 'custom' && <input type="password" className="settings-input" style={{ flex: 1, minWidth: 120, marginBottom: 0, fontSize: '.78rem', padding: '.5rem .7rem' }}
+                placeholder="API Key (optional)" value={apiKey[p.id] || ''}
+                onChange={e => setApiKey(a => ({ ...a, [p.id]: e.target.value }))} autoComplete="off" />}
+              <button type="button" className="settings-btn" onClick={() => handleSave(p.id)} disabled={saving[p.id]}
+                style={{ fontSize: '.76rem', padding: '.45rem .9rem', display: 'flex', alignItems: 'center', gap: '.3rem' }}>
+                <Save size={12} /> {saving[p.id] ? '…' : 'Save'}
+              </button>
+              {isCfg && <button type="button" onClick={() => { if (confirm(`Remove ${p.label}?`)) handleClear(p.id); }}
+                style={{ fontSize: '.72rem', color: 'var(--red)', background: 'none', border: 'none', cursor: 'pointer', padding: '.3rem' }}>Clear</button>}
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
 }

@@ -28,6 +28,7 @@ import PositionsTableComponent from '../components/PositionsTable';
 import PendingOrders from '../components/PendingOrders';
 import LearningDashboard from '../components/LearningDashboard';
 import { timeAgo } from '../utils/timeAgo';
+import { useOnboarding, OnboardingOverlay } from '../components/OnboardingPanel';
 import { Skeleton, SkeletonCard, SkeletonChart, SkeletonRows, SkeletonStats } from '../components/common/Skeleton';
 
 const FALLBACK_SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'ADAUSDT'];

@@ -9,6 +9,7 @@ from sqlalchemy.orm import selectinload
 from app.database import get_db
 from app.models import Agent as DBAgent, AgentSignal as DBAgentSignal, SignalType
 from app.services.backtest import BacktestConfig, backtest_engine
+from app.auth import get_current_user_id
 import app.strategies as strategy_registry
 
 router = APIRouter(prefix="/agents", tags=["agents"])
@@ -131,14 +132,23 @@ async def get_strategies(db: AsyncSession = Depends(get_db)):
 
 
 @router.get("", response_model=List[Agent])
-async def get_agents(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(DBAgent))
+async def get_agents(
+    db: AsyncSession = Depends(get_db),
+    tenant_id: str = Depends(get_current_user_id),
+):
+    result = await db.execute(
+        select(DBAgent).where(DBAgent.tenant_id == tenant_id)
+    )
     agents = result.scalars().all()
     return [agent_to_response(a) for a in agents]
 
 
 @router.post("", response_model=Agent)
-async def create_agent(config: AgentConfig, db: AsyncSession = Depends(get_db)):
+async def create_agent(
+    config: AgentConfig,
+    db: AsyncSession = Depends(get_db),
+    tenant_id: str = Depends(get_current_user_id),
+):
     import uuid
 
     # Validate strategy type is in registry
@@ -170,7 +180,8 @@ async def create_agent(config: AgentConfig, db: AsyncSession = Depends(get_db)):
     agent_id = str(uuid.uuid4())
     agent = DBAgent(
         id=agent_id,
-        user_id="default-user",
+        user_id=tenant_id,      # was "default-user" — now uses Clerk ID
+        tenant_id=tenant_id,
         trader_id=config.trader_id,
         name=config.name,
         strategy_type=config.strategy_type,
