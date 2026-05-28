@@ -54,11 +54,39 @@ class StrategyReviewService:
 
     # Safeguard limits per cycle
     MAX_CREATES_PER_CYCLE = 1
-    MAX_DISABLES_PER_CYCLE = 1
+    MAX_DISABLES_PER_CYCLE = 3   # raised from 1 — kill losers faster
     # Thresholds
     DISABLE_THRESHOLD_SCORE = 0.25   # below this → propose disable
     ENABLE_THRESHOLD_SCORE = 0.6     # above this → propose enable
     CREATE_THRESHOLD_SCORE = 0.7     # confluence must be this high to justify new agent
+
+    # ── Hard-loser fast-track disable ─────────────────────────────────────
+    # Independent of combined_score: if an agent has a statistically meaningful
+    # sample, is clearly losing money, AND the current regime is favourable
+    # for its strategy, disable it. The regime gate matters: a momentum agent
+    # losing during a 3-week range is suffering from regime mismatch, not a
+    # broken edge — disabling it would just mean re-creating it when trends
+    # return. The hard-loser path only fires when conditions ARE right and
+    # the agent still can't make money.
+    HARD_LOSER_MIN_TRADES = 40
+    HARD_LOSER_MAX_WIN_RATE = 0.42
+    HARD_LOSER_MAX_PNL = 0.0     # require strictly negative net PnL
+    HARD_LOSER_MIN_FIT_SCORE = 0.55  # only disable when regime is favourable
+    # Regime-bucket reprieve: if the agent has a regime bucket with at least
+    # this many trades AND non-negative PnL AND WR >= this floor, we treat
+    # the edge as "works in some regime" and decline to disable. The aggregate
+    # losing record is then attributable to wrong-regime runs, which the
+    # entry-time regime gate should be filtering going forward.
+    HARD_LOSER_REGIME_BUCKET_MIN_TRADES = 10
+    HARD_LOSER_REGIME_BUCKET_MIN_WR = 0.45
+
+    # ── Regime-mismatch suspension (separate from disable) ────────────────
+    # When an agent's strategy doesn't fit the current regime (low fit_score)
+    # AND it's lost money during this regime, we don't disable — disabling
+    # loses the agent's history. Instead the strategy review caps allocation
+    # to 0 in adverse regimes, and the existing avoid_conditions gate skips
+    # entries. The agent stays in the system and re-activates when its
+    # regime returns. This is handled in the existing combined-score path.
 
     async def run_strategy_review(
         self,
@@ -180,6 +208,12 @@ class StrategyReviewService:
                 'actual_trades': actual_trades,
                 'win_rate': win_rate,
                 'total_pnl': total_pnl,
+                # Per-regime PnL/WR breakdown (rolled up at close time on
+                # AgentMetricRecord.regime_stats). Used by the hard-loser
+                # fast-track to skip disabling agents that have a profitable
+                # bucket in at least one regime — the edge exists, the agent
+                # is just being run in the wrong conditions.
+                'regime_stats': metrics.get('regime_stats', {}) or {},
             }
             # Phase 3 — attach latest sensitivity sweep summary if available.
             # Downstream (LLM prompts, UI) can reason about parameter fragility
@@ -228,6 +262,83 @@ class StrategyReviewService:
         sorted_evals = sorted(evaluations, key=lambda e: e['combined_score'])
 
         for ev in sorted_evals:
+            # HARD-LOSER FAST TRACK: bypass combined_score and disable any agent
+            # that has a meaningful sample, is unambiguously losing money, AND
+            # is currently operating in a favourable regime (fit_score >= floor).
+            # The fit_score guard is critical: an agent losing during regime
+            # mismatch is suffering from "wrong tool for the job", not a broken
+            # edge. Disabling it just means re-creating it when conditions
+            # return. We only kill agents that fail in their *preferred* regime.
+            _hl_runs = ev.get('total_runs', 0) or 0
+            _hl_wr = ev.get('win_rate', 0.0) or 0.0
+            _hl_pnl = ev.get('total_pnl', 0.0) or 0.0
+            _hl_fit = ev.get('fit_score', 0.5) or 0.5
+            # Regime-bucket reprieve: scan the per-regime breakdown; if any
+            # bucket has a meaningful sample and is profitable with a
+            # respectable WR, the edge clearly exists in at least one regime.
+            # Disabling the whole agent destroys that edge — better to let
+            # the entry-time regime gate keep filtering.
+            _hl_regime_stats = ev.get('regime_stats') or {}
+            _hl_has_winning_bucket = False
+            _hl_winning_bucket_label: Optional[str] = None
+            for _rg_label, _rg in _hl_regime_stats.items():
+                if not isinstance(_rg, dict):
+                    continue
+                _rg_trades = int(_rg.get('trades', 0) or 0)
+                _rg_wr = float(_rg.get('win_rate', 0.0) or 0.0)
+                _rg_pnl = float(_rg.get('pnl', 0.0) or 0.0)
+                if (
+                    _rg_trades >= self.HARD_LOSER_REGIME_BUCKET_MIN_TRADES
+                    and _rg_pnl >= 0.0
+                    and _rg_wr >= self.HARD_LOSER_REGIME_BUCKET_MIN_WR
+                ):
+                    _hl_has_winning_bucket = True
+                    _hl_winning_bucket_label = _rg_label
+                    break
+            if (
+                ev['is_enabled']
+                and _hl_runs >= self.HARD_LOSER_MIN_TRADES
+                and _hl_wr < self.HARD_LOSER_MAX_WIN_RATE
+                and _hl_pnl < self.HARD_LOSER_MAX_PNL
+                and _hl_fit >= self.HARD_LOSER_MIN_FIT_SCORE
+                and not _hl_has_winning_bucket
+                and disables < self.MAX_DISABLES_PER_CYCLE
+            ):
+                proposals.append(StrategyActionProposal(
+                    action="disable_agent",
+                    target_agent_id=ev['agent_id'],
+                    target_agent_name=ev['agent_name'],
+                    strategy_type=ev['strategy_type'],
+                    params={},
+                    rationale=(
+                        f"Hard-loser fast track: {_hl_runs} trades, "
+                        f"WR {_hl_wr:.0%} (< {self.HARD_LOSER_MAX_WIN_RATE:.0%}), "
+                        f"net PnL ${_hl_pnl:+.2f}, in favourable regime "
+                        f"(fit_score {_hl_fit:.2f}). The setup is right and the agent "
+                        f"still can't make money — disabling regardless of combined "
+                        f"score ({ev['combined_score']:.2f})."
+                    ),
+                    initiated_by="joint",
+                    confluence_score=ev.get('confluence', 0.0),
+                    fit_score=_hl_fit,
+                ))
+                disables += 1
+                continue  # don't also evaluate this agent for normal disable/enable
+            elif (
+                ev['is_enabled']
+                and _hl_runs >= self.HARD_LOSER_MIN_TRADES
+                and _hl_wr < self.HARD_LOSER_MAX_WIN_RATE
+                and _hl_pnl < self.HARD_LOSER_MAX_PNL
+                and _hl_fit >= self.HARD_LOSER_MIN_FIT_SCORE
+                and _hl_has_winning_bucket
+            ):
+                # Reprieve granted — log it so the decision is auditable.
+                logger.info(
+                    f"strategy_review: hard-loser reprieve for {ev['agent_name']} "
+                    f"(WR {_hl_wr:.0%}, PnL ${_hl_pnl:+.2f}, {_hl_runs} trades) — "
+                    f"profitable bucket exists in regime '{_hl_winning_bucket_label}'."
+                )
+
             # DISABLE: Very poor combined score + enough data
             if (ev['combined_score'] < self.DISABLE_THRESHOLD_SCORE
                     and ev['is_enabled']
@@ -267,6 +378,37 @@ class StrategyReviewService:
                         f"Technical fit: {ev['fit_reasoning']}"
                     ),
                     initiated_by="joint",
+                    confluence_score=ev['confluence'],
+                    fit_score=ev['fit_score'],
+                ))
+
+            # REGIME-RECOVERY ENABLE: a disabled agent whose preferred regime
+            # has returned should come back, even if its historical PnL is bad.
+            # The combined-score gate above never fires for disabled agents
+            # because stale negative performance drags combined_score below 0.6
+            # forever. This second path looks at fit_score alone — when the
+            # regime is strongly favourable (fit >= 0.75), the agent re-enters
+            # the rotation. The first 5 trades after re-enable are still subject
+            # to all live gates (EV, fee budget, edge-significance with the 1.5×
+            # threshold for neutral regimes), so re-enabling is low-risk.
+            elif (
+                not ev['is_enabled']
+                and ev.get('fit_score', 0.0) >= 0.75
+                and ev.get('confluence', 0.0) >= 0.5
+            ):
+                proposals.append(StrategyActionProposal(
+                    action="enable_agent",
+                    target_agent_id=ev['agent_id'],
+                    target_agent_name=ev['agent_name'],
+                    strategy_type=ev['strategy_type'],
+                    params={},
+                    rationale=(
+                        f"Regime recovery: preferred conditions returned for "
+                        f"{ev['strategy_type']} (fit_score {ev['fit_score']:.2f}, "
+                        f"confluence {ev['confluence']:.2f}). Re-enabling — live "
+                        f"gates will block bad entries. {ev['fit_reasoning']}"
+                    ),
+                    initiated_by="technical_analyst",
                     confluence_score=ev['confluence'],
                     fit_score=ev['fit_score'],
                 ))

@@ -106,11 +106,37 @@ class CIOAgent:
         timestamp = datetime.utcnow()
         agent_metrics = agent_metrics or []
 
-        # Pre-compute these outside the try block so they survive any LLM failure
+        # Compute PnL and capital data for APR
+        _total_pnl = 0.0
+        _starting_capital = 50_000.0
+        _days_elapsed = 1.0
+        try:
+            from app.services.paper_trading import paper_trading
+            _pnl_data = await paper_trading.calculate_pnl()
+            _total_pnl = _pnl_data.get("total_pnl", 0) or 0
+            _balances = await paper_trading.get_all_balances()
+            _usdt = next((b for b in _balances if b.asset == "USDT"), None)
+            if _usdt is not None:
+                _current_balance = _usdt.available + (_usdt.locked or 0)
+                _starting_capital = max(0, _current_balance - _total_pnl)
+            _all_trades = await paper_trading.get_closed_trades(limit=9999)
+            if _all_trades:
+                _first = _all_trades[-1]
+                _fd = _first.get("exit_time") or _first.get("filled_at") or _first.get("created_at")
+                if _fd:
+                    if isinstance(_fd, str):
+                        _fd = datetime.fromisoformat(_fd.replace("Z", "+00:00"))
+                    _days_elapsed = max(1, (datetime.utcnow() - _fd).total_seconds() / 86400)
+        except Exception as _perf_err:
+            logger.debug(f"APR calculation data unavailable: {_perf_err}")
+
         fund_perf = self._calculate_fund_performance(
             agent_metrics,
             fund_performance,
-            current_positions
+            current_positions,
+            total_pnl=_total_pnl,
+            starting_capital=_starting_capital,
+            days_elapsed=_days_elapsed,
         )
         leaderboard = self._generate_leaderboard(agent_metrics, fund_perf)
         strategy_perf = self._analyze_strategy_performance(agent_metrics)
@@ -177,26 +203,34 @@ class CIOAgent:
         self,
         agent_metrics: List[Dict],
         fund_performance: Optional[Dict],
-        current_positions: Optional[Dict]
+        current_positions: Optional[Dict],
+        total_pnl: float = 0.0,
+        starting_capital: float = 50_000.0,
+        days_elapsed: float = 1.0,
     ) -> Dict[str, Any]:
-        """Calculate fund-level performance metrics"""
+        """Calculate fund-level performance metrics with APR/ARR."""
         if fund_performance:
             return fund_performance
 
-        # Fallback: calculate from agent metrics
-        total_pnl = sum(m.get('total_pnl', 0) for m in agent_metrics)
+        if not total_pnl:
+            total_pnl = sum(m.get('total_pnl', 0) for m in agent_metrics)
         total_runs = sum(m.get('total_runs', 0) for m in agent_metrics)
         winning_runs = sum(
             int((m.get('win_rate') or 0) * m.get('total_runs', 0))
             for m in agent_metrics
         )
+        win_rate = winning_runs / total_runs if total_runs > 0 else 0.0
+        total_return_pct = (total_pnl / starting_capital * 100) if starting_capital > 0 else 0.0
+        apr = (total_pnl / starting_capital) * (365 / days_elapsed) * 100 if starting_capital > 0 and days_elapsed > 0 else 0.0
 
         return {
-            'total_return_pct': 0.0,  # Would need balance data
-            'total_pnl': total_pnl,
-            'win_rate': winning_runs / total_runs if total_runs > 0 else 0.0,
-            'sharpe_ratio': 0.0,  # Would need time-series data
-            'max_drawdown_pct': 0.0,  # Would need time-series data
+            'total_return_pct': round(total_return_pct, 4),
+            'total_pnl': round(total_pnl, 2),
+            'win_rate': win_rate,
+            'apr': round(apr, 4),
+            'starting_capital': round(starting_capital, 2),
+            'sharpe_ratio': 0.0,
+            'max_drawdown_pct': 0.0,
             'total_runs': total_runs,
             'profitable_runs': winning_runs
         }
@@ -327,7 +361,8 @@ Provide 2-3 strategic recommendations in JSON format.
 IMPORTANT RULES:
 - Only recommend disable_agent if the agent has ≥15 runs AND win rate < 30% AND P&L is negative.
 - Recommend enable_agent if a disabled agent has ✓ regime fit (shown above) AND backtest results were positive.
-- Momentum, breakout, and trend-following strategies are GOOD in trending_down markets — consider re-enabling them.
+- Momentum, breakout, trend-following, and fair_value_gap strategies are GOOD in trending_up and trending_down markets — consider re-enabling them.
+- Fair value gap (FVG) strategies enter at price imbalances after a change of character; trend-following exit. Best in trending markets, avoid in ranging.
 - Mean-reversion and grid strategies are GOOD in ranging markets — re-enable when regime shifts.
 - Never disable an agent that was just re-enabled (give it at least 15 runs first).
 - Use TRADE LEARNING data (shown above) when it indicates a strategy is systematically failing or excelling.

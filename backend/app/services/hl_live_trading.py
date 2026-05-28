@@ -664,7 +664,7 @@ class HyperliquidLiveTradingService:
             return {"available": 0.0, "total": 0.0, "currency": "USDC", "error": str(exc)}
 
     @classmethod
-    def fee_rate_for(cls, symbol: str) -> float:  # noqa: ARG003
+    def fee_rate_for(cls, symbol: str, venue: str = "hyperliquid") -> float:  # noqa: ARG003
         """Hyperliquid taker fee: 0.035%."""
         return cls.DEFAULT_FEE_RATE
 

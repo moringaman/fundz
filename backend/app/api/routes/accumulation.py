@@ -26,6 +26,7 @@ class ConfigUpdate(BaseModel):
     enabled: Optional[bool] = None
     dca_enabled: Optional[bool] = None
     dca_amount_usd: Optional[float] = None
+    dca_balance_pct: Optional[float] = None
     dca_interval_hours: Optional[int] = None
     va_enabled: Optional[bool] = None
     va_target_growth_rate: Optional[float] = None
@@ -60,16 +61,16 @@ class TransferRequest(BaseModel):
 
 
 @router.post("/deposit")
-async def deposit_usdt(req: TransferRequest):
-    """Deposit USDT into the accumulation fund."""
+async def deposit_usdc(req: TransferRequest):
+    """Deposit USDC into the accumulation fund (Hyperliquid DEX)."""
     if req.amount <= 0:
         raise HTTPException(status_code=400, detail="Amount must be positive")
-    return await accumulation_service.deposit_usdt(req.amount)
+    return await accumulation_service.deposit_usdc(req.amount)
 
 
 @router.post("/transfer-to-trading")
 async def transfer_to_trading(req: TransferRequest):
-    """Transfer USDT from accumulation fund to the trading fund."""
+    """Transfer USDC from accumulation fund to the trading fund."""
     if req.amount <= 0:
         raise HTTPException(status_code=400, detail="Amount must be positive")
     try:
@@ -80,7 +81,7 @@ async def transfer_to_trading(req: TransferRequest):
 
 @router.post("/buy/{asset}")
 async def buy_spot(asset: str, amount: float):
-    """Execute a one-time spot buy into the accumulation fund."""
+    """Execute a one-time spot buy into the accumulation fund (Hyperliquid)."""
     if amount <= 0:
         raise HTTPException(status_code=400, detail="Amount must be positive")
     try:
@@ -91,14 +92,43 @@ async def buy_spot(asset: str, amount: float):
 
 @router.post("/run-dca")
 async def run_dca_manual():
-    """Manually trigger DCA check."""
-    return {"results": await accumulation_service.run_dca()}
+    """Manually trigger DCA check (bypasses schedule, executes immediately)."""
+    return {"results": await accumulation_service.run_dca(force=True)}
 
 
 @router.post("/run-scaleout")
 async def run_scaleout_manual():
     """Manually trigger scale-out check."""
     return {"results": await accumulation_service.check_scale_outs()}
+
+
+@router.get("/executions")
+async def get_executions(asset: Optional[str] = None, strategy: Optional[str] = None, limit: int = 100):
+    """Historical accumulation execution records."""
+    return await accumulation_service.get_executions(asset=asset, strategy=strategy, limit=limit)
+
+
+@router.get("/metrics")
+async def get_metrics():
+    """Aggregated execution counts per (asset, strategy) + portfolio stats."""
+    return await accumulation_service.get_metrics()
+
+
+@router.get("/performance-chart")
+async def get_performance_chart():
+    """Time-series of portfolio value derived from execution history."""
+    return await accumulation_service.get_performance_chart()
+
+
+@router.post("/sync-from-live")
+async def sync_from_live():
+    """Read current Hyperliquid accumulation state and write it to the paper DB.
+
+    Use this after switching accumulation from live mode back to paper mode,
+    so the paper DB reflects the actual on-chain holdings rather than stale data.
+    """
+    await accumulation_service.sync_live_to_paper()
+    return {"status": "synced"}
 
 
 @router.post("/ack-low-balance")

@@ -15,7 +15,7 @@ exposure using the standard portfolio-variance formula
         σ²_portfolio = Σᵢ Σⱼ ρᵢⱼ · wᵢ · wⱼ
 
 where wᵢ is signed fractional notional (positive long, negative short) and ρ
-is the rolling correlation matrix of daily log-returns. The square root of
+is the rolling correlation matrix of 1h log-returns (refreshed every 6h, 360-candle window). The square root of
 that sum is the **effective concentration** as a fraction of capital — it
 collapses to Σ|wᵢ| when correlations are 1.0 (one giant bet) and shrinks
 toward √Σwᵢ² as correlations approach 0 (genuinely diversified).
@@ -37,10 +37,10 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
-CORRELATION_REFRESH_HOURS = 23
-CORRELATION_LOOKBACK_DAYS = 90
-DEFAULT_TIMEFRAME = "1d"
-MIN_RETURN_OBSERVATIONS = 30
+CORRELATION_REFRESH_HOURS = 6
+CORRELATION_LOOKBACK_CANDLES = 360   # 15 days of 1h data
+DEFAULT_TIMEFRAME = "1h"
+MIN_RETURN_OBSERVATIONS = 60
 DEFAULT_FALLBACK_CORRELATION = 0.65
 
 
@@ -103,7 +103,7 @@ class CorrelationService:
             rows = await self._get_phemex().get_klines(
                 symbol=symbol,
                 interval=DEFAULT_TIMEFRAME,
-                limit=CORRELATION_LOOKBACK_DAYS + 5,
+                limit=CORRELATION_LOOKBACK_CANDLES + 5,
             )
         except Exception as e:
             logger.debug(f"correlation: kline fetch failed for {symbol}: {e}")
@@ -175,7 +175,7 @@ class CorrelationService:
             )
             logger.info(
                 f"correlation: refreshed matrix for {len(ordered_syms)} symbols "
-                f"with {min_len} daily-return observations"
+                f"with {min_len} 1h-return observations"
             )
             return self._matrix
 

@@ -43,6 +43,12 @@ strategies:
     agent_naming: ["BTC_Momentum", "ETH_Momentum", "SOL_Momentum_Bull"]
     ai_propose: true
     require_marina: false
+    reversal_limit_order:
+      enabled: true
+      trigger_progress: 0.75
+      size_fib: 0.382
+      tp_fib: 0.382
+      sl_fib: 0.236
 
   ema_crossover:
     label: "EMA Crossover"
@@ -134,6 +140,12 @@ strategies:
     agent_naming: ["BTC_Breakout", "ETH_Surge", "SOL_Breakout"]
     ai_propose: true
     require_marina: false
+    reversal_limit_order:
+      enabled: true
+      trigger_progress: 0.75
+      size_fib: 0.382
+      tp_fib: 0.382
+      sl_fib: 0.236
 
   trend_following:
     label: "Trend Following"
@@ -163,6 +175,12 @@ strategies:
     agent_naming: ["BTC_Trend", "ETH_TrendRider", "Macro_Trend"]
     ai_propose: true
     require_marina: false
+    reversal_limit_order:
+      enabled: true
+      trigger_progress: 0.75
+      size_fib: 0.382
+      tp_fib: 0.382
+      sl_fib: 0.236
 
   scalping:
     label: "Scalping"
@@ -275,6 +293,12 @@ strategies:
     agent_naming: ["BTC_AI_Agent", "ETH_Intelligence", "AI_Macro"]
     ai_propose: true
     require_marina: false
+    reversal_limit_order:
+      enabled: true
+      trigger_progress: 0.75
+      size_fib: 0.382
+      tp_fib: 0.382
+      sl_fib: 0.236
 
   fractal:
     label: "Fractal Breakout"
@@ -405,5 +429,33 @@ strategies:
       - "BTC_RegimeSwitch"
       - "ETH_RegimeSwitch"
       - "SOL_RegimeSwitch"
+    ai_propose: true
+    require_marina: false
+
+  fair_value_gap:
+    label: "Fair Value Gap"
+    description: "Trades when three-candle imbalances (FVGs) form after a change of character. Enters at the FVG midpoint with tight stops, targeting a return to the gap zone. Best in trending markets where imbalances are respected."
+    ai_guidance: |
+      FVG agents only trade when a Fair Value Gap pattern is detected by the Technical Analyst.
+      Wait for a bullish FVG (three bullish candles with a gap between candle 1 high and candle 3 low)
+      to go LONG, or a bearish FVG (three bearish candles with a gap between candle 1 low and candle 3 high)
+      to go SHORT. Entry at the FVG midpoint. SL just beyond the gap extreme. TP at 1× gap height.
+      Do NOT trade if no FVG pattern is present — this strategy has zero other indicators.
+      Best in trending_up or trending_down markets where FVGs act as support/resistance.
+    market_conditions: ["trending_up", "trending_down"]
+    avoid_conditions: ["ranging"]
+    timeframes:
+      default: "1h"
+      allowed: ["15m", "30m", "1h", "4h"]
+    risk:
+      stop_loss_pct: 2.0
+      take_profit_pct: 6.0
+      trailing_stop_pct: 3.0
+      max_portfolio_risk_pct: 4.0
+    indicators: {}
+    agent_naming:
+      - "BTC_FVG"
+      - "ETH_FVG"
+      - "SOL_FVG"
     ai_propose: true
     require_marina: false

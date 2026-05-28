@@ -33,6 +33,7 @@ export function SettingsPage() {
     max_leveraged_notional_pct: 200,
     liquidation_buffer_pct: 12.5,
     exposure_threshold_pct: 80,
+    max_correlated_exposure_pct: 30,
   });
 
   // ── Trading Preferences state ──
@@ -42,6 +43,7 @@ export function SettingsPage() {
     paper_trading_default: true,
     auto_confirm_orders: false,
     default_order_type: 'limit',
+    trading_venue: 'hyperliquid',
     trading_pairs: [
       'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'ADAUSDT',
       'DOGEUSDT', 'BNBUSDT', 'AVAXUSDT', 'LINKUSDT', 'DOTUSDT',
@@ -141,12 +143,12 @@ export function SettingsPage() {
     sr_proximity_block_pct: 0.005,
     max_daily_fees_pct: 0.5,
     fee_coverage_guard_enabled: true,
-    fee_coverage_min_ratio: 2.5,
+    fee_coverage_min_ratio: 1.5,
     fee_coverage_min_fees_usd: 25,
     fee_coverage_window_trades: 60,
     fee_coverage_min_closed_trades: 8,
     fee_coverage_include_slippage: true,
-    fee_coverage_slippage_bps: 2.0,
+    fee_coverage_slippage_bps: 1.0,
     fee_coverage_include_funding: true,
     leverage_enabled: true,
     leverage_confidence_threshold: 0.75,
@@ -332,12 +334,12 @@ export function SettingsPage() {
       await settingsApi.updateApiKeys(apiForm);
       showToast('API keys saved successfully', 'success');
       setApiForm(prev => ({ ...prev, phemex_api_key: '', phemex_api_secret: '' }));
-      refetchSettings();
     } catch (err) {
       showToast('Failed to save API keys', 'error');
     } finally {
       setSaving(false);
     }
+    refetchSettings();
   };
 
   const handleSaveRiskLimits = async () => {
@@ -345,12 +347,12 @@ export function SettingsPage() {
     try {
       await settingsApi.updateRiskLimits(riskForm);
       showToast('Risk limits updated', 'success');
-      refetchSettings();
     } catch (err) {
       showToast('Failed to update risk limits', 'error');
     } finally {
       setSaving(false);
     }
+    refetchSettings();
   };
 
   const handleSaveTradingPrefs = async () => {
@@ -358,12 +360,12 @@ export function SettingsPage() {
     try {
       await settingsApi.updateTradingPrefs(tradingForm);
       showToast('Trading preferences updated', 'success');
-      refetchSettings();
     } catch (err) {
       showToast('Failed to update trading preferences', 'error');
     } finally {
       setSaving(false);
     }
+    refetchSettings();
   };
 
   const handleSaveLlmConfig = async () => {
@@ -381,12 +383,12 @@ export function SettingsPage() {
       await settingsApi.updateLlmConfig(payload);
       showToast('LLM configuration updated', 'success');
       setLlmForm(prev => ({ ...prev, openai_api_key: '', anthropic_api_key: '', openrouter_api_key: '' }));
-      refetchSettings();
     } catch (err) {
       showToast('Failed to update LLM config', 'error');
     } finally {
       setSaving(false);
     }
+    refetchSettings();
   };
 
   const handleSaveGates = async () => {
@@ -394,12 +396,17 @@ export function SettingsPage() {
     try {
       await settingsApi.updateTradingGates(gatesForm);
       showToast('Trading gates updated', 'success');
-      refetchSettings();
     } catch (err) {
       showToast('Failed to update trading gates', 'error');
-    } finally {
       setSaving(false);
+      return;
     }
+    try {
+      await refetchSettings();
+    } catch {
+      // Refetch failure is non-fatal — save already succeeded
+    }
+    setSaving(false);
   };
 
   const tabs: { id: SettingsTab; label: string; icon: React.ReactNode }[] = [
@@ -703,6 +710,23 @@ export function SettingsPage() {
             </div>
           </div>
 
+          {/* Correlated Exposure Limit */}
+          <div style={{ marginTop: '.25rem' }}>
+            <label className="settings-label">
+              Max Correlated Exposure — <span style={{ fontWeight: 700, color: riskForm.max_correlated_exposure_pct > 50 ? 'var(--red)' : riskForm.max_correlated_exposure_pct > 40 ? 'var(--amber)' : 'var(--green)' }}>{riskForm.max_correlated_exposure_pct}%</span>
+            </label>
+            <p style={{ fontSize: '.68rem', color: 'var(--text-secondary)', margin: '0 0 .35rem' }}>
+              Correlation-weighted directional exposure limit. Blocks new trades when √(∑ρw²) exceeds this. Higher = more concentrated bets allowed.
+            </p>
+            <input
+              type="range" min="10" max="80" step="5"
+              className="slider"
+              value={riskForm.max_correlated_exposure_pct}
+              onChange={e => setRiskForm({ ...riskForm, max_correlated_exposure_pct: parseFloat(e.target.value) })}
+            />
+            <div className="slider-labels"><span>10% (tight)</span><span>80% (loose)</span></div>
+          </div>
+
           {/* Exposure Threshold */}
           <div style={{ marginTop: '.25rem' }}>
             <label className="settings-label">
@@ -831,6 +855,23 @@ export function SettingsPage() {
                     {ot}
                   </button>
                 ))}
+              </div>
+            </div>
+
+            <div className="form-group">
+              <label className="form-label">Trading Venue</label>
+              <select
+                className="settings-input"
+                style={{ marginBottom: 0, cursor: 'pointer', textTransform: 'capitalize' }}
+                value={tradingForm.trading_venue}
+                onChange={e => setTradingForm({ ...tradingForm, trading_venue: e.target.value })}
+              >
+                <option value="hyperliquid">Hyperliquid</option>
+                <option value="phemex">Phemex</option>
+                <option value="alpaca">Alpaca</option>
+              </select>
+              <div style={{ fontSize: '.65rem', color: 'var(--text-dim)', marginTop: '.2rem' }}>
+                Overrides individual agent venues. All trades will use this exchange.
               </div>
             </div>
           </div>

@@ -114,13 +114,32 @@ class DailyReportService:
             total = pnl.get("total_pnl", 0)
             realized = pnl.get("realized_pnl", 0)
             unrealized = pnl.get("unrealized_pnl", 0)
-            # Approximate daily return based on a 50k starting balance
-            daily_return = (total / 50000) * 100 if total else 0
+            balances = await paper_trading.get_all_balances()
+            usdt = next((b for b in balances if b.asset == "USDT"), None)
+            current_balance = (usdt.available + (usdt.locked or 0)) if usdt else 50000.0
+            starting_capital = max(0, current_balance - total) if total else current_balance
+            daily_return = (total / starting_capital * 100) if starting_capital > 0 else 0
+            # APR: annualize from first trade date
+            apr = 0.0
+            try:
+                all_trades = await paper_trading.get_closed_trades(limit=9999)
+                if all_trades:
+                    t = all_trades[-1]
+                    first_date = t.get("exit_time") or t.get("filled_at") or t.get("created_at")
+                    if first_date:
+                        if isinstance(first_date, str):
+                            first_date = datetime.fromisoformat(first_date.replace("Z", "+00:00"))
+                        days = max(1, (datetime.utcnow() - first_date).total_seconds() / 86400)
+                        apr = (total / starting_capital) * (365 / days) * 100
+            except Exception:
+                pass
             return {
                 "total_pnl": total,
                 "realized_pnl": realized,
                 "unrealized_pnl": unrealized,
                 "daily_return_pct": round(daily_return, 4),
+                "apr": round(apr, 4),
+                "starting_capital": round(starting_capital, 2),
             }
         except Exception as e:
             logger.error(f"Daily report – PnL gather failed: {e}")
@@ -162,14 +181,24 @@ class DailyReportService:
     async def _gather_positions(self) -> list:
         try:
             from app.services.paper_trading import paper_trading
-            positions = await paper_trading.get_positions_live()
+            positions = list(await paper_trading.get_positions_live() or [])
+            # Also fetch live positions when in live mode
+            try:
+                from app.api.routes.settings import get_trading_prefs
+                if not get_trading_prefs().paper_trading_default:
+                    from app.services.live_trading import live_trading
+                    positions.extend(list(await live_trading.get_positions() or []))
+                    from app.services.hl_live_trading import hl_live_trading
+                    positions.extend(list(await hl_live_trading.get_positions() or []))
+            except Exception:
+                pass
             return [
                 {
-                    "symbol": p.get("symbol", ""),
-                    "side": p.get("side", ""),
-                    "quantity": p.get("quantity", 0),
-                    "entry_price": p.get("entry_price", 0),
-                    "unrealized_pnl": p.get("unrealized_pnl", 0),
+                    "symbol": p.get("symbol", "") if isinstance(p, dict) else getattr(p, 'symbol', ''),
+                    "side": p.get("side", "") if isinstance(p, dict) else str(getattr(getattr(p, 'side', None), 'value', getattr(p, 'side', ''))),
+                    "quantity": p.get("quantity", 0) if isinstance(p, dict) else getattr(p, 'quantity', 0),
+                    "entry_price": p.get("entry_price", 0) if isinstance(p, dict) else getattr(p, 'entry_price', 0),
+                    "unrealized_pnl": p.get("unrealized_pnl", 0) if isinstance(p, dict) else getattr(p, 'unrealized_pnl', 0),
                 }
                 for p in positions
             ]

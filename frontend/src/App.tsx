@@ -25,7 +25,7 @@ import { SettingsPage } from './pages/SettingsPage';
 import { WhalePage } from './pages/WhalePage';
 import { WorkflowsPage } from './pages/WorkflowsPage';
 import { useAppSelector, useAppDispatch } from './store/hooks';
-import { setSidebarOpen } from './store/slices/uiSlice';
+import { setSidebarOpen, toggleSidebarCollapsed } from './store/slices/uiSlice';
 import './index.css';
 
 const routeToPage: Record<string, string> = {
@@ -73,7 +73,7 @@ function App() {
       <main className="main-content">
         <LiveModeBanner />
         <div className="mobile-header">
-          <button type="button" onClick={() => dispatch(setSidebarOpen(true))} className="mobile-menu-btn">
+          <button type="button" onClick={() => dispatch(toggleSidebarCollapsed())} className="mobile-menu-btn">
             <Menu size={22} />
           </button>
           <span className="sidebar-logo">AAAAAAAI</span>PX

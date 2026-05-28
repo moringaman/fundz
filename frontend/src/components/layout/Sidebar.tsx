@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
-import { Activity, Bot, Wallet, Settings, X, TrendingUp, History, Zap, Users, MessageCircle, BarChart2, GitBranch, Clock, PiggyBank } from 'lucide-react';
+import { Activity, Bot, Wallet, Settings, TrendingUp, History, Zap, Users, MessageCircle, BarChart2, GitBranch, Clock, PiggyBank, PanelLeftClose, PanelLeftOpen } from 'lucide-react';
 import { useAppSelector, useAppDispatch } from '../../store/hooks';
-import { setSidebarOpen } from '../../store/slices/uiSlice';
+import { setSidebarOpen, toggleSidebarCollapsed } from '../../store/slices/uiSlice';
 import { useAutomationStatus, useAgents, usePaperOrders, useTradeHistory, useFundTeamStatus } from '../../hooks/useQueries';
 import { pendingOrderApi } from '../../lib/api';
 import { NavBadge } from '../common/NavBadge';
@@ -34,20 +34,25 @@ function getHourInTimeZone(now: Date, timeZone: string): number {
   );
 }
 
-function getVolumeTier(now: Date): 'high' | 'good' | 'low' {
-  const utcHour = new Date().getUTCHours();
-  
-  // NY + London overlap (14:00-16:00 UTC) - peak volume
-  if (utcHour >= 14 && utcHour < 16) return 'high';
-  
-  // London session (08:00-16:00 UTC)
-  if (utcHour >= 8 && utcHour < 16) return 'good';
-  
-  // NY session (14:00-21:00 UTC)
-  if (utcHour >= 14 && utcHour < 21) return 'good';
-  
-  // Everything else is low volume (dead zones)
+function getVolumeTier(klines: { volume: number }[]): 'high' | 'good' | 'low' {
+  if (klines.length < 48) {
+    return 'good';
+  }
+  const recent = klines.slice(-24).reduce((a, b) => a + b.volume, 0);
+  const prior = klines.slice(-48, -24).reduce((a, b) => a + b.volume, 0);
+  if (prior <= 0) return 'good';
+  const ratio = recent / prior;
+  if (ratio >= 1.5) return 'high';
+  if (ratio >= 0.7) return 'good';
   return 'low';
+}
+
+function fmtVolume(volume24h: number | undefined): string {
+  if (!volume24h || volume24h <= 0) return '—';
+  if (volume24h >= 1_000_000_000) return `$${(volume24h / 1_000_000_000).toFixed(2)}B`;
+  if (volume24h >= 1_000_000) return `$${(volume24h / 1_000_000).toFixed(1)}M`;
+  if (volume24h >= 1_000) return `$${(volume24h / 1_000).toFixed(0)}K`;
+  return `$${volume24h.toFixed(0)}`;
 }
 
 export function Sidebar({ activePage, onNavigate }: SidebarProps) {
@@ -56,6 +61,8 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
   const sidebarOpen = useAppSelector((s) => s.ui.sidebarOpen);
   const signal = useAppSelector((s) => s.market.signal);
   const selectedSymbol = useAppSelector((s) => s.market.selectedSymbol);
+  const tickerVolume = useAppSelector((s) => s.market.ticker?.volume);
+  const klines = useAppSelector((s) => s.market.klines);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -105,7 +112,24 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
 
   const sigAction = signal?.action;
 
-  const closeSidebar = () => dispatch(setSidebarOpen(false));
+  // On mobile, sidebar is always visible — collapsed strip by default.
+  // The hamburger menu toggles between collapsed (56px) and expanded.
+  useEffect(() => {
+    if (window.innerWidth <= 1024) {
+      dispatch(setSidebarOpen(true));
+    }
+  }, []);
+
+  const closeSidebar = () => {
+    // On mobile, collapse instead of closing
+    if (window.innerWidth <= 1024) {
+      if (!sidebarCollapsed) dispatch(toggleSidebarCollapsed());
+    } else {
+      dispatch(setSidebarOpen(false));
+    }
+  };
+  const sidebarCollapsed = useAppSelector((s) => s.ui.sidebarCollapsed);
+  const toggleCollapsed = () => dispatch(toggleSidebarCollapsed());
 
   const navigate = (page: string) => {
     onNavigate(page);
@@ -114,32 +138,25 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
 
   return (
     <>
-      <button
-        className={`sidebar-overlay ${sidebarOpen ? 'visible' : ''}`}
-        onClick={closeSidebar}
-        onKeyDown={(e) => e.key === 'Escape' && closeSidebar()}
-        aria-label="Close sidebar"
-        type="button"
-      />
-
-      <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`}>
+      <aside className={`sidebar ${sidebarOpen ? 'open' : ''} ${sidebarCollapsed ? 'collapsed' : ''}`}>
         <div className="sidebar-header">
           <span className="sidebar-logo">
             PX<span>·</span>AI
           </span>
-          <button type="button" onClick={closeSidebar} className="header-btn">
-            <X size={16} />
+          <button type="button" onClick={toggleCollapsed} className="header-btn" title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}>
+            {sidebarCollapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
           </button>
         </div>
 
         <div className="sidebar-market-clocks">
           {(() => {
-            const tier = getVolumeTier(clockNow);
+            const tier = getVolumeTier(klines);
+            const volStr = fmtVolume(tickerVolume);
             return (
               <div className={`volume-indicator volume-${tier}`}>
-                <span className="volume-label">Volume</span>
+                <span className="volume-label">Volume 24h</span>
                 <span className="volume-tier">
-                  {tier === 'high' ? '● High' : tier === 'good' ? '○ Good' : '○ Low'}
+                  {tier === 'high' ? '● High' : tier === 'good' ? '○ Med' : '○ Low'} · {volStr}
                 </span>
               </div>
             );
@@ -262,9 +279,14 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
           </button>
         </nav>
 
-        <SidebarTeamFeed onNavigate={navigate} />
+        <div className="sidebar-footer">
+          <SidebarTeamFeed onNavigate={navigate} />
+          <SidebarTicker />
 
-        <SidebarTicker />
+          <button type="button" onClick={toggleCollapsed} className="collapse-btn header-btn" title={sidebarCollapsed ? 'Expand' : 'Collapse'}>
+            {sidebarCollapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
+          </button>
+        </div>
       </aside>
     </>
   );

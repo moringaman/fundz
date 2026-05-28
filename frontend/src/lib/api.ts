@@ -299,4 +299,20 @@ export const pendingOrderApi = {
   cleanup: (maxAgeMinutes = 120) => api.post('paper/pending-orders/cleanup', null, { params: { max_age_minutes: maxAgeMinutes } }),
 };
 
+export const accumulationApi = {
+  getPortfolio: () => api.get('accumulation/portfolio'),
+  getConfigs: () => api.get('accumulation/configs'),
+  updateConfig: (data: any) => api.put('accumulation/configs', data),
+  deleteConfig: (asset: string) => api.delete(`accumulation/configs/${asset}`),
+  deposit: (amount: number) => api.post('accumulation/deposit', { amount }),
+  transferToTrading: (amount: number) => api.post('accumulation/transfer-to-trading', { amount }),
+  buySpot: (asset: string, amount: number) => api.post(`accumulation/buy/${asset}?amount=${amount}`),
+  runDca: () => api.post('accumulation/run-dca'),
+  runScaleout: () => api.post('accumulation/run-scaleout'),
+  getExecutions: (params?: { asset?: string; strategy?: string; limit?: number }) =>
+    api.get('accumulation/executions', { params }),
+  getMetrics: () => api.get('accumulation/metrics'),
+  getPerformanceChart: () => api.get('accumulation/performance-chart'),
+};
+
 export default api;

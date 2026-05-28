@@ -469,6 +469,24 @@ body {
   flex-direction: column;
   gap: .4rem;
 }
+.collapse-btn {
+  align-self: flex-end;
+  background: transparent;
+  border: 1px solid var(--border-mid);
+  color: var(--text-secondary);
+  cursor: pointer;
+  border-radius: 6px;
+  padding: .3rem .5rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all .15s;
+}
+.collapse-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-dim);
+}
 
 .sidebar-ticker {
   display: flex;
@@ -481,20 +499,119 @@ body {
 .sidebar-ticker-change.up { color: var(--green); }
 .sidebar-ticker-change.down { color: var(--red); }
 
-/* ── Mobile ──────────────────────────────────────────────────────────── */
-@media (max-width: 640px) {
+/* ── Collapsed sidebar ───────────────────────────────────────────────── */
+.sidebar.collapsed {
+  width: 56px;
+}
+.sidebar.collapsed .sidebar-header {
+  justify-content: center;
+  padding: 1rem .5rem;
+}
+.sidebar.collapsed .sidebar-header .header-btn {
+  display: none;
+}
+.sidebar.collapsed .sidebar-logo {
+  font-size: .8rem;
+}
+.sidebar.collapsed .sidebar-logo span {
+  display: none;
+}
+.sidebar.collapsed .sidebar-market-clocks,
+.sidebar.collapsed .nav-item span,
+.sidebar.collapsed .nav-item .nav-badge,
+.sidebar.collapsed .sidebar-footer > *:not(.collapse-btn) {
+  display: none;
+}
+.sidebar.collapsed .nav-item {
+  justify-content: center;
+  padding: .65rem .5rem;
+}
+.sidebar.collapsed .sidebar-footer {
+  padding: .5rem;
+  align-items: center;
+}
+.sidebar.collapsed .sidebar-footer .collapse-btn {
+  padding: .4rem;
+  width: 32px;
+  height: 32px;
+  border-radius: 6px;
+}
+
+/* ── Mobile / small screens ──────────────────────────────────────────── */
+@media (max-width: 1024px) {
   .sidebar {
     position: fixed; inset: 0 auto 0 0;
-    transform: translateX(-100%);
+    width: 56px;
+    transform: none;
+    z-index: 100;
+    transition: width 0.2s cubic-bezier(.4,0,.2,1);
   }
-  .sidebar.open { transform: translateX(0); }
-  .sidebar-overlay {
+  .sidebar.open {
+    width: var(--sidebar-width);
+  }
+  .sidebar .sidebar-market-clocks,
+  .sidebar .nav-item span,
+  .sidebar .nav-item .nav-badge,
+  .sidebar .sidebar-footer > *:not(.collapse-btn) {
     display: none;
-    position: fixed; inset: 0;
-    background: rgba(0,0,0,.6);
-    z-index: 99;
   }
-  .sidebar-overlay.visible { display: block; }
+  .sidebar .nav-item {
+    justify-content: center;
+    padding: .65rem .5rem;
+  }
+  .sidebar .sidebar-header {
+    justify-content: center;
+    padding: 1rem .5rem;
+  }
+  .sidebar .sidebar-header .header-btn {
+    display: none;
+  }
+  .sidebar .sidebar-logo {
+    font-size: .8rem;
+  }
+  .sidebar .sidebar-logo span {
+    display: none;
+  }
+  .sidebar .sidebar-footer {
+    padding: .5rem;
+    align-items: center;
+  }
+  .sidebar .sidebar-footer .collapse-btn {
+    padding: .4rem;
+    width: 32px;
+    height: 32px;
+    border-radius: 6px;
+  }
+  .sidebar.open .sidebar-market-clocks,
+  .sidebar.open .nav-item span,
+  .sidebar.open .nav-item .nav-badge,
+  .sidebar.open .sidebar-footer > *:not(.collapse-btn) {
+    display: flex;
+  }
+  .sidebar.open .nav-item {
+    justify-content: flex-start;
+    padding: .5rem .75rem;
+  }
+  .sidebar.open .sidebar-header {
+    justify-content: space-between;
+    padding: 1rem;
+  }
+  .sidebar.open .sidebar-header .header-btn {
+    display: flex;
+  }
+  .sidebar.open .sidebar-logo {
+    font-size: .95rem;
+  }
+  .sidebar.open .sidebar-logo span {
+    display: inline;
+  }
+  .sidebar.open .sidebar-footer {
+    padding: .75rem 1rem;
+    align-items: stretch;
+  }
+  .sidebar-overlay {
+    display: none !important;
+  }
   .mobile-header {
     display: flex;
     align-items: center;
@@ -511,9 +628,25 @@ body {
     border-radius: 7px;
     color: var(--text-primary);
     cursor: pointer;
+    transition: all .15s;
   }
-  .page-inner { padding: 1rem; }
+  .mobile-menu-btn:hover { border-color: var(--accent); }
+  .page-inner {
+    padding: 1rem;
+  }
+  .page-title { font-size: 1rem; }
+  .app-container {
+    padding-left: 56px;
+  }
 }
+
+/* ── Desktop: collapse sidebar styling above breakpoint ──────────────── */
+@media (min-width: 1025px) {
+  .sidebar.collapsed .sidebar-header .header-btn {
+    display: flex;
+  }
+}
+
 @media (min-width: 641px) { .mobile-header { display: none; } }
 
 /* ── Utility ─────────────────────────────────────────────────────────── */

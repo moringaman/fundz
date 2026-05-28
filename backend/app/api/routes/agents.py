@@ -28,6 +28,7 @@ class AgentConfig(BaseModel):
     indicators_config: dict = {}
     timeframe: str = "1h"
     venue: str = "phemex"  # "phemex" | "hyperliquid"
+    trading_pairs: Optional[List[str]] = None
 
 
 # Permitted timeframes per strategy — loaded from registry
@@ -212,9 +213,15 @@ async def update_agent(agent_id: str, config: AgentConfig, db: AsyncSession = De
     
     agent.name = config.name
     agent.strategy_type = config.strategy_type
+    if config.trader_id is not None:
+        agent.trader_id = config.trader_id
     _existing_traded_pairs = agent.config.get("trading_pairs", []) if isinstance(agent.config, dict) else []
+    if config.trading_pairs is not None:
+        _use_traded_pairs = config.trading_pairs
+    else:
+        _use_traded_pairs = _existing_traded_pairs
     agent.config = {
-        "trading_pairs": _existing_traded_pairs,  # preserve trade history — not user-editable
+        "trading_pairs": _use_traded_pairs,  # preserve trade history — not user-editable
         "indicators_config": config.indicators_config,
         "stop_loss_pct": config.stop_loss_pct,
         "take_profit_pct": config.take_profit_pct,

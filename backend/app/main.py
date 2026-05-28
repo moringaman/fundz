@@ -526,6 +526,18 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Settings load from DB failed (using defaults): {e}")
 
+    # Explicitly reload Telegram config bypassing the _settings_loaded guard,
+    # since the telegram_service singleton may have been re-initialised between
+    # startup and the first lifespan run (common under --reload).
+    try:
+        from app.api.routes.settings import _load_setting, _apply_telegram_config, TelegramSettingsModel
+        _tg_data = await _load_setting("telegram")
+        if _tg_data:
+            _apply_telegram_config(TelegramSettingsModel(**_tg_data))
+            logger.info("Telegram config applied to runtime service")
+    except Exception as e:
+        logger.warning(f"Telegram config apply failed: {e}")
+
     # Wire team chat broadcasts to the WS connection manager
     from app.services.team_chat import team_chat
     team_chat.set_broadcast(lambda msg: manager.broadcast(msg))

@@ -60,6 +60,40 @@ class PaperTradingService:
             return cls.ALPACA_FEE_RATE
         return cls.CONTRACT_FEE_RATE
 
+    # ── Slippage model ─────────────────────────────────────────────────
+    # Bps applied against the trader on every market fill so paper P&L
+    # matches live execution. Without this, paper backtests routinely
+    # over-state win rate by 5-8pts vs. live trading because real fills
+    # cross the spread and walk the book.
+    #   BUY  → fill higher (price * (1 + slip))
+    #   SELL → fill lower  (price * (1 - slip))
+    SLIPPAGE_BPS_NORMAL = 1.5      # 0.015% — typical mid-liquidity market entry
+    SLIPPAGE_BPS_ADVERSE = 3.0     # 0.030% — wide-spread / band-extreme entries
+
+    @classmethod
+    def _apply_slippage(
+        cls,
+        price: float,
+        side: str,
+        adverse: bool = False,
+    ) -> float:
+        """Return fill price after applying execution slippage against the trader.
+
+        side: "buy" or "sell" (case-insensitive).
+        adverse: True when filling at a known-bad-liquidity zone (mean-reversion
+                 entries at BB extremes, post-stop-out re-entries, etc.).
+        """
+        if price is None or price <= 0:
+            return price
+        bps = cls.SLIPPAGE_BPS_ADVERSE if adverse else cls.SLIPPAGE_BPS_NORMAL
+        slip = bps / 10000.0
+        s = (side.value if hasattr(side, "value") else str(side)).lower()
+        if s == "buy":
+            return price * (1.0 + slip)
+        if s == "sell":
+            return price * (1.0 - slip)
+        return price
+
     @staticmethod
     def quote_currency(symbol: str) -> str:
         """Return the quote currency for a symbol.
@@ -191,28 +225,46 @@ class PaperTradingService:
                     f"(pattern={pattern_type or 'none'}, tol={_tol:.2f}%)"
                 )
                 # Persist pending order before raising so it's visible in the UI
+                # But only if there isn't already an identical pending order — otherwise
+                # every scheduler cycle creates a duplicate at the same price.
                 try:
                     async with get_async_session() as _pending_db:
-                        _pending = PaperOrder(
-                            id=str(uuid.uuid4()),
-                            user_id="default-user",
-                            agent_id=agent_id,
-                            trader_id=trader_id,
-                            symbol=symbol,
-                            side=side,
-                            quantity=quantity,
-                            price=float(entry_price),
-                            total=0,
-                            fee=0,
-                            leverage=max(float(leverage or 1.0), 1.0),
-                            margin_used=0,
-                            status=OrderStatus.PENDING,
-                            is_paper=True,
-                            created_at=datetime.now(),
-                            phemex_order_id=order_type,  # store "Limit" or "Stop" for fill logic
+                        _dup_check = await _pending_db.execute(
+                            select(PaperOrder).where(
+                                PaperOrder.user_id == "default-user",
+                                PaperOrder.agent_id == agent_id,
+                                PaperOrder.symbol == symbol,
+                                PaperOrder.side == side,
+                                PaperOrder.price == float(entry_price),
+                                PaperOrder.status == OrderStatus.PENDING,
+                            )
                         )
-                        _pending_db.add(_pending)
-                        await _pending_db.commit()
+                        if _dup_check.scalar_one_or_none() is not None:
+                            self.logger.info(
+                                f"Deferred order already exists for {symbol} at {entry_price:.6g} "
+                                f"— skipping duplicate"
+                            )
+                        else:
+                            _pending = PaperOrder(
+                                id=str(uuid.uuid4()),
+                                user_id="default-user",
+                                agent_id=agent_id,
+                                trader_id=trader_id,
+                                symbol=symbol,
+                                side=side,
+                                quantity=quantity,
+                                price=float(entry_price),
+                                total=0,
+                                fee=0,
+                                leverage=max(float(leverage or 1.0), 1.0),
+                                margin_used=0,
+                                status=OrderStatus.PENDING,
+                                is_paper=True,
+                                created_at=datetime.now(),
+                                phemex_order_id=order_type,
+                            )
+                            _pending_db.add(_pending)
+                            await _pending_db.commit()
                 except Exception as _pe:
                     self.logger.warning(f"Failed to persist pending order: {_pe}")
                 raise PatternEntryDeferred(
@@ -223,6 +275,12 @@ class PaperTradingService:
                     pattern_type=pattern_type,
                 )
             price = float(entry_price)
+
+        # ── Apply execution slippage on market fills ───────────────────
+        # Limit / Stop orders (handled above) fill at the requested
+        # entry_price by definition, so only Market orders take slippage.
+        if order_type == "Market":
+            price = self._apply_slippage(float(price), side, adverse=False)
 
         async with get_async_session() as db:
             _quote = self.quote_currency(symbol)
@@ -748,6 +806,9 @@ class PaperTradingService:
             quantity = pos.quantity
             side = pos.side.value if hasattr(pos.side, "value") else str(pos.side)
             entry = pos.entry_price or 0
+            _sl = getattr(pos, 'stop_loss_price', None)
+            _tp = getattr(pos, 'take_profit_price', None)
+            _trail = getattr(pos, 'trailing_stop_pct', None)
 
         # Fetch live price
         try:
@@ -764,7 +825,16 @@ class PaperTradingService:
             quantity=quantity,
             price=current_price,
             agent_id=pos.agent_id,
+            stop_loss_price=_sl,
+            take_profit_price=_tp,
+            trailing_stop_pct=_trail,
         )
+
+        # Cancel any pending orders for this agent/symbol — the thesis is done
+        try:
+            await self.cancel_pending_for_agent_symbol(pos.agent_id, symbol)
+        except Exception:
+            pass
 
         is_short = side.lower() == "sell"
         if is_short:
@@ -783,6 +853,26 @@ class PaperTradingService:
             "leverage": getattr(pos, 'leverage', 1.0) or 1.0,
             "order": order,
         }
+
+    async def cancel_pending_for_agent_symbol(self, agent_id: str, symbol: str) -> int:
+        """Cancel all pending orders for an agent/symbol pair. Returns count cancelled."""
+        cancelled = 0
+        async with get_async_session() as db:
+            orders = await db.execute(
+                select(PaperOrder).where(
+                    PaperOrder.user_id == "default-user",
+                    PaperOrder.agent_id == agent_id,
+                    PaperOrder.symbol == symbol,
+                    PaperOrder.status == OrderStatus.PENDING,
+                )
+            )
+            for o in orders.scalars().all():
+                o.status = OrderStatus.CANCELLED
+                cancelled += 1
+            if cancelled:
+                await db.commit()
+                self.logger.info(f"Cancelled {cancelled} pending orders for {symbol} (agent {agent_id})")
+        return cancelled
 
     async def partial_close(
         self,
@@ -821,6 +911,11 @@ class PaperTradingService:
             entry = pos.entry_price or price
             side_str = pos.side.value if hasattr(pos.side, "value") else str(pos.side)
             is_long = side_str.upper() == "BUY"
+
+            # Apply exit slippage: closing a long sells into the bid (lower fill);
+            # closing a short buys the ask (higher fill).
+            close_side_str = "sell" if is_long else "buy"
+            price = self._apply_slippage(float(price), close_side_str, adverse=False)
 
             # Raw P&L on the slice
             if is_long:
@@ -1026,6 +1121,15 @@ class PaperTradingService:
             order.filled_at = datetime.now()
 
             # Deduct notional + fee from quote balance
+            # Guard: if balance can't cover notional + fee, cancel instead of going negative
+            if usdt_balance.available < notional + fee:
+                self.logger.warning(
+                    f"Insufficient balance to fill pending {order.symbol} {order.side}: "
+                    f"need ${notional + fee:.2f}, have ${usdt_balance.available:.2f}. Cancelling."
+                )
+                order.status = OrderStatus.CANCELLED
+                await db.commit()
+                return
             usdt_balance.available -= notional
             usdt_balance.available -= fee
 
@@ -1148,7 +1252,7 @@ class PaperTradingService:
             self.logger.info(f"Pending order {order.id} filled: {order.symbol} @ {fill_price:.6f}")
 
 
-    async def get_closed_trades(self, symbol: Optional[str] = None, limit: int = 100, include_archived: bool = False) -> List[dict]:
+    async def get_closed_trades(self, symbol: Optional[str] = None, limit: int = 100, include_archived: bool = False, agent_id: Optional[str] = None) -> List[dict]:
         """Return completed round-trip trades with realised P&L.
 
         Uses FIFO matching: for longs, each sell is matched against earliest
@@ -1169,6 +1273,8 @@ class PaperTradingService:
             )
             if symbol:
                 query = query.where(PaperOrder.symbol == symbol)
+            if agent_id:
+                query = query.where(PaperOrder.agent_id == agent_id)
             result = await db.execute(query)
             orders = list(result.scalars().all())
 
@@ -1180,6 +1286,8 @@ class PaperTradingService:
                     _arch_query = _arch_sel(ArchivedTrade).order_by(ArchivedTrade.created_at.asc().nullsfirst())
                     if symbol:
                         _arch_query = _arch_query.where(ArchivedTrade.symbol == symbol)
+                    if agent_id:
+                        _arch_query = _arch_query.where(ArchivedTrade.agent_id == agent_id)
                     _arch_result = await db.execute(_arch_query)
                     _arch_rows = _arch_result.scalars().all()
                     # Wrap ArchivedTrade rows as order-like objects for FIFO matching
@@ -1393,6 +1501,7 @@ class PaperTradingService:
             else:
                 symbol_sells.setdefault(sym, []).append((o.quantity, o.price))
 
+        # ── Match trades via FIFO to compute closed PnL ──────────────────────
         closed_pnl = 0.0
         for sym, sells in symbol_sells.items():
             buys = list(symbol_buys.get(sym, []))
@@ -1447,11 +1556,20 @@ class PaperTradingService:
             cp = current_prices.get(pos.symbol, pos.entry_price or 0.0)
             open_exit_fees += (pos.quantity or 0) * cp * self.fee_rate_for(pos.symbol, self._venue_for(pos.agent_id))
 
+        # ── Total P&L from closed trades (FIFO-matched) ──────────────────────
+        # Use get_closed_trades which properly matches BUYs and SELLs.
+        # The old formula (closed_pnl + unrealized - total_fees) double-counted
+        # fees from orphan orders (SELLs with no matching BUY from the broken close).
+        _closed_trades = await self.get_closed_trades(limit=9999)
+        _closed_pnl = sum(t.get("net_pnl", 0) for t in _closed_trades)
+        _closed_gross = sum(t.get("gross_pnl", 0) for t in _closed_trades)
+        _closed_fees = sum(abs(t.get("fee", 0)) for t in _closed_trades)
+
         return {
-            "total_pnl": closed_pnl + unrealized_pnl - total_fees - open_exit_fees,
-            "realized_pnl": closed_pnl,
+            "total_pnl": _closed_pnl + unrealized_pnl - open_exit_fees,
+            "realized_pnl": _closed_gross,
             "unrealized_pnl": unrealized_pnl - open_exit_fees,
-            "total_fees": total_fees + open_exit_fees,
+            "total_fees": _closed_fees + open_exit_fees,
             "daily_fees_paid": daily_fees_paid,
             "daily_fees_with_estimated_exit": daily_fees_paid + open_exit_fees,
             "buy_volume": buy_volume,

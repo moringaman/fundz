@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from datetime import datetime
 from dataclasses import dataclass, field
 import asyncio
@@ -89,6 +89,9 @@ class AgentMetrics:
     avg_pnl: float = 0.0
     # Per-venue breakdown: {venue: {"trades": int, "wins": int, "pnl": float}}
     venue_stats: dict = field(default_factory=dict)
+    # Per-regime breakdown: {regime_label: {"trades": int, "wins": int, "pnl": float, "win_rate": float}}
+    # Updated only when a position closes and an entry_regime was captured.
+    regime_stats: dict = field(default_factory=dict)
 
 
 class AgentScheduler:
@@ -106,6 +109,11 @@ class AgentScheduler:
         self._agent_metrics: Dict[str, AgentMetrics] = {}
         self._enabled_agents: Dict[str, dict] = {}
         self._scheduler_task: Optional[asyncio.Task] = None
+        self._fast_sl_monitor_task: Optional[asyncio.Task] = None
+
+        # WebSocket price feed (from Hyperliquid allMids stream)
+        self._ws_prices: Dict[str, float] = {}
+        self._ws_prices_updated_at: Optional[datetime] = None
 
         # Pre-trade backtest cache: key = "agent_id:symbol", value = (BacktestResult, cached_at datetime)
         self._backtest_cache: Dict[str, tuple] = {}
@@ -114,10 +122,13 @@ class AgentScheduler:
         # Cleared at the start of each _run_enabled_agents pass.
         self._cycle_trades: List[CycleTradeRecord] = []
 
-        # Post-close cooldown: key = "agent_id:symbol", value = datetime of last close.
-        # Prevents whipsaw re-entries on the same symbol within 15 minutes of a close.
-        self._recent_closes: Dict[str, datetime] = {}
+        # Post-close cooldown: key = "agent_id:symbol", value = (datetime, exit_type).
+        # exit_type ∈ {"stop-loss", "take-profit", "trailing-stop", "manual"}.
+        # SL exits get a 2× cooldown multiplier — stop-outs cluster around vol
+        # spikes, and immediate re-entry is the worst possible timing.
+        self._recent_closes: Dict[str, tuple] = {}
         self._POST_CLOSE_COOLDOWN_SECONDS = 900  # 15 minutes (base; scales with fee pressure)
+        self._SL_COOLDOWN_MULTIPLIER = 2.0       # 2× cooldown after a stop-loss exit
 
         # Fee-pressure state: cached from team analysis cycle (15 min refresh)
         # so per-trade paths don't need their own DB query.
@@ -131,6 +142,23 @@ class AgentScheduler:
         # TTL: 5 minutes — keeps context fresh without hammering Phemex on every agent run
         self._ta_cache: Dict[str, tuple] = {}
         _TA_CACHE_TTL_MINUTES = 5
+
+        # Per-symbol GMM regime cache: key = symbol, value = (regime_label, cached_at)
+        # Refreshed at the top of each _run_enabled_agents pass with one DB query
+        # so the synchronous _build_market_context can inject it without blocking.
+        # Maps GMM labels (risk_off | range | risk_on) into the strategy condition
+        # vocabulary (trending_down | ranging | trending_up) used by avoid_conditions.
+        self._gmm_regime_cache: Dict[str, tuple] = {}
+        self._GMM_REGIME_CACHE_TTL_SECONDS = 300  # 5 minutes
+
+        # Per-cycle signal arbiter: key = symbol, value = (side, confidence, agent_name).
+        # Cleared at the top of every _run_enabled_agents pass. When a second agent
+        # in the same cycle wants to enter the OPPOSITE side on the same symbol,
+        # we skip it unless its confidence materially exceeds the first agent's.
+        # This prevents the portfolio-level whipsaw where momentum and mean-rev
+        # fire opposing trades on the same bar and net to zero edge minus 2× fees.
+        self._cycle_pending_signals: Dict[str, tuple] = {}
+        self._ARBITER_CONF_OVERRIDE_DELTA = 0.15  # newcomer must beat existing conf by 15% to win
 
         # Team Decision Tier state
         self._last_team_analysis: Optional[datetime] = None
@@ -160,9 +188,17 @@ class AgentScheduler:
         self._dead_zone_noop_notified: bool = False          # team chat posted for overnight no-op window
         self._last_trader_checkin: Optional[datetime] = None
 
+        # Trader commentary fed into Sarah Chen's SL/TP review
+        self._latest_trader_commentary: Dict[str, str] = {}  # {trader_name: comment_text}
+        # Reversal limit orders placed — tracked so we only place once per position
+        # Value: {"sl": float, "tp": float, "order_id": str}
+        self._reversal_orders_placed: Dict[str, dict] = {}  # {agent_id: cfg}
+        # Last time each trader ran a strategy review (so auto-reviews happen at least every 6h)
+        self._last_trader_strategy_review: Dict[str, datetime] = {}  # {trader_id: timestamp}
+
         # Phase 9.1 — Consistency gating
         self._consistency_flags: Dict[str, str] = {}  # {trader_id: last_known_flag}
-        self._agent_cap_max = 4
+        self._agent_cap_max = 6  # per-trader fairness: allows ~2 veterans per trader (was 4)
         self._agent_cap_min_trades = 10
         self._agent_cap_last_run: Optional[datetime] = None
         self._atr_target_vol_pct = 3.0
@@ -190,16 +226,18 @@ class AgentScheduler:
         self._WATCHLIST_TTL_SECS  = 3600   # legacy fallback (kept for safety)
 
     async def _get_total_capital(self, positions_value: float = 0.0) -> float:
-        """Return total fund capital.
+        """Return total fund capital across all venues.
 
-        Live mode: USDT balance from Phemex + open positions value.
+        Live mode: Phemex USDT + Hyperliquid USDC account value + open positions.
         Paper mode: paper DB USDT balance + open positions value.
-        Falls back to the paper DB default seed value (50 000) on any error.
+        Falls back to 50 000 on any error.
         """
         _PAPER_DEFAULT = 50_000.0
+        total = 0.0
+
         try:
             if not paper_trading._enabled:
-                # Live mode — pull real balance from Phemex
+                # Phemex USDT balance
                 raw = await self.phemex.get_account_balance()
                 wallets = raw.get("data", [])
                 usdt_ev = next(
@@ -207,20 +245,28 @@ class AgentScheduler:
                     None,
                 )
                 if usdt_ev is None:
-                    logger.warning("Phemex balance response missing USDT wallet; falling back to paper balance")
+                    logger.warning("Phemex balance missing USDT; falling back to paper")
                     balances = await paper_trading.get_all_balances()
-                    usdt_balance = next((b.available for b in balances if b.asset == "USDT"), _PAPER_DEFAULT)
+                    total += next((b.available for b in balances if b.asset == "USDT"), _PAPER_DEFAULT)
                 else:
-                    usdt_balance = float(usdt_ev) / 100_000_000
-            else:
-                # Paper mode — use simulated DB balance
-                balances = await paper_trading.get_all_balances()
-                usdt_balance = next((b.available for b in balances if b.asset == "USDT"), _PAPER_DEFAULT)
-        except Exception as exc:
-            logger.warning(f"Failed to fetch capital balance ({exc}); using paper default ${_PAPER_DEFAULT:,.0f}")
-            usdt_balance = _PAPER_DEFAULT
+                    total += float(usdt_ev) / 100_000_000
 
-        return usdt_balance + positions_value
+                # Hyperliquid USDC account value
+                try:
+                    from app.services.hl_live_trading import hl_live_trading as _hl_cap
+                    _hl_bal = await _hl_cap.get_balance()
+                    total += _hl_bal.get("total", 0.0)
+                except Exception as _hl_err:
+                    logger.debug(f"Hyperliquid balance not included in total capital: {_hl_err}")
+            else:
+                # Paper mode — simulated DB balance
+                balances = await paper_trading.get_all_balances()
+                total += next((b.available for b in balances if b.asset == "USDT"), _PAPER_DEFAULT)
+        except Exception as exc:
+            logger.warning(f"Failed to fetch capital balance ({exc}); using default ${_PAPER_DEFAULT:,.0f}")
+            total = _PAPER_DEFAULT
+
+        return total + positions_value
 
     @property
     def is_running(self) -> bool:
@@ -247,47 +293,17 @@ class AgentScheduler:
         return dict(self._current_confluence_scores)
 
     async def _compute_daily_pnl(self) -> float:
-        """Compute today's realized P&L from FIFO-matched buy→sell orders."""
+        """Compute today's realized P&L from position-aware closed trades."""
         from datetime import date
         try:
-            orders = await paper_trading.get_orders(limit=500)
+            closed_trades = await paper_trading.get_closed_trades(limit=9999)
             today = date.today()
-            # Filter sells executed today
-            today_sells = [
-                o for o in orders
-                if o.side == OrderSide.SELL
-                and o.status == OrderStatus.FILLED
-                and o.created_at
-                and o.created_at.date() == today
-            ]
-            if not today_sells:
-                return 0.0
-
-            # Get ALL filled orders for FIFO matching
-            all_orders = sorted(orders, key=lambda o: o.created_at or datetime.min)
-            # Group buys by (symbol, agent_id)
-            buy_queues: dict = {}
-            daily_pnl = 0.0
-
-            for o in all_orders:
-                key = (o.symbol, o.agent_id or "__none__")
-                if o.side == OrderSide.BUY and o.status == OrderStatus.FILLED:
-                    buy_queues.setdefault(key, []).append({"qty": o.quantity, "price": o.price})
-                elif o.side == OrderSide.SELL and o.status == OrderStatus.FILLED:
-                    buys = buy_queues.get(key, [])
-                    remaining = o.quantity
-                    sell_pnl = 0.0
-                    while remaining > 1e-12 and buys:
-                        fill = min(remaining, buys[0]["qty"])
-                        sell_pnl += fill * (o.price - buys[0]["price"])
-                        remaining -= fill
-                        buys[0]["qty"] -= fill
-                        if buys[0]["qty"] <= 1e-12:
-                            buys.pop(0)
-                    # Only count P&L for today's sells
-                    if o.created_at and o.created_at.date() == today:
-                        daily_pnl += sell_pnl
-
+            daily_pnl = sum(
+                t.get("net_pnl", 0.0)
+                for t in closed_trades
+                if t.get("exit_time")
+                and datetime.fromisoformat(t["exit_time"].replace("Z", "+00:00")).date() == today
+            )
             return round(daily_pnl, 4)
         except Exception as e:
             logger.error(f"Failed to compute daily P&L: {e}")
@@ -548,12 +564,79 @@ class AgentScheduler:
         except Exception:
             return None
 
+    @staticmethod
+    def _map_gmm_to_condition(gmm_label: Optional[str]) -> Optional[str]:
+        """Map GMM regime labels to the strategy condition vocabulary used by
+        registry.yaml's `market_conditions` / `avoid_conditions` lists.
+
+        GMM produces three argmax labels; strategies declare their preferences
+        against the wider condition vocab. This mapping picks the closest
+        directional analogue so the existing avoid_conditions gate fires.
+        """
+        if not gmm_label:
+            return None
+        return {
+            "risk_on":  "trending_up",
+            "risk_off": "trending_down",
+            "range":    "ranging",
+        }.get(gmm_label)
+
+    async def _refresh_gmm_regime_cache(self) -> None:
+        """Populate self._gmm_regime_cache with the latest GMM regime per symbol.
+
+        One query per scheduler pass keeps _build_market_context (sync) cheap.
+        Symbols not yet classified by the GMM model fall back to the global
+        analyst regime via _build_market_context's fallback branch.
+        """
+        try:
+            from app.models import RegimeStateRecord
+            from sqlalchemy import select, desc, func as _sqlfunc
+            async with get_async_session() as db:
+                # Latest row per symbol via a max(created_at) subquery.
+                _sub = (
+                    select(
+                        RegimeStateRecord.symbol,
+                        _sqlfunc.max(RegimeStateRecord.created_at).label("max_ts"),
+                    )
+                    .group_by(RegimeStateRecord.symbol)
+                    .subquery()
+                )
+                _q = (
+                    select(RegimeStateRecord)
+                    .join(
+                        _sub,
+                        (RegimeStateRecord.symbol == _sub.c.symbol)
+                        & (RegimeStateRecord.created_at == _sub.c.max_ts),
+                    )
+                )
+                _now = datetime.now()
+                _result = await db.execute(_q)
+                for _row in _result.scalars().all():
+                    self._gmm_regime_cache[_row.symbol] = (_row.regime_label, _now)
+        except Exception as _e:
+            logger.debug(f"GMM regime cache refresh failed: {_e}")
+
     def _build_market_context(self, agent_id: str, symbol: str) -> Optional[Dict]:
         """Build market context dict for non-AI (indicator-based) strategies."""
         ctx = {}
 
-        # Market regime from Research Analyst
-        if self._current_analyst_report:
+        # Market regime — prefer the per-symbol GMM classification (Phase 4)
+        # over the global analyst report. GMM is statistically derived from
+        # log-return + vol features and is updated per symbol; the analyst
+        # report is a single global label that lags shifts in individual pairs.
+        # Map GMM labels into the strategy condition vocab so the existing
+        # avoid_conditions gate (in _run_single_agent) fires correctly.
+        _gmm_cached = self._gmm_regime_cache.get(symbol)
+        if _gmm_cached:
+            _gmm_label, _gmm_at = _gmm_cached
+            if (datetime.now() - _gmm_at).total_seconds() < self._GMM_REGIME_CACHE_TTL_SECONDS:
+                _mapped = self._map_gmm_to_condition(_gmm_label)
+                if _mapped:
+                    ctx["regime"] = _mapped
+                    ctx["gmm_regime"] = _gmm_label
+
+        # Fallback: global analyst regime if GMM unavailable
+        if "regime" not in ctx and self._current_analyst_report:
             regime = getattr(self._current_analyst_report, 'market_regime', None)
             if regime:
                 ctx["regime"] = getattr(regime, 'regime', 'unknown')
@@ -567,9 +650,9 @@ class AgentScheduler:
                 ctx["ta_alignment"] = ta_data.get("alignment", "unknown")
                 ctx["ta_confluence_score"] = ta_data.get("score", 0.0)
 
-        # Round-number proximity — sourced from TA cache (populated by TechnicalAnalystAgent).
-        # Injected here so generate_signal() can apply the round-number magnet modifier
-        # without the indicator engine needing its own price-level calculation.
+        # Round-number proximity + pattern types — sourced from TA cache (populated
+        # by TechnicalAnalystAgent). Injected here so generate_signal() can consume
+        # them without its own TA report connection.
         try:
             _ta_key_mc = f"{symbol}:1h"  # use 1h as the canonical reference frame
             _ta_cached_mc = self._ta_cache.get(_ta_key_mc)
@@ -579,6 +662,15 @@ class AgentScheduler:
                     _rn = getattr(getattr(_ta_rep_mc, "price_levels", None), "round_number_proximity", None)
                     if _rn:
                         ctx["round_number_proximity"] = _rn
+                    # Pattern types — used by fair_value_gap strategy and signal modifiers
+                    _patterns = getattr(_ta_rep_mc, "patterns", [])
+                    if _patterns:
+                        ctx["ta_pattern_types"] = [p.pattern_type for p in _patterns]
+                        ctx["ta_patterns"] = [
+                            {"type": p.pattern_type, "direction": p.direction,
+                             "confidence": p.confidence, "entry_price": p.entry_price}
+                            for p in _patterns
+                        ]
         except Exception:
             pass
 
@@ -625,7 +717,111 @@ class AgentScheduler:
             pass
 
         return ctx if ctx else None
-    
+
+    async def _compute_flip_score(
+        self,
+        symbol: str,
+        existing_side: str,       # "buy" or "sell" — direction of the existing position
+        intended_side: str,       # "buy" or "sell" — proposed new trade
+        position_entry_time: Optional[datetime],
+        position_age_hours: float,
+        technical_report,          # TechnicalAnalystReport — already in scope
+        gates,                     # TradingGates config
+    ) -> Tuple[float, List[str]]:
+        """
+        Compute a flip confidence score (0-100) for whether to allow an
+        opposite-direction trade on the same symbol.
+
+        Four components weighted by TradingGates config:
+          1. Regime change (default 40 pts) — GMM regime label changed since entry
+          2. TA opposition (default 30 pts) — TA signal opposes existing position
+          3. MTF alignment (default 20 pts) — HTF trend aligns with intended flip
+          4. Age decay    (default 10 pts) — position is old (>4h = partial, >8h = full)
+
+        Score >= flip_score_threshold (default 50) means the flip is justified.
+        """
+        score = 0.0
+        reasons: List[str] = []
+
+        _r_w = getattr(gates, "flip_regime_weight", 40.0)
+        _t_w = getattr(gates, "flip_ta_weight", 30.0)
+        _m_w = getattr(gates, "flip_mtf_weight", 20.0)
+        _a_w = getattr(gates, "flip_age_weight", 10.0)
+
+        # ── 1. Regime change (0 → flip_regime_weight points) ──────────────
+        # Query GMM regime at position entry time vs current regime.
+        # A label change (e.g. risk_on → risk_off) is strong evidence of trend reversal.
+        if _r_w > 0 and position_entry_time is not None:
+            try:
+                from app.models import RegimeStateRecord
+                from sqlalchemy import select, desc
+                async with get_async_session() as db:
+                    entry_q = await db.execute(
+                        select(RegimeStateRecord)
+                        .where(
+                            RegimeStateRecord.symbol == symbol,
+                            RegimeStateRecord.created_at <= position_entry_time,
+                        )
+                        .order_by(desc(RegimeStateRecord.created_at))
+                        .limit(1)
+                    )
+                    entry_row = entry_q.scalar_one_or_none()
+
+                    curr_q = await db.execute(
+                        select(RegimeStateRecord)
+                        .where(RegimeStateRecord.symbol == symbol)
+                        .order_by(desc(RegimeStateRecord.created_at))
+                        .limit(1)
+                    )
+                    curr_row = curr_q.scalar_one_or_none()
+
+                if entry_row and curr_row and entry_row.regime_label != curr_row.regime_label:
+                    score += _r_w
+                    reasons.append(f"regime {entry_row.regime_label}→{curr_row.regime_label}")
+            except Exception:
+                pass
+
+        # ── 2. TA signal opposes existing position (0 → flip_ta_weight pts) ─
+        # If the Technical Analyst now says bearish but we hold a long, the
+        # trend likely reversed. Scale by TA confidence.
+        if _t_w > 0 and technical_report and technical_report.overall_signal:
+            ta_is_bullish = technical_report.overall_signal == "bullish"
+            pos_is_long = existing_side == "buy"
+            if ta_is_bullish != pos_is_long:
+                # TA opposes the existing position — validates the flip
+                ta_pts = _t_w * (technical_report.confidence or 0.5)
+                score += ta_pts
+                reasons.append(
+                    f"TA opposes existing {('LONG' if pos_is_long else 'SHORT')} "
+                    f"({technical_report.overall_signal}, conf={technical_report.confidence:.0%})"
+                )
+
+        # ── 3. MTF alignment with intended direction (0 → flip_mtf_weight pts) ──
+        # If higher timeframes agree with where we want to go, the flip has
+        # structural support rather than being a noise trade.
+        if _m_w > 0 and technical_report and technical_report.multi_timeframe:
+            _mtf = technical_report.multi_timeframe
+            _htf_trend = getattr(_mtf, "htf_alignment", None) or getattr(_mtf, "htf_signal", None)
+            if _htf_trend:
+                intended_is_long = intended_side == "buy"
+                htf_is_bullish = _htf_trend in ("bullish", "bull")
+                if intended_is_long == htf_is_bullish:
+                    score += _m_w
+                    reasons.append(f"HTF aligns with flip ({_htf_trend})")
+
+        # ── 4. Position age decay (0 → flip_age_weight pts) ────────────────
+        # Old positions are more likely to represent stale thesis. Full points
+        # at 8h+, half at 4h, none below.
+        if _a_w > 0:
+            if position_age_hours >= 8:
+                score += _a_w
+                reasons.append(f"age={position_age_hours:.1f}h")
+            elif position_age_hours >= 4:
+                score += _a_w * 0.5
+                reasons.append(f"age={position_age_hours:.1f}h (partial)")
+
+        return min(score, 100.0), reasons
+
     async def start(self):
         if self._running:
             return
@@ -642,6 +838,8 @@ class AgentScheduler:
         await self._auto_register_agents()
 
         self._scheduler_task = asyncio.create_task(self._scheduler_loop())
+        self._fast_sl_monitor_task = asyncio.create_task(self._fast_sl_tp_monitor_loop())
+        self._start_ws_price_feed()
         logger.info("Agent scheduler started")
         asyncio.create_task(_send_telegram(telegram_service.alert_automation_started()))
     async def _load_metrics_from_db(self):
@@ -835,33 +1033,61 @@ class AgentScheduler:
                 from app.services.trader_service import validate_trader_configs
                 await validate_trader_configs(session)
                 if self._traders:
-                    alpha = self._traders[0]
                     # Only assign unassigned agents if any exist (one-time migration guard)
                     unassigned_result = await session.execute(
                         select(DBAgent).where(DBAgent.trader_id.is_(None))
                     )
                     unassigned = unassigned_result.scalars().all()
                     if unassigned:
-                        await trader_service.assign_existing_agents_to_trader(session, alpha["id"])
-                        logger.info(f"Trader layer: assigned {len(unassigned)} unassigned strategies → {alpha['name']}")
+                        # Round-robin: assign unassigned agents to the trader with
+                        # the fewest agents so Kai doesn't absorb everything.
+                        from sqlalchemy import func
+                        trader_counts_result = await session.execute(
+                            select(DBAgent.trader_id, func.count(DBAgent.id))
+                            .where(DBAgent.trader_id.isnot(None))
+                            .group_by(DBAgent.trader_id)
+                        )
+                        agent_counts = dict(trader_counts_result.all() or [])
+                        # Seed all known traders with 0 so they're included
+                        for _t in self._traders:
+                            agent_counts.setdefault(_t["id"], 0)
+                        # Assign each unassigned agent to the trader with fewest agents
+                        assignments = {_t["id"]: 0 for _t in self._traders}
+                        for _ua in unassigned:
+                            _target_id = min(agent_counts, key=agent_counts.get)
+                            _ua.trader_id = _target_id
+                            agent_counts[_target_id] += 1
+                            assignments[_target_id] += 1
+                        await session.commit()
+                        _summary = ", ".join(
+                            f"{count}→{next((t['name'] for t in self._traders if t['id'] == tid), tid)}"
+                            for tid, count in assignments.items() if count > 0
+                        )
+                        logger.info(f"Trader layer: round-robin assigned {len(unassigned)} unassigned agents ({_summary})")
                     else:
                         logger.info(f"Trader layer: {len(self._traders)} traders loaded")
 
             agents = await self._fetch_agents_from_db()
 
+            # Apply global venue override from TradingPreferences
+            try:
+                from app.api.routes.settings import get_trading_prefs
+                _global_venue = getattr(get_trading_prefs(), "trading_venue", None)
+            except Exception:
+                _global_venue = None
+
             registered = 0
             for agent in agents:
                 if agent.get("is_enabled"):
+                    # Use global venue if set, otherwise fall back to agent's individual venue
+                    _venue = _global_venue or agent.get("venue", "phemex")
+                    agent["venue"] = _venue
                     self.register_agent(agent)
                     registered += 1
                     # Register venue so fee calculations and live routing
                     # use the correct backend rates.
-                    trading_service.set_agent_venue(
-                        agent["id"], agent.get("venue", "phemex")
-                    )
-                    paper_trading.set_agent_venue(
-                        agent["id"], agent.get("venue", "phemex")
-                    )
+                    trading_service.set_agent_venue(agent["id"], _venue)
+                    paper_trading.set_agent_venue(agent["id"], _venue)
 
                     # Bootstrap metrics from backtest if agent has never traded
                     metrics = self._agent_metrics.get(agent["id"])
@@ -1017,6 +1243,9 @@ class AgentScheduler:
         if self._scheduler_task:
             self._scheduler_task.cancel()
             self._scheduler_task = None
+        if hasattr(self, '_fast_sl_monitor_task') and self._fast_sl_monitor_task:
+            self._fast_sl_monitor_task.cancel()
+            self._fast_sl_monitor_task = None
         for task in self._tasks.values():
             task.cancel()
         self._tasks.clear()
@@ -1201,7 +1430,7 @@ class AgentScheduler:
                                 f"Gain: +{_so['gain_pct']:.1f}%\n"
                                 f"Transferred ${_so['transferred']:.2f} → Trading Fund"
                             )))
-                    _low_bal = await _acc.check_low_balance(min_usdt=200.0)
+                    _low_bal = await _acc.check_low_balance(min_usdc=200.0)
                     if _low_bal is not None:
                         from app.services.telegram_service import telegram_service as _tg_lb
                         asyncio.create_task(_send_telegram(_tg_lb.send(
@@ -1234,13 +1463,199 @@ class AgentScheduler:
 
             await asyncio.sleep(60)
 
+    async def _fast_sl_tp_monitor_loop(self):
+        """Dedicated high-frequency SL/TP + momentum decay monitor.
+
+        Runs as a separate task every 5 seconds — much faster than the
+        main 60-second scheduler loop.  Handles:
+
+        * SL/TP hit detection — closes positions before price gaps past
+          the trigger level between 60-second main-loop iterations.
+        * Momentum decay early exit — if price reached >50% of TP
+          distance then retraced >30% from its peak, momentum has stalled
+          and we exit early to lock in partial profit before a full
+          reversal to SL.
+
+        Trailing-stop progression, scale-outs, breakeven adjustments and
+        the heavier RSI-based momentum-exhaustion exit remain in the main
+        60-second ``_monitor_open_positions``.
+        """
+        while self._running:
+            try:
+                positions: list = []
+                try:
+                    positions.extend(list(await paper_trading.get_positions() or []))
+                except Exception:
+                    pass
+                try:
+                    from app.api.routes.settings import get_trading_prefs as _gtp
+                    if not _gtp().paper_trading_default:
+                        from app.services.live_trading import live_trading as _lt_fast
+                        positions.extend(list(await _lt_fast.get_positions() or []))
+                        from app.services.hl_live_trading import hl_live_trading as _hl_fetch
+                        positions.extend(list(await _hl_fetch.get_positions() or []))
+                except Exception:
+                    pass
+                if not positions:
+                    await asyncio.sleep(5)
+                    continue
+
+                for pos in positions:
+                    try:
+                        _pos_is_paper = getattr(pos, "is_paper", True)
+                        _agent = self._enabled_agents.get(pos.agent_id, {})
+                        _venue = _agent.get("venue", "phemex")
+
+                        if _pos_is_paper or _venue == "phemex":
+                            from app.services.live_trading import live_trading as _lt_svc
+                            _svc = paper_trading if _pos_is_paper else _lt_svc
+                        elif _venue == "hyperliquid":
+                            from app.services.hl_live_trading import hl_live_trading as _hl_svc
+                            _svc = _hl_svc
+                        else:
+                            continue
+
+                        # Try WebSocket price first (zero-latency), fall back to HTTP
+                        current_price = self._ws_price(pos.symbol)
+                        if current_price is None or current_price <= 0:
+                            current_price = await paper_trading.fetch_current_price(pos.symbol)
+                        if current_price <= 0:
+                            continue
+
+                        entry = pos.entry_price or 0
+                        if entry <= 0:
+                            continue
+
+                        _side = pos.side.value if hasattr(pos.side, 'value') else str(pos.side)
+                        is_short = _side.lower() == 'sell'
+                        sl_price = getattr(pos, 'stop_loss_price', None)
+                        tp_price = getattr(pos, 'take_profit_price', None)
+                        if sl_price is None and tp_price is None:
+                            continue
+
+                        highest = getattr(pos, 'highest_price', entry)
+                        _pd = {
+                            'side': _side,
+                            'entry_price': entry,
+                            'stop_loss': sl_price,
+                            'take_profit': tp_price,
+                            'highest_price': highest,
+                        }
+
+                        # ── Momentum decay early exit ────────────────────────
+                        # If price reached >50% of TP distance then retraced
+                        # >30% from its peak, momentum has stalled — exit now
+                        # to lock in partial profit before a full reversal to SL.
+                        _check = None
+                        if tp_price and entry:
+                            if is_short:
+                                _full_move = entry - tp_price
+                                _current_move = entry - current_price
+                                _peak_move = entry - highest  # highest is lowest price for shorts
+                            else:
+                                _full_move = tp_price - entry
+                                _current_move = current_price - entry
+                                _peak_move = highest - entry
+                            if _full_move > 0:
+                                _peak_progress = max(_peak_move / _full_move, 0)
+                                _current_progress = max(_current_move / _full_move, 0)
+                                if _peak_progress > 0.5 and _current_progress < _peak_progress * 0.7:
+                                    _retrace_pct = (_peak_progress - _current_progress) / _peak_progress
+                                    logger.info(
+                                        f"[Fast SL/TP] Momentum decay on {pos.symbol}: "
+                                        f"retraced {_retrace_pct:.0%} from peak ({_peak_progress:.0%}→{_current_progress:.0%} TP)"
+                                    )
+                                    _check = RiskCheckResult(
+                                        allowed=True, action="exit",
+                                        reason=f"Momentum decay: retraced {_retrace_pct:.0%} from {_peak_progress:.0%} TP peak",
+                                    )
+
+                        if _check is None:
+                            _check = risk_manager.check_exit(_pd, current_price, RiskConfig(
+                                stop_loss_pct=_agent.get('stop_loss_pct', 3.5),
+                                take_profit_pct=_agent.get('take_profit_pct', 7.0),
+                                trailing_stop_pct=_agent.get('trailing_stop_pct', 4.0),
+                                liquidation_buffer_pct=12.5,
+                            ))
+
+                        if _check.action == "exit":
+                            _close = pos.quantity
+                            _exit_side = "buy" if is_short else "sell"
+                            if _pos_is_paper:
+                                await _svc.place_order(
+                                    symbol=pos.symbol, side=_exit_side,
+                                    quantity=_close, price=current_price,
+                                    agent_id=pos.agent_id,
+                                )
+                            else:
+                                await _svc.close_position(pos.id)
+                            # Telegram notification — same pattern as main monitor
+                            _dir = "SHORT" if is_short else "LONG"
+                            _pnl = ((entry - current_price) * _close) if is_short else ((current_price - entry) * _close)
+                            _exit_type = "trailing-stop" if "Trailing" in _check.reason else (
+                                "take-profit" if "Take-profit" in _check.reason else "stop-loss"
+                            )
+                            if _exit_type == "take-profit":
+                                asyncio.create_task(_send_telegram(telegram_service.alert_take_profit_hit(
+                                    symbol=pos.symbol, side=_dir.lower(), pnl=_pnl,
+                                )))
+                            else:
+                                asyncio.create_task(_send_telegram(telegram_service.alert_position_closed(
+                                    symbol=pos.symbol, side=_dir.lower(), pnl=_pnl,
+                                    close_reason=_exit_type.replace("-", " ").title(),
+                                )))
+                            logger.info(
+                                f"[Fast SL/TP] Closed {pos.symbol}: {_check.reason}"
+                            )
+                    except Exception as _e:
+                        logger.debug(f"[Fast SL/TP] Check error: {_e}")
+            except Exception as e:
+                logger.error(f"[Fast SL/TP] Loop error: {e}")
+
+            await asyncio.sleep(5)
+
+    def _start_ws_price_feed(self) -> None:
+        """Connect to Hyperliquid WebSocket for real-time allMids prices.
+
+        Runs ``Info.subscribe`` in a daemon thread (the SDK's
+        ``WebsocketManager`` is thread-based).  Prices are written to
+        ``self._ws_prices`` which the async fast SL/TP loop reads.
+        """
+        try:
+            from hyperliquid.info import Info
+            _info = Info()
+
+            def _on_mids(data):
+                if isinstance(data, dict):
+                    for coin, price in data.items():
+                        try:
+                            self._ws_prices[coin] = float(price)
+                        except (ValueError, TypeError):
+                            pass
+                    self._ws_prices_updated_at = datetime.now()
+
+            _info.subscribe({"type": "allMids"}, _on_mids)
+            logger.info("Hyperliquid WS price feed started (allMids)")
+        except Exception as e:
+            logger.warning(f"Hyperliquid WS price feed failed: {e}")
+
+    def _ws_price(self, symbol: str) -> Optional[float]:
+        """Get latest price from WS feed, or None if stale (>5s)."""
+        if self._ws_prices_updated_at is None:
+            return None
+        age = (datetime.now() - self._ws_prices_updated_at).total_seconds()
+        if age > 5:
+            return None
+        coin = symbol.upper().replace("USDT", "").replace("BUSD", "").replace("USD", "")
+        return self._ws_prices.get(coin)
+
     async def _maybe_emit_trader_checkins(self, session_info: Optional[dict] = None) -> None:
         """Post a heartbeat check-in from each enabled trader every 30 minutes."""
         if not self._traders:
             return
 
         now = datetime.now()
-        if self._last_trader_checkin and (now - self._last_trader_checkin).total_seconds() < 1800:
+        if self._last_trader_checkin and (now - self._last_trader_checkin).total_seconds() < 900:
             return
 
         _session_label = (session_info or {}).get("session", "unknown").replace("_", " ")
@@ -1330,6 +1745,22 @@ class AgentScheduler:
                                                    (f" | SL ${sl:.2f}" if sl else "") +
                                                    (f" | TP ${tp:.2f}" if tp else ""))
                         if pos_block:
+                            # Build market context so the trader factors in
+                            # regime/risk when evaluating position targets.
+                            _mkt_lines = []
+                            if hasattr(self, '_current_analyst_report') and self._current_analyst_report:
+                                _regime = getattr(self._current_analyst_report, 'market_regime', None)
+                                if _regime:
+                                    _mkt_lines.append(
+                                        f"Market regime: {_regime.regime} | Sentiment: {_regime.sentiment}"
+                                    )
+                            if hasattr(self, '_current_risk_assessment') and self._current_risk_assessment:
+                                _mkt_lines.append(
+                                    f"Portfolio risk: {self._current_risk_assessment.risk_level} | "
+                                    f"Exposure: {getattr(self._current_risk_assessment, 'exposure_pct', 'N/A')}%"
+                                )
+                            _market_ctx = "\n".join(_mkt_lines) or "No broader market context available."
+
                             pos_summary = "Open positions:\n" + "\n".join(f"- {p}" for p in pos_block)
                             pos_system = (
                                 f"You are {trader_name}, a crypto fund trader. "
@@ -1339,14 +1770,21 @@ class AgentScheduler:
                                 f"and key market levels you're watching. "
                                 f"Keep it brief - 1-2 sentences per position. "
                                 f"Only flag REAL issues: wrong direction, clearly broken trade thesis. "
+                                f"Be realistic about TP targets given the current market regime "
+                                f"(e.g. aiming for a 20%+ move in a ranging market is unlikely). "
                                 f"Don't mention duplicates - multiple agents holding same pair is normal."
                             )
                             try:
-                                pos_response = await trader_llm._call_llm_text(pos_system, f"{pos_summary}\n", temperature=0.3, max_tokens=200)
+                                pos_response = await trader_llm._call_llm_text(
+                                    pos_system, f"{_market_ctx}\n\n{pos_summary}\n",
+                                    temperature=0.3, max_tokens=200,
+                                )
                                 if pos_response and not pos_response.startswith("I'm sorry"):
+                                    _commentary = pos_response.strip()
+                                    self._latest_trader_commentary[trader_name] = _commentary
                                     await team_chat.add_message(
                                         agent_role=f"trader_{trader_name.lower().replace(' ', '_')}",
-                                        content=f"📊 **Position Update:** {pos_response.strip()}",
+                                        content=f"📊 **Position Update:** {_commentary}",
                                         message_type="analysis",
                                         metadata={"_override_name": trader_name, "_override_avatar": trader_avatar},
                                     )
@@ -1417,30 +1855,35 @@ class AgentScheduler:
             self._cb_halt_reason = ""
         return False
 
-    async def _get_daily_fee_pressure(self) -> dict:
-        """Return UTC-day fee-budget usage so entry quality can tighten immediately."""
+    async def _get_daily_fee_pressure(self, agent_id: Optional[str] = None) -> dict:
+        """Return UTC-day fee-budget usage so entry quality can tighten immediately.
+
+        When *agent_id* is provided, the rolling fee-coverage ratio is computed
+        using only that agent's closed trades, so one bleeding strategy cannot
+        stand down the entire fleet.
+        """
         try:
             from app.api.routes.settings import get_trading_gates
 
             gates = get_trading_gates()
             max_daily_fees_pct = float(getattr(gates, "max_daily_fees_pct", 0.5) or 0.5)
             fee_coverage_guard_enabled = bool(getattr(gates, "fee_coverage_guard_enabled", True))
-            fee_coverage_min_ratio = float(getattr(gates, "fee_coverage_min_ratio", 2.5) or 2.5)
+            fee_coverage_min_ratio = float(getattr(gates, "fee_coverage_min_ratio", 1.5) or 1.5)
             fee_coverage_min_fees_usd = float(getattr(gates, "fee_coverage_min_fees_usd", 25.0) or 25.0)
             fee_coverage_window_trades = int(getattr(gates, "fee_coverage_window_trades", 60) or 60)
             fee_coverage_min_closed_trades = int(getattr(gates, "fee_coverage_min_closed_trades", 8) or 8)
             fee_coverage_include_slippage = bool(getattr(gates, "fee_coverage_include_slippage", True))
-            fee_coverage_slippage_bps = float(getattr(gates, "fee_coverage_slippage_bps", 2.0) or 2.0)
+            fee_coverage_slippage_bps = float(getattr(gates, "fee_coverage_slippage_bps", 1.0) or 1.0)
             fee_coverage_include_funding = bool(getattr(gates, "fee_coverage_include_funding", True))
         except Exception:
             max_daily_fees_pct = 0.5
             fee_coverage_guard_enabled = True
-            fee_coverage_min_ratio = 2.5
+            fee_coverage_min_ratio = 1.5
             fee_coverage_min_fees_usd = 25.0
             fee_coverage_window_trades = 60
             fee_coverage_min_closed_trades = 8
             fee_coverage_include_slippage = True
-            fee_coverage_slippage_bps = 2.0
+            fee_coverage_slippage_bps = 1.0
             fee_coverage_include_funding = True
 
         metrics = {
@@ -1494,7 +1937,10 @@ class AgentScheduler:
             # ratio using recent closed trades. This avoids leverage-based boosts
             # and evaluates edge quality after real execution costs.
             if _is_paper_mode():
-                closed_trades = await paper_trading.get_closed_trades(limit=fee_coverage_window_trades)
+                closed_trades = await paper_trading.get_closed_trades(
+                    limit=fee_coverage_window_trades,
+                    agent_id=agent_id,
+                )
                 closed_count = len(closed_trades)
                 total_fees = float(sum(float(t.get("fee", 0.0) or 0.0) for t in closed_trades))
                 gross_realized_pnl = float(
@@ -1504,6 +1950,42 @@ class AgentScheduler:
                     )
                 )
                 realized_pnl = float(sum(float(t.get("net_pnl", 0.0) or 0.0) for t in closed_trades))
+
+                # ── Time-decay weighting (7-day half-life) ──────────────────
+                # Recent trades count more than old ones, so a regime shift isn't
+                # drowned out by stale history.
+                from math import exp
+                _now = datetime.utcnow()
+                _half_life_days = 7.0
+
+                weighted_fees = 0.0
+                weighted_net_pnl = 0.0
+                weighted_slippage = 0.0
+                weighted_gross = 0.0
+                for t in closed_trades:
+                    _exit_str = t.get("exit_time")
+                    _days_ago = 0.0
+                    if _exit_str:
+                        try:
+                            _exit_dt = datetime.fromisoformat(_exit_str.replace("Z", "+00:00"))
+                            _days_ago = (_now - _exit_dt).total_seconds() / 86_400.0
+                        except Exception:
+                            pass
+                    _w = exp(-max(0.0, _days_ago) / _half_life_days)
+
+                    _fee = float(t.get("fee", 0.0) or 0.0)
+                    _net = float(t.get("net_pnl", 0.0) or 0.0)
+                    _gross = float(t.get("gross_pnl", (_net + _fee)) or 0.0)
+                    weighted_fees += _fee * _w
+                    weighted_net_pnl += _net * _w
+                    weighted_gross += _gross * _w
+
+                    if fee_coverage_include_slippage and fee_coverage_slippage_bps > 0:
+                        qty = abs(float(t.get("quantity", 0.0) or 0.0))
+                        entry = abs(float(t.get("entry_price", 0.0) or 0.0))
+                        exit_ = abs(float(t.get("exit_price", 0.0) or 0.0))
+                        slippage_rate = fee_coverage_slippage_bps / 10_000.0
+                        weighted_slippage += ((qty * entry) + (qty * exit_)) * slippage_rate * _w
 
                 slippage_costs = 0.0
                 if fee_coverage_include_slippage and fee_coverage_slippage_bps > 0:
@@ -1522,7 +2004,9 @@ class AgentScheduler:
                     funding_costs = 0.0
 
                 net_realized_edge = realized_pnl - slippage_costs - funding_costs
-                fee_coverage_ratio = (net_realized_edge / total_fees) if total_fees > 0 else None
+                # Use time-decay weighted values for the coverage ratio
+                weighted_net_edge = weighted_net_pnl - weighted_slippage - funding_costs
+                fee_coverage_ratio = (weighted_net_edge / weighted_fees) if weighted_fees > 0 else None
 
                 metrics.update({
                     "realized_pnl": realized_pnl,
@@ -1538,7 +2022,7 @@ class AgentScheduler:
                 if (
                     fee_coverage_guard_enabled
                     and closed_count >= fee_coverage_min_closed_trades
-                    and total_fees >= fee_coverage_min_fees_usd
+                    and weighted_fees >= fee_coverage_min_fees_usd
                     and fee_coverage_ratio is not None
                     and fee_coverage_ratio < fee_coverage_min_ratio
                 ):
@@ -1566,7 +2050,7 @@ class AgentScheduler:
         except Exception:
             return {
                 "leverage": 1.0,
-                "margin_used": base_position_value,
+                "margin_used": base_position_value / 1.0,
                 "leveraged_notional": base_position_value,
                 "liquidation_price": None,
             }
@@ -1610,7 +2094,7 @@ class AgentScheduler:
         liquidation_price = risk_manager.calculate_liquidation_price(entry_price, side, leverage)
         return {
             "leverage": leverage,
-            "margin_used": base_position_value,
+            "margin_used": base_position_value / leverage,
             "leveraged_notional": leveraged_notional,
             "liquidation_price": liquidation_price,
         }
@@ -1790,7 +2274,8 @@ class AgentScheduler:
                 if _sw_price <= 0:
                     continue
 
-                _sw_fee_rt = _sw_svc.fee_rate_for(_sw_pos.symbol) * 2
+                _sw_venue = self._enabled_agents.get(_sw_pos.agent_id, {}).get("venue", "hyperliquid")
+                _sw_fee_rt = _sw_svc.fee_rate_for(_sw_pos.symbol, _sw_venue) * 2
                 _sw_side = _sw_pos.side.value if hasattr(_sw_pos.side, "value") else str(_sw_pos.side)
                 _sw_is_short = _sw_side.lower() == "sell"
                 _sw_existing_sl = getattr(_sw_pos, "stop_loss_price", None)
@@ -1846,20 +2331,77 @@ class AgentScheduler:
                 return getattr(_report, "price_levels", None)
         return None
 
+    def _get_scaled_profit_thresholds(self, symbol: str, entry_indicators: Optional[dict]) -> Tuple[float, float, float, float]:
+        """Return regime/ATR-scaled profit-lock thresholds.
+
+        Base milestones (absolute % from entry to watermark):
+          breakeven = 0.5%, 25% lock = 1.0%, 50% lock = 1.5%, 75% lock = 2.5%
+
+        Scaling:
+          1. ATR% from entry_indicators.  Typical crypto ATR(14) on 1h ≈ 1.0-1.5%.
+             scale_atr = clamp(atr_pct / 1.2, 0.5, 2.0)
+          2. Regime from GMM cache:
+             risk_on  → 1.25× (trending, let winners run)
+             range    → 0.75× (mean-reverting, tighten fast)
+             risk_off → 1.00× (neutral)
+             unknown  → 1.00×
+
+        Hard limits:
+          breakeven >= 0.30%  (avoid noise stop-outs)
+          breakeven <= 1.00%  (don't wait too long for protection)
+          75% lock   <= 6.00%  (never give back >6% on a single position)
+        """
+        _BE_BASE = 0.005
+        _P25_BASE = 0.010
+        _P50_BASE = 0.015
+        _P75_BASE = 0.025
+
+        # ATR scale from entry-time volatility
+        _atr_pct = (entry_indicators or {}).get('atr_pct') if entry_indicators else None
+        if _atr_pct and _atr_pct > 0:
+            _atr_scale = max(0.5, min(2.0, _atr_pct / 1.2))
+        else:
+            _atr_scale = 1.0
+
+        # Regime multiplier from cached GMM label
+        _regime_mult = 1.0
+        _gmm_cached = self._gmm_regime_cache.get(symbol)
+        if _gmm_cached:
+            _gmm_label, _gmm_at = _gmm_cached
+            if (datetime.now() - _gmm_at).total_seconds() < self._GMM_REGIME_CACHE_TTL_SECONDS:
+                _regime_map = {
+                    "risk_on": 1.25,
+                    "range": 0.75,
+                    "risk_off": 1.0,
+                }
+                _regime_mult = _regime_map.get(_gmm_label, 1.0)
+
+        _total_scale = _atr_scale * _regime_mult
+
+        _be  = max(0.003, min(0.010, _BE_BASE  * _total_scale))
+        _p25 = max(0.006,            _P25_BASE * _total_scale)
+        _p50 = max(0.009,            _P50_BASE * _total_scale)
+        _p75 = max(0.015, min(0.060, _P75_BASE * _total_scale))
+
+        return (_be, _p25, _p50, _p75)
+
     async def _monitor_open_positions(self):
         """Check open positions against live prices and trigger SL/TP exits."""
         try:
             paper_positions = await paper_trading.get_positions()
             # Also include live positions when in live mode
             live_positions: list = []
+            hl_positions: list = []
             try:
                 from app.api.routes.settings import get_trading_prefs
                 if not get_trading_prefs().paper_trading_default:
                     from app.services.live_trading import live_trading
                     live_positions = list(await live_trading.get_positions() or [])
+                    from app.services.hl_live_trading import hl_live_trading
+                    hl_positions = list(await hl_live_trading.get_positions() or [])
             except Exception:
                 pass
-            positions = list(paper_positions or []) + live_positions
+            positions = list(paper_positions or []) + live_positions + hl_positions
             if not positions:
                 return
 
@@ -1867,13 +2409,17 @@ class AgentScheduler:
                 try:
                     # Route all trading calls to the correct backend for this position
                     _pos_is_paper = getattr(pos, "is_paper", True)
-                    if _pos_is_paper:
-                        _svc = paper_trading
+                    _pos_agent_venue = self._enabled_agents.get(pos.agent_id, {}).get("venue", "phemex")
+                    if _pos_is_paper or _pos_agent_venue == "phemex":
+                        _svc = paper_trading if _pos_is_paper else live_trading
+                        current_price = await paper_trading.fetch_current_price(pos.symbol)
+                    elif _pos_agent_venue == "hyperliquid":
+                        from app.services.hl_live_trading import hl_live_trading as _hl_svc
+                        _svc = _hl_svc
+                        current_price = await _hl_svc.fetch_current_price(pos.symbol)
                     else:
-                        from app.services.live_trading import live_trading as _live_svc
-                        _svc = _live_svc
-
-                    current_price = await paper_trading.fetch_current_price(pos.symbol)
+                        _svc = live_trading
+                        current_price = await paper_trading.fetch_current_price(pos.symbol)
                     if current_price <= 0:
                         logger.warning(f"SL/TP monitor: skipping {pos.symbol} — bad price {current_price}")
                         continue
@@ -1900,7 +2446,7 @@ class AgentScheduler:
                     trailing_pct = (
                         getattr(pos, 'trailing_stop_pct', None)
                         or agent_config.get('trailing_stop_pct')
-                        or 4.0  # default 4% trailing stop — wide enough not to snap on noise
+                        or 2.0  # default 2% trailing stop — tight enough to protect profit
                     )
 
                     stored_sl = getattr(pos, 'stop_loss_price', None)
@@ -1913,11 +2459,39 @@ class AgentScheduler:
                         sl_price = stored_sl if stored_sl is not None else entry * (1 - sl_pct / 100)
                         tp_price = stored_tp if stored_tp is not None else entry * (1 + tp_pct / 100)
 
+                    # ── Override SL/TP for newly filled reversal orders ──────────
+                    # Reversal limit orders fill via _execute_pending_fill which
+                    # doesn't set SL/TP on the new position.  Apply the Fibonacci
+                    # levels computed at placement time.
+                    if pos.agent_id in self._reversal_orders_placed:
+                        _rev_cfg = self._reversal_orders_placed[pos.agent_id]
+                        try:
+                            from app.database import AsyncSessionLocal
+                            async with AsyncSessionLocal() as _db:
+                                _order = await _db.get(Trade, _rev_cfg["order_id"])
+                                if _order and _order.status == OrderStatus.FILLED:
+                                    await _svc.update_position_sl_tp(
+                                        pos.id,
+                                        stop_loss_price=_rev_cfg["sl"],
+                                        take_profit_price=_rev_cfg["tp"],
+                                    )
+                                    sl_price = _rev_cfg["sl"]
+                                    tp_price = _rev_cfg["tp"]
+                                    stored_sl = sl_price
+                                    stored_tp = tp_price
+                                    logger.info(
+                                        f"✅ Reversal SL/TP applied: {pos.symbol} "
+                                        f"SL=${_rev_cfg['sl']:.2f} TP=${_rev_cfg['tp']:.2f}"
+                                    )
+                                    del self._reversal_orders_placed[pos.agent_id]
+                        except Exception as _rev_tp_err:
+                            logger.debug(f"Reversal SL/TP apply error: {_rev_tp_err}")
+
                     # ── Minimum TP distance: TP must clear round-trip fees + profit floor ──
                     # Prevents a stored TP tightened by LLM review from triggering at a
                     # net loss.  Minimum = round-trip taker fees (e.g. 0.2% USDT) + 0.3%
                     # net profit floor, so every TP hit books a genuine gain.
-                    _fee_rt_min = _svc.fee_rate_for(pos.symbol) * 2
+                    _fee_rt_min = _svc.fee_rate_for(pos.symbol, _pos_agent_venue) * 2
                     _min_tp_move = _fee_rt_min + 0.003  # fees + 0.3% net profit floor
                     if entry and tp_price is not None:
                         if is_short:
@@ -1957,101 +2531,117 @@ class AgentScheduler:
                         liquidation_buffer_pct=_liq_buffer_pct,
                     )
 
-                    # ── Stage 1 & 2: Breakeven + profit-lock SL progression ──────
-                    # Runs independently of trailing stop, using TP distance milestones.
+                    # ── Graduated profit-protection stages ────────────────────────
+                    # Instead of waiting for progress toward a potentially distant TP,
+                    # we tighten the SL at fixed absolute-profit milestones based on
+                    # the watermark (highest/lowest price reached).  Once a milestone
+                    # is passed the SL is locked at that level — it never widens even
+                    # if price retraces.  This prevents "giving back" gains.
                     #
-                    # Stage 1 — BREAKEVEN (50% of way to TP reached):
-                    #   Move SL to entry + round-trip fees (0.12%) so the trade
-                    #   can never close at a loss from this point forward.
-                    #   Requires at least 0.5% absolute profit to avoid snapping SL
-                    #   on noise immediately after entry.
+                    # Milestones (absolute % from entry to watermark):
+                    #   breakeven → lock 25% → lock 50% → lock 75%
                     #
-                    # Stage 2 — PROFIT LOCK (80% of way to TP reached):
-                    #   Move SL to entry + 33% of current profit so a meaningful
-                    #   portion of the gain is protected, while leaving room for
-                    #   the trade to breathe through normal volatility.
+                    # Values are scaled by entry-time ATR% and GMM regime so a
+                    # low-vol / ranging setup tightens faster, while a high-vol
+                    # / trending setup gives the trade more room to breathe.
                     #
-                    # Both stages only ever TIGHTEN the SL (never widen it).
-                    # A minimum 0.2% price-move filter prevents DB thrashing.
-                    # ─────────────────────────────────────────────────────────
-                    _FEE_RT = _svc.fee_rate_for(pos.symbol) * 2  # round-trip taker fee
-                    _MIN_PROFIT_TO_BREAKEVEN = 0.005  # require at least 0.5% absolute gain first
-                    if entry and tp_price and sl_price is not None:
-                        if is_short:
-                            _full_move = entry - tp_price          # total move to TP (positive)
-                            _current_move = entry - current_price  # how far price has moved (positive = good)
-                        else:
-                            _full_move = tp_price - entry
-                            _current_move = current_price - entry
+                    # Each stage only ever TIGHTENS the SL.  A 0.2% minimum-move
+                    # filter prevents DB thrashing.
+                    # ─────────────────────────────────────────────────────────────
+                    _FEE_RT = _svc.fee_rate_for(pos.symbol, _pos_agent_venue) * 2
+                    _entry_inds = getattr(pos, 'entry_indicators', None)
+                    _PROFIT_BE, _PROFIT_25, _PROFIT_50, _PROFIT_75 = self._get_scaled_profit_thresholds(pos.symbol, _entry_inds)
 
-                        if _full_move > 0 and _current_move > 0:
-                            _progress = _current_move / _full_move  # 0.0 → 1.0
-                            _abs_profit_pct = _current_move / entry  # actual % gain
+                    if _PROFIT_BE != 0.005 or _PROFIT_75 != 0.025:
+                        logger.info(
+                            f"📐 Scaled profit stages for {pos.symbol}: "
+                            f"BE={_PROFIT_BE:.2%}, 25%={_PROFIT_25:.2%}, "
+                            f"50%={_PROFIT_50:.2%}, 75%={_PROFIT_75:.2%} "
+                            f"(entry_indicators={bool(_entry_inds)})"
+                        )
+
+                    if entry and sl_price is not None and highest:
+                        if is_short:
+                            _max_move = entry - highest  # max favourable move (positive = good)
+                        else:
+                            _max_move = highest - entry
+
+                        if _max_move > 0:
+                            _max_profit_pct = _max_move / entry
 
                             if is_short:
-                                _breakeven_sl = entry * (1 - _FEE_RT)   # just below entry (covers fees)
-                                _lock_sl      = entry - (_current_move * 0.50)  # lock HALF of profit
-                                # Snap profit-lock to nearest structural level
-                                if _pos_levels:
-                                    from app.services.technical_analyst import snap_sl_to_structure
-                                    _snapped = snap_sl_to_structure(_lock_sl, _pos_levels, current_price, is_short=True, max_widen_pct=0.10)
-                                    if _snapped < _lock_sl:
-                                        _lock_sl = _snapped
-                                from app.services.technical_analyst import snap_to_psychological as _psych
-                                _lock_sl = _psych(_lock_sl, entry, is_sl=True)
+                                # ── Short stages: tighten by lowering SL ─────────────
+                                if _max_profit_pct >= _PROFIT_75:
+                                    _new_sl = entry - (_max_move * 0.75)
+                                    _stage_label = "75% lock"
+                                elif _max_profit_pct >= _PROFIT_50:
+                                    _new_sl = entry - (_max_move * 0.50)
+                                    _stage_label = "50% lock"
+                                elif _max_profit_pct >= _PROFIT_25:
+                                    _new_sl = entry - (_max_move * 0.25)
+                                    _stage_label = "25% lock"
+                                elif _max_profit_pct >= _PROFIT_BE:
+                                    _new_sl = entry * (1 - _FEE_RT)
+                                    _stage_label = "breakeven"
+                                else:
+                                    _new_sl = None
 
-                                if _progress >= 0.50 and _lock_sl < sl_price:
-                                    # Stage 2: price ≥ 50% to TP — lock half of profit
-                                    if (sl_price - _lock_sl) >= current_price * 0.002:
-                                        await _svc.update_position_sl_tp(pos.id, stop_loss_price=_lock_sl)
+                                if _new_sl is not None:
+                                    # Snap to structural / psychological levels
+                                    if _pos_levels:
+                                        from app.services.technical_analyst import snap_sl_to_structure
+                                        _snapped = snap_sl_to_structure(_new_sl, _pos_levels, current_price, is_short=True, max_widen_pct=0.10)
+                                        if _snapped < _new_sl:
+                                            _new_sl = _snapped
+                                    from app.services.technical_analyst import snap_to_psychological as _psych
+                                    _new_sl = _psych(_new_sl, entry, is_sl=True)
+
+                                    # Only tighten (lower SL for shorts)
+                                    if _new_sl < sl_price and (sl_price - _new_sl) >= current_price * 0.002:
+                                        await _svc.update_position_sl_tp(pos.id, stop_loss_price=_new_sl)
                                         logger.info(
-                                            f"🔒 Profit lock: {pos.symbol} SHORT SL "
-                                            f"${sl_price:.4f}→${_lock_sl:.4f} "
-                                            f"(50% to TP, locking {_current_move * 0.50 / entry:.2%} profit)"
+                                            f"🔒 {_stage_label}: {pos.symbol} SHORT SL "
+                                            f"${sl_price:.4f}→${_new_sl:.4f} "
+                                            f"(watermark ${highest:.4f}, max profit {_max_profit_pct:.2%})"
                                         )
-                                        sl_price = _lock_sl
-                                elif _progress >= 0.30 and _abs_profit_pct >= _MIN_PROFIT_TO_BREAKEVEN and _breakeven_sl < sl_price:
-                                    # Stage 1: price ≥ 30% to TP and at least 0.3% profit — breakeven
-                                    if (sl_price - _breakeven_sl) >= current_price * 0.002:
-                                        await _svc.update_position_sl_tp(pos.id, stop_loss_price=_breakeven_sl)
-                                        logger.info(
-                                            f"⚖️  Breakeven SL: {pos.symbol} SHORT "
-                                            f"${sl_price:.4f}→${_breakeven_sl:.4f} "
-                                            f"({_progress:.0%} to TP, fees covered)"
-                                        )
-                                        sl_price = _breakeven_sl
+                                        sl_price = _new_sl
+
                             else:
-                                _breakeven_sl = entry * (1 + _FEE_RT)   # just above entry (covers fees)
-                                _lock_sl      = entry + (_current_move * 0.50)  # lock HALF of profit
-                                # Snap profit-lock to nearest structural level
-                                if _pos_levels:
-                                    from app.services.technical_analyst import snap_sl_to_structure
-                                    _snapped = snap_sl_to_structure(_lock_sl, _pos_levels, current_price, is_short=False, max_widen_pct=0.10)
-                                    if _snapped > _lock_sl:
-                                        _lock_sl = _snapped
-                                from app.services.technical_analyst import snap_to_psychological as _psych
-                                _lock_sl = _psych(_lock_sl, entry, is_sl=True)
+                                # ── Long stages: tighten by raising SL ──────────────
+                                if _max_profit_pct >= _PROFIT_75:
+                                    _new_sl = entry + (_max_move * 0.75)
+                                    _stage_label = "75% lock"
+                                elif _max_profit_pct >= _PROFIT_50:
+                                    _new_sl = entry + (_max_move * 0.50)
+                                    _stage_label = "50% lock"
+                                elif _max_profit_pct >= _PROFIT_25:
+                                    _new_sl = entry + (_max_move * 0.25)
+                                    _stage_label = "25% lock"
+                                elif _max_profit_pct >= _PROFIT_BE:
+                                    _new_sl = entry * (1 + _FEE_RT)
+                                    _stage_label = "breakeven"
+                                else:
+                                    _new_sl = None
 
-                                if _progress >= 0.50 and _lock_sl > sl_price:
-                                    # Stage 2: price ≥ 50% to TP — lock half of profit
-                                    if (_lock_sl - sl_price) >= current_price * 0.002:
-                                        await _svc.update_position_sl_tp(pos.id, stop_loss_price=_lock_sl)
+                                if _new_sl is not None:
+                                    # Snap to structural / psychological levels
+                                    if _pos_levels:
+                                        from app.services.technical_analyst import snap_sl_to_structure
+                                        _snapped = snap_sl_to_structure(_new_sl, _pos_levels, current_price, is_short=False, max_widen_pct=0.10)
+                                        if _snapped > _new_sl:
+                                            _new_sl = _snapped
+                                    from app.services.technical_analyst import snap_to_psychological as _psych
+                                    _new_sl = _psych(_new_sl, entry, is_sl=True)
+
+                                    # Only tighten (raise SL for longs)
+                                    if _new_sl > sl_price and (_new_sl - sl_price) >= current_price * 0.002:
+                                        await _svc.update_position_sl_tp(pos.id, stop_loss_price=_new_sl)
                                         logger.info(
-                                            f"🔒 Profit lock: {pos.symbol} LONG SL "
-                                            f"${sl_price:.4f}→${_lock_sl:.4f} "
-                                            f"(50% to TP, locking {_current_move * 0.50 / entry:.2%} profit)"
+                                            f"🔒 {_stage_label}: {pos.symbol} LONG SL "
+                                            f"${sl_price:.4f}→${_new_sl:.4f} "
+                                            f"(watermark ${highest:.4f}, max profit {_max_profit_pct:.2%})"
                                         )
-                                        sl_price = _lock_sl
-                                elif _progress >= 0.30 and _abs_profit_pct >= _MIN_PROFIT_TO_BREAKEVEN and _breakeven_sl > sl_price:
-                                    # Stage 1: price ≥ 30% to TP and at least 0.3% profit — breakeven
-                                    if (_breakeven_sl - sl_price) >= current_price * 0.002:
-                                        await _svc.update_position_sl_tp(pos.id, stop_loss_price=_breakeven_sl)
-                                        logger.info(
-                                            f"⚖️  Breakeven SL: {pos.symbol} LONG "
-                                            f"${sl_price:.4f}→${_breakeven_sl:.4f} "
-                                            f"({_progress:.0%} to TP, fees covered)"
-                                        )
-                                        sl_price = _breakeven_sl
+                                        sl_price = _new_sl
 
                     # ── Stage 3: Trailing stop watermark ──────────────────────────
                     # When price has moved favourably, physically move the SL
@@ -2066,8 +2656,11 @@ class AgentScheduler:
                     # even paid for itself yet.
                     if trailing_pct and highest:
                         _fee_breakeven_dist = entry * _FEE_RT
+                        # Activate trailing once price has moved 0.5% in our favour.
+                        # This is well before the 2% trail distance, so the trail
+                        # starts working early and protects profit from the outset.
                         _trail_activation_distance = max(
-                            entry * (trailing_pct / 100) * 1.0,
+                            entry * 0.005,
                             _fee_breakeven_dist,
                         )
                         if is_short:
@@ -2158,9 +2751,9 @@ class AgentScheduler:
                                         continue
                                     if _progress >= _lvl["pct_of_tp"]:
                                         _close_pct = _lvl["close_pct"]
-                                        _close_qty = max((pos.quantity or 0) * _close_pct, 0.0)
+                                        _close_qty = max((_lvl.get("original_qty") or pos.quantity or 0) * _close_pct, 0.0)
 
-                                        _fee_rate = paper_trading.fee_rate_for(pos.symbol, paper_trading._venue_for(pos.agent_id)) if _pos_is_paper else _svc.fee_rate_for(pos.symbol)
+                                        _fee_rate = paper_trading.fee_rate_for(pos.symbol, paper_trading._venue_for(pos.agent_id)) if _pos_is_paper else _svc.fee_rate_for(pos.symbol, _pos_agent_venue)
 
                                         # Only scale out when the tranche itself is net-profitable
                                         # after estimated round-trip fees.
@@ -2195,7 +2788,7 @@ class AgentScheduler:
                                                 f"qty remaining {_result['remaining_quantity']:.4g})"
                                             )
                                             # Move SL to breakeven after first scale
-                                            _FEE_RT_SCALE = _svc.fee_rate_for(pos.symbol) * 2
+                                            _FEE_RT_SCALE = _svc.fee_rate_for(pos.symbol, _pos_agent_venue) * 2
                                             _be_moved = False
                                             if not is_short:
                                                 _be_sl = entry * (1 + _FEE_RT_SCALE)
@@ -2248,6 +2841,100 @@ class AgentScheduler:
                         except Exception as _so_err:
                             logger.debug(f"Scale-out processing error for {pos.symbol}: {_so_err}")
 
+                    # ── Reversal limit order ──────────────────────────────────
+                    # When a position has made significant progress toward TP,
+                    # place a limit order on the opposite side at the TP level
+                    # to catch a Fibonacci retracement at a structural support/
+                    # resistance zone.  Only enabled for directional strategies
+                    # (momentum, trend, breakout, ai) that ride large moves.
+                    if tp_price and entry:
+                        _rev_full = entry - tp_price if is_short else tp_price - entry
+                        _rev_curr = entry - current_price if is_short else current_price - entry
+                        if _rev_full > 0 and _rev_curr > 0:
+                            _rev_progress = _rev_curr / _rev_full
+                        else:
+                            _rev_progress = -1.0
+                        # Load reversal config from strategy registry (not agent_config)
+                        import app.strategies as _strat_reg
+                        _strat_def = _strat_reg.get(agent_config.get("strategy_type", ""))
+                        _rev_cfg = (_strat_def or {}).get("reversal_limit_order", {})
+                        # Only place at structural levels — don't fade at arbitrary prices
+                        _rev_near_structure = True
+                        if _pos_levels is not None:
+                            if is_short:
+                                _rev_near_structure = any(
+                                    abs(tp_price - s) / max(s, 1e-10) <= 0.005
+                                    for s in (_pos_levels.support or [])
+                                )
+                            else:
+                                _rev_near_structure = any(
+                                    abs(r - tp_price) / max(r, 1e-10) <= 0.005
+                                    for r in (_pos_levels.resistance or [])
+                                )
+                        if (
+                            _rev_cfg.get("enabled")
+                            and _rev_near_structure
+                            and _rev_progress >= _rev_cfg.get("trigger_progress", 0.75)
+                        ):
+                            _rev_key = pos.agent_id
+                            if _rev_key not in self._reversal_orders_placed:
+                                import uuid as _uuid
+                                _rev_side = OrderSide.BUY if is_short else OrderSide.SELL
+                                _size_fib = _rev_cfg.get("size_fib", 0.382)
+                                _tp_fib = _rev_cfg.get("tp_fib", 0.382)
+                                _sl_fib = _rev_cfg.get("sl_fib", 0.236)
+                                _rev_qty = max((pos.quantity or 0) * _size_fib, 0.0)
+                                if _rev_qty > 0:
+                                    _rev_price = tp_price
+                                    if is_short:
+                                        _rev_sl = tp_price - (_rev_full * _sl_fib)
+                                        _rev_tp = tp_price + (_rev_full * _tp_fib)
+                                    else:
+                                        _rev_sl = tp_price + (_rev_full * _sl_fib)
+                                        _rev_tp = tp_price - (_rev_full * _tp_fib)
+                                    try:
+                                        from app.database import AsyncSessionLocal
+                                        async with AsyncSessionLocal() as _db:
+                                            _dup = await _db.execute(
+                                                select(Trade).where(
+                                                    Trade.agent_id == pos.agent_id,
+                                                    Trade.symbol == pos.symbol,
+                                                    Trade.side == _rev_side,
+                                                    Trade.status == OrderStatus.PENDING,
+                                                )
+                                            )
+                                            if _dup.scalar_one_or_none() is None:
+                                                _new_order = Trade(
+                                                    id=str(_uuid.uuid4()),
+                                                    user_id="default-user",
+                                                    agent_id=pos.agent_id,
+                                                    trader_id=agent_config.get("trader_id"),
+                                                    symbol=pos.symbol,
+                                                    side=_rev_side,
+                                                    quantity=_rev_qty,
+                                                    price=_rev_price,
+                                                    total=0, fee=0,
+                                                    leverage=getattr(pos, 'leverage', 1) or 1,
+                                                    margin_used=0,
+                                                    status=OrderStatus.PENDING,
+                                                    is_paper=_pos_is_paper,
+                                                    created_at=datetime.now(),
+                                                    phemex_order_id="Limit",
+                                                )
+                                                _db.add(_new_order)
+                                                await _db.commit()
+                                                self._reversal_orders_placed[_rev_key] = {
+                                                    "sl": _rev_sl, "tp": _rev_tp, "order_id": _new_order.id,
+                                                }
+                                                logger.info(
+                                                    f"📌 Reversal limit order: "
+                                                    f"{'BUY' if not is_short else 'SELL'} {_rev_qty:.4g} "
+                                                    f"{pos.symbol} @ ${_rev_price:.4g} "
+                                                    f"(SL ${_rev_sl:.4g} TP ${_rev_tp:.4g})"
+                                                )
+                                    except Exception as _rev_err:
+                                        logger.debug(f"Reversal order failed: {_rev_err}")
+
                     # ── Momentum exhaustion early exit ────────────────────────
                     # If the trend structure that justified this entry has broken down,
                     # exit BEFORE the mechanical SL triggers. This catches the "waning
@@ -2282,6 +2969,11 @@ class AgentScheduler:
                                             quantity=pos.quantity, price=current_price,
                                             agent_id=pos.agent_id,
                                         )
+                                        _me_pnl = ((entry - current_price) * pos.quantity) if is_short else ((current_price - entry) * pos.quantity)
+                                        asyncio.create_task(_send_telegram(telegram_service.alert_position_closed(
+                                            symbol=pos.symbol, side=_direction.lower(), pnl=_me_pnl,
+                                            close_reason="Momentum Exhaustion",
+                                        )))
                                         from app.services.team_chat import team_chat
                                         await team_chat.add_message(
                                             agent_role="system",
@@ -2302,6 +2994,152 @@ class AgentScheduler:
                         'take_profit': tp_price,
                         'highest_price': highest,
                     }
+
+                    # ── Dynamic stay score ────────────────────────────────────
+                    # Composite score that determines whether a position should
+                    # remain open.  Considers age, regime, TP progress trajectory,
+                    # momentum, volatility, and fee pressure.  A score below the
+                    # threshold means it's time to exit and free up capital.
+                    if tp_price and entry:
+                        _full_move_stay = entry - tp_price if is_short else tp_price - entry
+                        _curr_move_stay = entry - current_price if is_short else current_price - entry
+                        if _full_move_stay > 0 and _curr_move_stay > 0:
+                            _tp_progress_stay = _curr_move_stay / _full_move_stay
+                            _peak_move_stay = entry - highest if is_short else highest - entry
+                            _peak_progress_stay = min(max(_peak_move_stay / _full_move_stay, 0), 1.0)
+                            _retrace_stay = (_peak_progress_stay - _tp_progress_stay) / max(_peak_progress_stay, 0.01) if _peak_progress_stay > 0 else 0
+                        else:
+                            _tp_progress_stay = 0
+                            _peak_progress_stay = 0
+                            _retrace_stay = 0
+                    else:
+                        _tp_progress_stay = 0
+                        _peak_progress_stay = 0
+                        _retrace_stay = 0
+
+                    _pos_age_stay = 0
+                    try:
+                        _age_dt = getattr(pos, 'created_at', None)
+                        if _age_dt is not None:
+                            _age_utc = _age_dt.replace(tzinfo=None) if _age_dt.tzinfo is not None else _age_dt
+                            _pos_age_stay = (datetime.now() - _age_utc).total_seconds() / 3600
+                    except Exception:
+                        pass
+
+                    # Regime multiplier
+                    _regime_stay = "unknown"
+                    if hasattr(self, '_current_analyst_report') and self._current_analyst_report:
+                        _r = getattr(self._current_analyst_report, 'market_regime', None)
+                        if _r:
+                            _regime_stay = str(getattr(_r, 'regime', 'unknown')).lower()
+
+                    _is_trending_stay = _regime_stay in ('trending_up', 'trending_down')
+                    _is_ranging_stay = _regime_stay in ('range', 'ranging', 'consolidation', 'consolidating')
+
+                    # Age multiplier: decays from 1.5 → 0.1
+                    _age_max_stay = 168 if _is_trending_stay else 72
+                    _age_mult_stay = max(0.1, 1.5 - (_pos_age_stay / _age_max_stay) * 1.4)
+
+                    # Regime multiplier
+                    if _is_trending_stay:
+                        _regime_mult_stay = 2.0
+                    elif _is_ranging_stay:
+                        _regime_mult_stay = 0.5
+                    elif _regime_stay in ('risk_on', 'risk_off'):
+                        _regime_mult_stay = 1.5
+                    else:
+                        _regime_mult_stay = 1.0
+
+                    # Progress trajectory multiplier
+                    if _peak_progress_stay > 0.8:
+                        _progress_mult_stay = 0.3
+                    elif _retrace_stay > 0.3:
+                        _progress_mult_stay = 0.4
+                    elif _tp_progress_stay > 0.5:
+                        _progress_mult_stay = 1.5
+                    elif _tp_progress_stay > 0.3:
+                        _progress_mult_stay = 1.0
+                    elif _tp_progress_stay > 0:
+                        _progress_mult_stay = 0.6
+                    else:
+                        _progress_mult_stay = 1.0
+
+                    # Momentum multiplier (RSI change from entry)
+                    _momentum_mult_stay = 1.0
+                    _entry_rsi_stay = (_entry_inds or {}).get('rsi') if _entry_inds else None
+                    if _entry_rsi_stay is not None:
+                        try:
+                            import pandas as _pd_stay
+                            _rsi_df_stay = await self.indicator_service.fetch_ohlcv(pos.symbol, '1h', limit=5)
+                            if _rsi_df_stay is not None and len(_rsi_df_stay) >= 5:
+                                _rsi_now_stay = self.indicator_service.calculate_rsi(_rsi_df_stay['close'].astype(float))
+                                _curr_rsi_stay = float(_rsi_now_stay.iloc[-1]) if not _pd_stay.isna(_rsi_now_stay.iloc[-1]) else None
+                                if _curr_rsi_stay is not None:
+                                    _rsi_change_stay = _curr_rsi_stay - _entry_rsi_stay
+                                    if is_short:
+                                        _momentum_mult_stay = 1.5 if _rsi_change_stay < -5 else (0.5 if _rsi_change_stay > 5 else 1.0)
+                                    else:
+                                        _momentum_mult_stay = 1.5 if _rsi_change_stay > 5 else (0.5 if _rsi_change_stay < -5 else 1.0)
+                        except Exception:
+                            pass
+
+                    # Volatility multiplier (ATR from entry indicators)
+                    _atr_pct_stay = (_entry_inds or {}).get('atr_pct') if _entry_inds else None
+                    if _atr_pct_stay is not None:
+                        if _atr_pct_stay > 3.0:
+                            _vol_mult_stay = 1.3
+                        elif _atr_pct_stay > 1.0:
+                            _vol_mult_stay = 1.0
+                        else:
+                            _vol_mult_stay = 0.6
+                    else:
+                        _vol_mult_stay = 1.0
+
+                    # Fee pressure multiplier
+                    _fee_ratio_stay = getattr(self, '_cached_budget_ratio', 0.0) or 0.0
+                    if _fee_ratio_stay < 0.25:
+                        _fee_mult_stay = 0.5
+                    elif _fee_ratio_stay < 0.50:
+                        _fee_mult_stay = 0.7
+                    elif _fee_ratio_stay < 0.75:
+                        _fee_mult_stay = 0.9
+                    else:
+                        _fee_mult_stay = 1.0
+
+                    _stay_score = _age_mult_stay * _regime_mult_stay * _progress_mult_stay * _momentum_mult_stay * _vol_mult_stay * _fee_mult_stay
+                    _STAY_THRESHOLD = 0.3
+
+                    if _stay_score < _STAY_THRESHOLD and _pos_age_stay > 6:
+                        _pos_pnl_stay = ((entry - current_price) / entry) * 100 if is_short else ((current_price - entry) / entry) * 100
+                        if _pos_pnl_stay > 0:
+                            _dir_label_stay = "SHORT" if is_short else "LONG"
+                            logger.info(
+                                f"Stay-score exit: {pos.symbol} {_dir_label_stay} "
+                                f"score={_stay_score:.2f} < {_STAY_THRESHOLD} "
+                                f"(age={_age_mult_stay:.2f}×{_regime_mult_stay:.2f}×{_progress_mult_stay:.2f}×"
+                                f"{_momentum_mult_stay:.2f}×{_vol_mult_stay:.2f}×{_fee_mult_stay:.2f}) "
+                                f"open={_pos_age_stay:.0f}h pnl={_pos_pnl_stay:+.2f}% regime={_regime_stay}"
+                            )
+                            check = RiskCheckResult(
+                                allowed=True, action="exit",
+                                reason=(
+                                    f"Stay score {_stay_score:.2f} below {_STAY_THRESHOLD}: "
+                                    f"open {_pos_age_stay:.0f}h, {_regime_stay}, progress {_tp_progress_stay:.0%}"
+                                ),
+                            )
+                            try:
+                                await team_chat.add_message(
+                                    agent_role="system",
+                                    content=(
+                                        f"🚪 **Stay-score exit:** {pos.symbol} {_dir_label_stay} "
+                                        f"closed @ ${current_price:.2f} "
+                                        f"(score={_stay_score:.2f}, open={_pos_age_stay:.0f}h, "
+                                        f"regime={_regime_stay}, pnl={_pos_pnl_stay:+.2f}%)"
+                                    ),
+                                    message_type="trade",
+                                )
+                            except Exception:
+                                pass
 
                     _liq_check = risk_manager.check_liquidation_risk(
                         side=pos_side,
@@ -2372,7 +3210,7 @@ class AgentScheduler:
                             # This matches exactly the net_pnl shown in the closed trades history
                             # for this exit row. Scale-out P&L was already reported when each
                             # scale-out fired; don't include it here to avoid double-counting.
-                            _fee_rate = _svc.fee_rate_for(pos.symbol)
+                            _fee_rate = _svc.fee_rate_for(pos.symbol, _pos_agent_venue)
                             _entry_fee = (_close_entry * _close_qty) * _fee_rate
                             _exit_fee = (current_price * _close_qty) * _fee_rate
                             if is_short:
@@ -2384,9 +3222,14 @@ class AgentScheduler:
                             pnl = _final_pnl + _scale_out_pnl
                             risk_manager.record_pnl(pnl)
 
-                            # Record close time for post-close cooldown
+                            # Record close time + exit type for post-close cooldown.
+                            # Stop-loss exits get a 2× cooldown to avoid whipsaw re-entries
+                            # into the same volatility spike that just hit the SL.
                             _cooldown_key = f"{pos.agent_id}:{pos.symbol}"
-                            self._recent_closes[_cooldown_key] = datetime.now()
+                            _exit_type_for_cd = "trailing-stop" if "Trailing" in check.reason else (
+                                "take-profit" if "Take-profit" in check.reason else "stop-loss"
+                            )
+                            self._recent_closes[_cooldown_key] = (datetime.now(), _exit_type_for_cd)
 
                             if pos.agent_id and pos.agent_id in self._agent_metrics:
                                 # Arrr, route through _record_run so actual_trades, winning_trades,
@@ -2406,6 +3249,7 @@ class AgentScheduler:
                                     pnl=pnl,
                                     strategy_type=self._enabled_agents.get(pos.agent_id, {}).get("strategy_type"),
                                     use_paper=_pos_is_paper,
+                                    entry_regime=getattr(pos, "entry_regime", None),
                                 )
                                 # Tag the run buffer entry with exit reason for team context
                                 if self._agent_runs:
@@ -2611,18 +3455,31 @@ class AgentScheduler:
                 "(or 1.5% above current price for a short). Never place a new SL within 1% of "
                 "current price — it will trigger immediately and close the trade unnecessarily.\n"
                 "4. If TA confluence is bearish for a long position (or bullish for a short), tighten SL.\n"
-                "5. TP ADJUSTMENTS — both directions are valid:\n"
-                "   a) EXTEND TP: only if TA confluence is strongly aligned with the trade direction AND "
-                "the position has significant momentum (TP_progress > 50%).\n"
-                "   b) REDUCE TP: consider lowering TP in any of these situations:\n"
-                "      - TA signal has flipped AGAINST the trade direction (e.g. TA=bearish for a long)\n"
-                "      - Market regime has changed to 'ranging' or 'consolidation' after entry\n"
-                "      - Price has been open > 48 hours (open_hrs > 48) and TP_progress < 30% "
-                "(target is stalling — take what the market is offering)\n"
-                "      - TP_progress > 80% (price is nearly there — lower TP to current price + small buffer "
-                "to lock in the gain rather than risk a reversal)\n"
-                "   When reducing TP for a long, do NOT reduce below current price + 0.5%. "
-                "When reducing TP for a short, do NOT reduce above current price - 0.5%.\n"
+                 "5. TP ADJUSTMENTS — CRITICAL: raising vs lowering the TP number has the "
+                 "OPPOSITE meaning for shorts vs longs. First decide whether you want to "
+                 "WIDEN or TIGHTEN the target, THEN pick the correct price direction:\n"
+                 "   - WIDEN = move target further from current price (ask for more profit)\n"
+                 "     Long: raise TP price  |  Short: lower TP price\n"
+                 "   - TIGHTEN = move target closer to current price (lock gains sooner)\n"
+                 "     Long: lower TP price  |  Short: raise TP price\n\n"
+                 "   a) WIDEN TP: only if TA confluence is strongly ALIGNED with the trade "
+                 "direction AND the position has significant momentum (TP_progress > 50%).\n"
+                 "     'TA aligns with trade direction' means:\n"
+                 "       - Long + bullish TA, or Short + bearish TA\n"
+                 "   b) TIGHTEN TP: consider if any of these apply:\n"
+                 "      - TA signal has FLIPPED AGAINST the trade direction:\n"
+                 "        * Long + bearish TA (bearish is against a long)\n"
+                 "        * Short + bullish TA (bullish is against a short)\n"
+                 "      - Market regime changed to 'ranging' or 'consolidation' after entry\n"
+                 "      - Open > 48 hrs and TP_progress < 30% (stalling — take what is offered)\n"
+                 "      - TP_progress > 80% (nearly there — lock in the gain)\n"
+                 "     For a long: tighten by lowering the TP price, but not below current price + 0.5%.\n"
+                 "     For a short: tighten by raising the TP price, but not above current price - 0.5%.\n"
+                 "   IMPORTANT: In the 'reason' field, use correct directional language. "
+                 "Say 'widening TP' when moving the target further from price, "
+                 "'tightening TP' when moving it closer. Never say 'tighten' or "
+                 "'lock gains' when you are actually widening the target — e.g. for a "
+                 "short, lowering the TP price is WIDENING (asking for more profit).\n"
                 "6. If no change is warranted, return an empty adjustments array.\n"
                 "7. Always include a brief reason per adjustment.\n"
                 "8. CRITICAL: Before proposing any SL, check the current price shown in the "
@@ -2634,11 +3491,22 @@ class AgentScheduler:
                 '  {"position_id": "...", "symbol": "...", '
                 '"new_stop_loss": <number|null>, "new_take_profit": <number|null>, '
                 '"reason": "..."}\n'
-                '], "summary": "one-line overall summary"}\n\n'
-                "IMPORTANT: Values must be plain numbers (e.g. 67500.00), NOT strings with $ signs."
+                '], "summary": "one-line overall summary — use correct directional language '
+                '(widened/tightened, NOT reduce/extend/lock gains unless it is actually tightening)"}\n\n'
+                 "IMPORTANT: Values must be plain numbers (e.g. 67500.00), NOT strings with $ signs."
             )
 
+            # Prepend latest trader commentary so Sarah Chen factors in
+            # each trader's own assessment of their positions.
+            _trader_notes = ""
+            if self._latest_trader_commentary:
+                _lines = []
+                for _tname, _tcomment in self._latest_trader_commentary.items():
+                    _lines.append(f"{_tname}: {_tcomment}")
+                _trader_notes = "LATEST TRADER COMMENTARY:\n" + "\n".join(_lines) + "\n\n"
+
             user_prompt = (
+                f"{_trader_notes}"
                 f"MARKET CONTEXT:\n{market_ctx}\n\n"
                 f"OPEN POSITIONS:\n" + "\n".join(position_blocks)
             )
@@ -2725,29 +3593,48 @@ class AgentScheduler:
                             kwargs["stop_loss_price"] = new_sl
                 if new_tp is not None:
                     old_tp = old.get("tp")
+                    _tp_entry_price = old.get("entry", ref_price)
+                    _tp_is_short = old.get("is_short", False)
                     if old_tp is not None:
-                        # Cap TP extensions to +25% above the original TP — prevents the LLM
-                        # from dreaming up targets that are 2× away.  Also floor reductions at
-                        # 50% of original TP so TP isn't collapsed below meaningful profit.
-                        _max_tp = old_tp * 1.25
-                        _min_tp = old_tp * 0.50
-                        if new_tp > _max_tp:
-                            logger.info(
-                                f"SL/TP Review: TP extension capped ${new_tp:.4f}→${_max_tp:.4f} "
-                                f"(+25% max above original ${old_tp:.4f})"
-                            )
-                            new_tp = round(_max_tp, 6)
-                        elif new_tp < _min_tp:
-                            logger.info(
-                                f"SL/TP Review: TP reduction floored ${new_tp:.4f}→${_min_tp:.4f} "
-                                f"(50% min of original ${old_tp:.4f})"
-                            )
-                            new_tp = round(_min_tp, 6)
+                        # Cap TP extensions and floor reductions in a direction-aware way.
+                        # For longs: extension = higher price (further from entry),
+                        # reduction = lower price (closer to entry).
+                        # For shorts: extension = lower price (further from entry),
+                        # reduction = higher price (closer to entry).
+                        _old_dist = abs(old_tp - _tp_entry_price)
+                        if _tp_is_short:
+                            _max_tp = old_tp - _old_dist * 0.25  # can't extend profit > 25% beyond original
+                            _min_tp = old_tp + _old_dist * 0.50  # can't reduce profit below 50% of original
+                            if new_tp < _max_tp:
+                                logger.info(
+                                    f"SL/TP Review: SHORT TP extension capped ${new_tp:.4f}→${_max_tp:.4f} "
+                                    f"(+25% max beyond original ${old_tp:.4f})"
+                                )
+                                new_tp = round(_max_tp, 6)
+                            elif new_tp > _min_tp:
+                                logger.info(
+                                    f"SL/TP Review: SHORT TP reduction floored ${new_tp:.4f}→${_min_tp:.4f} "
+                                    f"(50% min of original ${old_tp:.4f})"
+                                )
+                                new_tp = round(_min_tp, 6)
+                        else:
+                            _max_tp = old_tp + _old_dist * 0.25
+                            _min_tp = old_tp - _old_dist * 0.50
+                            if new_tp > _max_tp:
+                                logger.info(
+                                    f"SL/TP Review: LONG TP extension capped ${new_tp:.4f}→${_max_tp:.4f} "
+                                    f"(+25% max above original ${old_tp:.4f})"
+                                )
+                                new_tp = round(_max_tp, 6)
+                            elif new_tp < _min_tp:
+                                logger.info(
+                                    f"SL/TP Review: LONG TP reduction floored ${new_tp:.4f}→${_min_tp:.4f} "
+                                    f"(50% min of original ${old_tp:.4f})"
+                                )
+                                new_tp = round(_min_tp, 6)
                     # Fee-profitable floor: TP must be far enough from entry to cover
                     # round-trip fees + a net profit minimum, so no LLM-proposed TP
                     # can result in a guaranteed loss on exit.
-                    _tp_entry_price = old.get("entry", ref_price)
-                    _tp_is_short = old.get("is_short", False)
                     _tp_min_dist = 0.002 + 0.003  # 0.2% round-trip fees + 0.3% net profit
                     if _tp_is_short:
                         _tp_profit_floor = _tp_entry_price * (1 - _tp_min_dist)
@@ -2769,6 +3656,36 @@ class AgentScheduler:
                             new_tp = round(_tp_profit_floor, 6)
                     if old_tp is None or abs(new_tp - old_tp) >= min_delta:
                         kwargs["take_profit_price"] = new_tp
+                if "take_profit_price" in kwargs and new_tp is not None and old_tp is not None:
+                    # ── Safety gate: correct directional language in reason ──
+                    # The LLM often says "tightening TP" when it's actually
+                    # widening (moving target further from price) for shorts.
+                    # Determine the actual effect and override the reason.
+                    _tp_is_short_pos = old.get("is_short", False)
+                    # "tighten" = move closer to current price
+                    # For long:  lower TP number  = closer = tighten
+                    # For short: raise TP number  = closer = tighten
+                    if _tp_is_short_pos:
+                        _actually_tightening = new_tp > old_tp  # raising price = closer
+                    else:
+                        _actually_tightening = new_tp < old_tp  # lowering price = closer
+                    if _actually_tightening:
+                        _correct_verb = "tightening"
+                        _correct_effect = "locking gains sooner"
+                    else:
+                        _correct_verb = "widening"
+                        _correct_effect = "asking for more profit"
+                    reason_lower = reason.lower()
+                    _has_wrong_term = ("tighten" in reason_lower or "lock gain" in reason_lower) and not _actually_tightening
+                    _has_wrong_term = _has_wrong_term or (("widen" in reason_lower or "more profit" in reason_lower) and _actually_tightening)
+                    if _has_wrong_term:
+                        logger.warning(
+                            f"SL/TP Review: corrected reason for {symbol}: "
+                            f"LLM said 'reason={reason}' but this is actually "
+                            f"{_correct_verb} TP ({_correct_effect})"
+                        )
+                        reason = f"{_correct_verb} TP ({_correct_effect})"
+                        adj["reason"] = reason
                 if not kwargs:
                     continue
 
@@ -2827,9 +3744,11 @@ class AgentScheduler:
                             f"- The proposed SL is too close to current price (within 1%) and would close the position immediately\n"
                             f"- It would prematurely close a position before your thesis plays out\n"
                             f"- It contradicts your entry reasoning\n"
-                            f"- A TP reduction is proposed but the original thesis is still intact "
-                            f"(e.g. TA hasn't flipped, regime hasn't changed, position is progressing normally)\n"
-                            f"- A TP extension is proposed but there is no momentum or TA support for it\n"
+                             f"- Tightening TP (moving target closer to current price) is proposed "
+                             f"but the original thesis is still intact "
+                             f"(e.g. TA hasn't flipped, regime hasn't changed, position is progressing normally)\n"
+                             f"- Widening TP (moving target further from current price) is proposed "
+                             f"but there is no momentum or TA support for it\n"
                             f"Be concise (1-2 sentences)."
                         )
                         trader_user = (
@@ -2879,6 +3798,27 @@ class AgentScheduler:
                     logger.warning(f"SL/TP Review: Failed to update position {pid} — not found")
 
             if adjusted_count > 0:
+                # ── Correct summary directional language ─────────────────────
+                # Catch leftover LLM summary like "tightened TP to lock in gains"
+                # that's directionally wrong for shorts.  Check if any applied
+                # adjustment has mismatch between price direction and wording.
+                _summary_has_wrong = False
+                for _adj in adjustments:
+                    _oid = _adj.get("position_id", "")
+                    _old = pos_current_levels.get(_oid, {})
+                    if _old.get("is_short") and _adj.get("new_take_profit") is not None:
+                        _new_tp_v = _safe_float(_adj["new_take_profit"])
+                        _old_tp_v = _old.get("tp")
+                        if _old_tp_v and _new_tp_v is not None and _new_tp_v < _old_tp_v:
+                            _s_lower = summary.lower()
+                            if "tighten" in _s_lower or "lock gain" in _s_lower:
+                                _summary_has_wrong = True
+                                break
+                if _summary_has_wrong:
+                    summary = summary.replace("tightened", "widened").replace("Tightened", "Widened")
+                    summary = summary.replace("tighten", "widen").replace("Tighten", "Widen")
+                    summary = summary.replace("lock gains", "ask for more profit").replace("Lock gains", "Ask for more profit")
+                    logger.info(f"SL/TP Review: corrected summary directional language → '{summary}'")
                 await team_chat.add_message(
                     agent_role="fund_manager",
                     content=(
@@ -2949,6 +3889,8 @@ class AgentScheduler:
                 "strategy_type": next(
                     (a["strategy_type"] for a in agents if a["id"] == agent_id), "unknown"
                 ),
+                "venue_stats": getattr(metrics, "venue_stats", {}) or {},
+                "regime_stats": getattr(metrics, "regime_stats", {}) or {},
             })
         return metrics_list
 
@@ -2973,6 +3915,7 @@ class AgentScheduler:
                     "leverage": getattr(p, 'leverage', 1.0) or 1.0,
                     "margin_used": getattr(p, 'margin_used', None),
                     "notional": (p.quantity or 0) * (getattr(p, 'current_price', None) or p.entry_price or 0),
+                    "stop_loss_price": getattr(p, 'stop_loss_price', None),
                 }
                 for p in positions
             ]
@@ -3337,12 +4280,16 @@ class AgentScheduler:
                         await self._execute_strategy_actions(review.proposed_actions, agents_list)
 
                     # 2.6 Trader Strategy Reviews: Each trader reviews its own agents
-                    # Only run if the trader was @mentioned or hasn't reviewed in 60 min.
+                    # Runs on @mention (up to every 60 min) OR auto-runs every 6 hours
+                    # so the strategy mix adapts to regime changes.
                     for t in self._traders:
                         if not t.get("is_enabled", True):
                             continue
                         _trader_tag = f"@{t['name'].lower().replace(' ', '_')}"
-                        if not self._was_mentioned_recently(_trader_tag, minutes=60):
+                        _mentioned = self._was_mentioned_recently(_trader_tag, minutes=60)
+                        _last_review = self._last_trader_strategy_review.get(t["id"])
+                        _hours_since = (datetime.now() - _last_review).total_seconds() / 3600 if _last_review else 999
+                        if not _mentioned and _hours_since < 6:
                             continue
                         try:
                             t_agents = [a for a in agents_list if a.get("trader_id") == t["id"]]
@@ -3363,6 +4310,8 @@ class AgentScheduler:
                             )
                             if actions:
                                 await self._execute_trader_strategy_actions(actions, t, agents_list)
+                            # Record review timestamp regardless of whether actions were taken
+                            self._last_trader_strategy_review[t["id"]] = datetime.now()
                         except Exception as te:
                             logger.error(f"Trader {t['name']} strategy review failed", exc_info=True)
             except Exception as e:
@@ -3594,14 +4543,43 @@ class AgentScheduler:
             return
 
         enabled = [a for a in agents_list if a.get("is_enabled", True)]
-        if len(enabled) <= self._agent_cap_max:
+
+        # ── Rookie protection ──────────────────────────────────────────────
+        # Agents with fewer than _agent_cap_min_trades have no meaningful
+        # performance data (they all score the default 0.500). Culling them
+        # before they can build a track record starves conservative traders
+        # (Otto) and new strategies of any chance to compete. Rookies get a
+        # free pass — only veterans compete for the cap slots.
+        from app.database import get_async_session
+        from app.models import AgentMetricRecord
+        from sqlalchemy import select as _sel
+
+        rookies: list = []
+        veterans: list = []
+        async with get_async_session() as _cap_db:
+            for agent in enabled:
+                _mr = await _cap_db.execute(
+                    _sel(AgentMetricRecord).where(
+                        AgentMetricRecord.agent_id == agent["id"],
+                        AgentMetricRecord.is_paper == _is_paper_mode(),
+                    )
+                )
+                _metrics = _mr.scalar_one_or_none()
+                if not _metrics or (_metrics.actual_trades or 0) < self._agent_cap_min_trades:
+                    rookies.append(agent)
+                else:
+                    veterans.append(agent)
+
+        if len(veterans) <= self._agent_cap_max:
+            # Veterans fit within the cap; rookies always ride free.
             return
 
+        # Only veterans compete for cap slots — rookies are always safe.
         scored = {}
-        for agent in enabled:
+        for agent in veterans:
             scored[agent["id"]] = await self._calibrated_agent_score(agent["id"])
 
-        ranked = sorted(enabled, key=lambda a: scored.get(a["id"], 0.5), reverse=True)
+        ranked = sorted(veterans, key=lambda a: scored.get(a["id"], 0.5), reverse=True)
         to_keep_ids = {a["id"] for a in ranked[:self._agent_cap_max]}
         to_disable = [a for a in ranked[self._agent_cap_max:] if scored.get(a["id"], 0.5) < 0.55]
 
@@ -3899,17 +4877,24 @@ class AgentScheduler:
     async def _run_enabled_agents(self):
         # Clear the per-cycle trade buffer so Alex starts fresh each pass
         self._cycle_trades = []
+        # Clear the per-cycle signal arbiter so opposing trades can be detected
+        # only within the same scheduler pass (not across passes).
+        self._cycle_pending_signals = {}
+
+        # Refresh per-symbol GMM regime cache once per pass so the per-agent
+        # _build_market_context (sync) can inject up-to-date regime labels
+        # without needing async DB access on the hot path.
+        await self._refresh_gmm_regime_cache()
 
         for agent_id, config in self._enabled_agents.items():
             try:
                 interval = config.get('run_interval_seconds', 3600)
 
-                # Trend-following strategies (momentum, breakout, ema_crossover) need to
-                # catch moves early — use a 5-minute floor so they never miss a candle close.
-                # Mean reversion and grid are range-bound and don't need fast polling.
-                _s_poll = config.get('strategy_type', 'momentum')
-                if _s_poll in ('momentum', 'breakout', 'ema_crossover'):
-                    interval = min(interval, 300)   # max 5-minute poll for trend strategies
+                # All strategies get a 5-minute floor so every trader gets equal
+                # opportunity to fire. Previously trend-only gave momentum/breakout a
+                # 12× scheduling advantage over mean_reversion/grid, starving
+                # conservative traders like Otto Brenner of execution opportunities.
+                interval = min(interval, 300)   # max 5-minute poll for all strategies
 
                 # ── Session-aware interval scaling ────────────────────────────
                 # London/NY overlap (13:00–17:00 UTC) is the highest-liquidity window.
@@ -4789,6 +5774,15 @@ class AgentScheduler:
         reasoning = best_reasoning
         df = best_df
         current_price = df['close'].iloc[-1]
+        # Freshen price from WebSocket feed (the kline close is stale by minutes)
+        _ws_price = self._ws_price(symbol)
+        if _ws_price and _ws_price > 0:
+            _ws_dev = abs(_ws_price - current_price) / current_price
+            if _ws_dev < 0.05:  # sanity gate: reject if WS price is wildly different
+                current_price = _ws_price
+                logger.debug(f"WS price override: {symbol} {df['close'].iloc[-1]:.4f} → {_ws_price:.4f}")
+            else:
+                logger.debug(f"WS price skipped: {symbol} ws={_ws_price:.4f} vs kline={current_price:.4f} ({_ws_dev:.2%} diff)")
         team_context = await self._build_team_context(agent_id, symbol, timeframe)
 
         try:
@@ -4931,7 +5925,7 @@ class AgentScheduler:
                     )
 
             if signal in ('buy', 'sell'):
-                _fee_pressure = await self._get_daily_fee_pressure()
+                _fee_pressure = await self._get_daily_fee_pressure(agent_id=agent_id)
                 _budget_used = float(_fee_pressure.get("budget_used_ratio", 0.0) or 0.0)
 
                 # ── Check whether this agent already has open positions ────────
@@ -4982,7 +5976,7 @@ class AgentScheduler:
                 _fee_guard_active = bool(_fee_pressure.get("fee_coverage_guard_active", False))
                 if _fee_guard_active and not _agent_has_open_pos:
                     _ratio = float(_fee_pressure.get("fee_coverage_ratio", 0.0) or 0.0)
-                    _target = float(_fee_pressure.get("fee_coverage_min_ratio", 2.5) or 2.5)
+                    _target = float(_fee_pressure.get("fee_coverage_min_ratio", 1.5) or 1.5)
                     _deficit = min(1.0, max(0.0, (_target - _ratio) / max(_target, 0.01)))
 
                     _effective_min_entry_conf = min(0.92, _effective_min_entry_conf + (0.12 * _deficit))
@@ -5419,6 +6413,112 @@ class AgentScheduler:
                         executed=False, error="EV coverage too low",
                     )
 
+                # ── Per-agent edge-significance gate ─────────────────────────
+                # Once an agent has a meaningful sample of closed trades, require
+                # that sample to show real edge before letting the agent keep
+                # spending capital on new entries. Three conditions to BLOCK:
+                #   (a) >= MIN_SAMPLE closed trades   — sample is large enough
+                #   (b) realized total PnL <= 0       — net-negative after fees
+                #   (c) win rate < 0.45               — coin-flip or worse
+                #
+                # If all three are true the agent is statistically a loser and
+                # should stop trading. Lower-confidence signals (< 0.85) are
+                # blocked entirely; only top-conviction signals can attempt to
+                # rebuild the track record. This is the "kill what doesn't work"
+                # gate from the profitability checklist.
+                #
+                # REGIME EXEMPTION: if the current regime is in this strategy's
+                # preferred conditions (favourable), apply the gate normally.
+                # If the regime is mixed/unknown, apply normally.
+                # If the regime is in avoid_conditions, the upstream regime gate
+                # has already skipped the trade, so we won't reach this point.
+                # The gate therefore implicitly only fires on losses accumulated
+                # during favourable or neutral regimes — losses in unfavourable
+                # regimes don't count, because those entries are already blocked.
+                _agent_metrics = self._agent_metrics.get(agent_id)
+                if _agent_metrics is not None:
+                    _ag_trades = int(getattr(_agent_metrics, "actual_trades", 0) or 0)
+                    _ag_wins = int(getattr(_agent_metrics, "winning_trades", 0) or 0)
+                    _ag_pnl = float(getattr(_agent_metrics, "total_pnl", 0.0) or 0.0)
+                    _ag_wr = (_ag_wins / _ag_trades) if _ag_trades > 0 else None
+                    _MIN_SAMPLE = 30  # ~95% CI on 50% baseline excludes ~32%/68%
+                    _STRICT_OVERRIDE_CONF = 0.85
+
+                    # Regime fit check: if the strategy is in its PREFERRED regime
+                    # right now, a losing track record is real. If we're in a
+                    # neutral/transitional regime, give the agent more rope by
+                    # raising the trade threshold (1.5×) — losses during regime
+                    # transitions are common even for good strategies.
+                    _is_preferred_regime = False
+                    try:
+                        import app.strategies as _sr
+                        _strat_def = _sr.get(strategy_type)
+                        _preferred = _strat_def.get("market_conditions", []) if _strat_def else []
+                        _is_preferred_regime = (
+                            _current_regime in _preferred if _current_regime else False
+                        )
+                    except Exception:
+                        pass
+                    _effective_min_sample = (
+                        _MIN_SAMPLE if _is_preferred_regime else int(_MIN_SAMPLE * 1.5)
+                    )
+
+                    if (
+                        _ag_trades >= _effective_min_sample
+                        and _ag_pnl <= 0
+                        and _ag_wr is not None
+                        and _ag_wr < 0.45
+                        and confidence < _STRICT_OVERRIDE_CONF
+                    ):
+                        _es_reason = (
+                            f"Edge-significance gate: {_ag_trades} trades, "
+                            f"WR {_ag_wr:.0%}, net PnL ${_ag_pnl:+.2f}"
+                            f"{' (preferred regime)' if _is_preferred_regime else ' (neutral regime, raised threshold)'}. "
+                            f"Pausing entries below {_STRICT_OVERRIDE_CONF:.0%} confidence "
+                            f"until edge improves."
+                        )
+                        logger.info(f"Edge gate blocked {name} {signal.upper()} {symbol}: {_es_reason}")
+                        self._record_run(agent_id, symbol, signal, confidence, current_price, False,
+                                        error="Edge-significance gate")
+                        await team_chat.log_trade_blocked(
+                            trader_name=_trader_name, trader_avatar=_trader_avatar,
+                            agent_name=name, symbol=symbol, side=signal, reason=_es_reason,
+                        )
+                        return AgentRun(
+                            agent_id=agent_id, timestamp=datetime.now(), symbol=symbol,
+                            signal="hold", confidence=confidence, price=current_price,
+                            executed=False, error="Edge-significance gate",
+                        )
+
+                # ── Venue/strategy compatibility gate ────────────────────────
+                # Some strategies are structurally unprofitable on high-fee venues:
+                # scalping on Phemex contracts (0.06%/leg = 0.12% round-trip) needs
+                # a 0.5%+ winner just to break even, which is most of a 1% TP target.
+                # Block these combinations entirely — the math doesn't work.
+                _agent_strat = self._enabled_agents.get(agent_id, {}).get("strategy_type", "")
+                _agent_venue_check = self._enabled_agents.get(agent_id, {}).get("venue", "hyperliquid")
+                _BAD_VENUE_STRATEGY = {
+                    ("scalping", "phemex"),  # 0.12% round-trip kills the 1% SL / 3.5% TP economics
+                }
+                if (_agent_strat, _agent_venue_check) in _BAD_VENUE_STRATEGY:
+                    _vs_reason = (
+                        f"Venue/strategy mismatch: {_agent_strat} on {_agent_venue_check} "
+                        f"is structurally unprofitable (round-trip fees too high). "
+                        f"Move agent to hyperliquid (0.07% RT) or change strategy."
+                    )
+                    logger.info(f"Venue gate blocked {name} {signal.upper()} {symbol}: {_vs_reason}")
+                    self._record_run(agent_id, symbol, signal, confidence, current_price, False,
+                                    error="Venue/strategy mismatch")
+                    await team_chat.log_trade_blocked(
+                        trader_name=_trader_name, trader_avatar=_trader_avatar,
+                        agent_name=name, symbol=symbol, side=signal, reason=_vs_reason,
+                    )
+                    return AgentRun(
+                        agent_id=agent_id, timestamp=datetime.now(), symbol=symbol,
+                        signal="hold", confidence=0, price=current_price,
+                        executed=False, error="Venue/strategy mismatch",
+                    )
+
                 # Each agent is fully isolated via the (user_id, agent_id, symbol) unique constraint.
                 # Different agents — even on the same symbol — operate independently and should not
                 # block each other. No cross-agent conflict gate needed here.
@@ -5426,8 +6526,15 @@ class AgentScheduler:
                 # POST-CLOSE COOLDOWN: prevent whipsaw re-entries on the same symbol
                 # within 15 minutes of a position close. Avoids the pattern where an
                 # agent closes a loss, then immediately re-enters on the same noisy signal.
+                # Stop-loss exits get a 2× multiplier — they cluster around vol spikes
+                # and the worst possible re-entry moment is right after a stop hits.
                 _cooldown_key = f"{agent_id}:{symbol}"
-                _last_close = self._recent_closes.get(_cooldown_key)
+                _last_close_entry = self._recent_closes.get(_cooldown_key)
+                # Backward compat: legacy entries may be a bare datetime, not a tuple
+                if isinstance(_last_close_entry, tuple):
+                    _last_close, _last_exit_type = _last_close_entry
+                else:
+                    _last_close, _last_exit_type = _last_close_entry, None
                 if _last_close:
                     _seconds_since_close = (datetime.now() - _last_close).total_seconds()
                     # Dynamic cooldown: scales with fee budget consumption so re-entries
@@ -5436,11 +6543,17 @@ class AgentScheduler:
                     _effective_cooldown = int(
                         self._POST_CLOSE_COOLDOWN_SECONDS * max(1.0, 1.0 + self._cached_budget_ratio * 2.0)
                     )
-                    _effective_cooldown = min(3600, _effective_cooldown)
+                    # SL multiplier — only applied when the prior exit was a stop-loss
+                    if _last_exit_type == "stop-loss":
+                        _effective_cooldown = int(_effective_cooldown * self._SL_COOLDOWN_MULTIPLIER)
+                        _effective_cooldown = min(7200, _effective_cooldown)  # cap 2h after SL
+                    else:
+                        _effective_cooldown = min(3600, _effective_cooldown)
                     if _seconds_since_close < _effective_cooldown:
                         _mins_left = (_effective_cooldown - _seconds_since_close) / 60
+                        _reason_suffix = " (post-SL)" if _last_exit_type == "stop-loss" else ""
                         logger.info(
-                            f"Post-close cooldown: {name}/{symbol} — "
+                            f"Post-close cooldown{_reason_suffix}: {name}/{symbol} — "
                             f"{_mins_left:.0f}m remaining before re-entry allowed"
                         )
                         self._record_run(agent_id, symbol, signal, confidence, current_price, False,
@@ -5451,17 +6564,76 @@ class AgentScheduler:
                             executed=False, error=f"Post-close cooldown ({_mins_left:.0f}m left)",
                         )
 
+                # ── Per-cycle signal arbiter ─────────────────────────────────
+                # Block the second agent in the same cycle from entering the
+                # OPPOSITE side on the same symbol. Strategies (momentum vs
+                # mean-reversion vs grid) routinely fire contradictory signals
+                # on the same bar; without this gate they cancel each other's
+                # edge and pay 2× round-trip fees for net-zero exposure.
+                #
+                # Override: if the new signal's confidence beats the existing
+                # one by ARBITER_CONF_OVERRIDE_DELTA (default 15%), the new
+                # signal wins the slot (the existing trade is already executed
+                # and cannot be revoked, but the arbiter at least keeps the
+                # opposite-direction trade out for the rest of the cycle).
+                _existing = self._cycle_pending_signals.get(symbol)
+                if _existing:
+                    _ex_side, _ex_conf, _ex_agent = _existing
+                    if _ex_side != signal:
+                        # Opposite side already pending/executed this cycle
+                        if confidence < _ex_conf + self._ARBITER_CONF_OVERRIDE_DELTA:
+                            logger.info(
+                                f"Arbiter: blocking {name} {signal.upper()} {symbol} "
+                                f"(conf {confidence:.2f}) — {_ex_agent} already "
+                                f"holds {_ex_side.upper()} this cycle (conf {_ex_conf:.2f})"
+                            )
+                            self._record_run(
+                                agent_id, symbol, signal, confidence, current_price, False,
+                                error=f"Arbiter blocked: opposite signal from {_ex_agent}",
+                            )
+                            return AgentRun(
+                                agent_id=agent_id, timestamp=datetime.now(), symbol=symbol,
+                                signal="hold", confidence=confidence, price=current_price,
+                                executed=False,
+                                error=f"Arbiter blocked: opposite signal from {_ex_agent}",
+                            )
+                        else:
+                            logger.info(
+                                f"Arbiter: {name} {signal.upper()} {symbol} overrides "
+                                f"prior {_ex_side.upper()} from {_ex_agent} "
+                                f"(conf {confidence:.2f} vs {_ex_conf:.2f})"
+                            )
+                # Record this signal so subsequent agents in the same cycle
+                # can see what's already claimed the slot.
+                self._cycle_pending_signals[symbol] = (signal, confidence, name)
+                # ── End arbiter ──────────────────────────────────────────────
+
+                # Venue-specific available balance
+                _agent_venue_bal = self._enabled_agents.get(agent_id, {}).get("venue", "phemex")
                 if _is_paper_mode():
                     balances = await paper_trading.get_all_balances()
-                    usdt_balance = next((b.available for b in balances if b.asset == "USDT"), 50_000.0)
+                    available_balance = next((b.available for b in balances if b.asset == "USDT"), 50_000.0)
+                    _bal_currency = "USDT"
+                elif _agent_venue_bal == "hyperliquid":
+                    try:
+                        from app.services.hl_live_trading import hl_live_trading as _hl_bal_svc
+                        _hl_resp = await _hl_bal_svc.get_balance()
+                        available_balance = _hl_resp.get("available", 0.0) or 0.0
+                        _bal_currency = "USDC"
+                    except Exception:
+                        balances = await paper_trading.get_all_balances()
+                        available_balance = next((b.available for b in balances if b.asset == "USDT"), 50_000.0)
+                        _bal_currency = "USDT"
                 else:
                     try:
                         from app.services.live_trading import live_trading as _lt_bal
                         _live_bal = await _lt_bal.get_balance()
-                        usdt_balance = _live_bal.get("available", 0.0) or 50_000.0
+                        available_balance = _live_bal.get("available", 0.0) or 50_000.0
+                        _bal_currency = "USDT"
                     except Exception:
                         balances = await paper_trading.get_all_balances()
-                        usdt_balance = next((b.available for b in balances if b.asset == "USDT"), 50_000.0)
+                        available_balance = next((b.available for b in balances if b.asset == "USDT"), 50_000.0)
+                        _bal_currency = "USDT"
 
                 # Strategy-specific position size multipliers.
                 # Scalping/mean-reversion work on small price moves — a full allocation
@@ -5508,10 +6680,9 @@ class AgentScheduler:
                     _progress = max(0.0, min(1.0, (confidence - _effective_min_entry_conf) / (_size_ref - _effective_min_entry_conf)))
                     _conf_mult = _effective_conf_floor + ((1.0 - _effective_conf_floor) * (_progress ** 1.35))
 
-                # Size position based on total fund capital (not just available USDT).
-                # allocation_pct is a % of the total fund; using only available USDT
-                # would produce shrinking positions as capital gets deployed.
-                total_fund = self._total_capital or usdt_balance
+                # Size position based on total fund capital (all venues).
+                # allocation_pct is a % of the total fund capital.
+                total_fund = self._total_capital or available_balance
 
                 _atr_mult = 1.0
                 if df is not None and len(df) >= self._atr_period + 1:
@@ -5526,8 +6697,8 @@ class AgentScheduler:
 
                 target_position_value = total_fund * allocation_pct / 100 * _size_mult * _conf_mult * _perf_mult * _atr_mult
 
-                # Cap at 95% of available USDT to avoid overdrafts
-                position_value = min(target_position_value, usdt_balance * 0.95)
+                # Cap at 95% of venue-specific available balance to avoid overdrafts
+                position_value = min(target_position_value, available_balance * 0.95)
                 # Hard cap: single trade's margin must not exceed max exposure % of total fund
                 from app.api.routes.settings import get_risk_limits as _get_rl
                 _max_exposure_pct = getattr(_get_rl(), 'exposure_threshold_pct', 80.0)
@@ -5554,7 +6725,7 @@ class AgentScheduler:
                 logger.debug(
                     f"Sizing {name} ({strategy_type}, {_size_mult:.0%} strat, {_conf_mult:.0%} conf, {_perf_mult:.2f}× perf, {_atr_mult:.2f}× atr, {leverage:.1f}x lev): "
                     f"total_fund=${total_fund:.0f}, alloc={allocation_pct:.2f}%, "
-                    f"target=${target_position_value:.0f}, available=${usdt_balance:.0f}, margin=${margin_used:.0f}, "
+                    f"target=${target_position_value:.0f}, available=${available_balance:.0f} {_bal_currency}, margin=${margin_used:.0f}, "
                     f"notional=${leveraged_notional:.0f}, qty={quantity:.4f} @ ${current_price}"
                 )
 
@@ -5590,15 +6761,15 @@ class AgentScheduler:
                 if not _closing_existing and position_value < _MIN_NOTIONAL:
                     _skip_reason = (
                         f"Position value ${position_value:.2f} is below minimum notional "
-                        f"${_MIN_NOTIONAL:.0f} — available USDT balance too low "
-                        f"(${usdt_balance:.2f} available, ${target_position_value:.0f} targeted)"
+                        f"${_MIN_NOTIONAL:.0f} — available {_bal_currency} balance too low "
+                        f"(${available_balance:.2f} available, ${target_position_value:.0f} targeted)"
                     )
                     logger.info(f"Micro-trade skipped: {name}/{symbol} — {_skip_reason}")
                     self._record_run(agent_id, symbol, signal, confidence, current_price, False, error="Below minimum notional")
                     await team_chat.log_trade_blocked(
                         trader_name=_trader_name, trader_avatar=_trader_avatar,
                         agent_name=name, symbol=symbol, side=signal,
-                        reason=f"Available USDT (${usdt_balance:.2f}) is below the minimum notional (${_MIN_NOTIONAL:.0f}) — fund is nearly fully deployed. Waiting for capital to free up.",
+                        reason=f"Available {_bal_currency} (${available_balance:.2f}) is below the minimum notional (${_MIN_NOTIONAL:.0f}) — fund is nearly fully deployed. Waiting for capital to free up.",
                     )
                     return AgentRun(
                         agent_id=agent_id, timestamp=datetime.now(), symbol=symbol,
@@ -5616,7 +6787,7 @@ class AgentScheduler:
                     await team_chat.log_trade_blocked(
                         trader_name=_trader_name, trader_avatar=_trader_avatar,
                         agent_name=name, symbol=symbol, side=signal,
-                        reason=f"Fund nearly fully deployed — only ${usdt_balance:.2f} USDT available vs ${target_position_value:.0f} targeted. Sitting on hands until positions close.",
+                        reason=f"Fund nearly fully deployed — only ${available_balance:.2f} {_bal_currency} available vs ${target_position_value:.0f} targeted. Sitting on hands until positions close.",
                     )
                     return AgentRun(
                         agent_id=agent_id, timestamp=datetime.now(), symbol=symbol,
@@ -5637,7 +6808,7 @@ class AgentScheduler:
                     max_daily_loss=_gates.max_daily_loss_pct,
                     total_capital=total_fund,
                     max_position_size=leveraged_notional if not _closing_existing else quantity * current_price,
-                    max_open_positions=_gates.max_open_positions,
+                    max_open_positions=_limits.max_open_positions,
                     max_exposure=total_fund * _limits.exposure_threshold_pct / 100,
                     leverage=leverage,
                     max_leveraged_notional_pct=getattr(_limits, 'max_leveraged_notional_pct', 200.0),
@@ -5685,6 +6856,33 @@ class AgentScheduler:
                         error=risk_check.reason
                     )
 
+                # ── Risk:Reward sanity gate ──────────────────────────────────────
+                # Reject trades where the profit target is closer than the stop loss.
+                # Inverted R/R creates negative expectancy regardless of win rate.
+                # At 1× leverage this is merely inefficient; above 1.5× it becomes dangerous.
+                _tp_dist = take_profit_pct
+                _sl_dist = stop_loss_pct
+                if _tp_dist < _sl_dist:
+                    _rr_reason = (
+                        f"Inverted R/R: TP={_tp_dist:.2f}% < SL={_sl_dist:.2f}% — "
+                        f"negative expectancy even with 67%+ win rate"
+                    )
+                    if leverage > 1.5:
+                        logger.warning(f"Trade blocked by R/R gate: {_rr_reason}")
+                        self._record_run(agent_id, symbol, signal, confidence, current_price, False, error=_rr_reason)
+                        await team_chat.log_trade_blocked(
+                            trader_name=_trader_name, trader_avatar=_trader_avatar,
+                            agent_name=name, symbol=symbol, side=signal,
+                            reason=_rr_reason,
+                        )
+                        return AgentRun(
+                            agent_id=agent_id, timestamp=datetime.now(), symbol=symbol,
+                            signal="hold", confidence=0, price=current_price,
+                            executed=False, error=_rr_reason,
+                        )
+                    else:
+                        logger.warning(f"Poor R/R allowed (lev={leverage:.1f}x): {_rr_reason}")
+
                 # ── Technical analysis already fetched above (line ~3440) for TP scaling ───
                 # Confluence data is used for dynamic concentration limits (below)
                 # and for confluence-aware TP scaling (above).
@@ -5725,38 +6923,15 @@ class AgentScheduler:
                     _target_side = OrderSide.BUY if _is_long_signal else OrderSide.SELL
                     _direction_label = "LONG" if _is_long_signal else "SHORT"
 
-                    _same_sym_positions = [
-                        p for p in _all_open
-                        if p.symbol == symbol and p.side == _target_side
-                    ]
-                    _max_same = getattr(_limits, 'max_same_asset_positions', 2)
-                    if len(_same_sym_positions) >= _max_same:
-                        _corr_reason = (
-                            f"Correlation limit: already {len(_same_sym_positions)} open {_direction_label} "
-                            f"positions on {symbol} (max {_max_same})"
-                        )
-                        logger.info(f"Concentration gate: {_corr_reason}")
-                        self._record_run(agent_id, symbol, signal, confidence, current_price, False, error=_corr_reason)
-                        await team_chat.log_trade_blocked(
-                            trader_name=_trader_name, trader_avatar=_trader_avatar,
-                            agent_name=name, symbol=symbol, side=signal,
-                            reason=_corr_reason,
-                        )
-                        return AgentRun(
-                            agent_id=agent_id, timestamp=datetime.now(), symbol=symbol,
-                            signal="hold", confidence=0, price=current_price,
-                            executed=False, error=_corr_reason,
-                        )
-                    # Total directional concentration check (now with dynamic limit)
-                    # Use margin (capital committed) not full notional, so leveraged
-                    # positions don't falsely inflate the directional exposure figure.
-                    # position_value is already in margin terms (fund % × multipliers).
-                    #
-                    # Fallback chain for margin:
-                    #   1. p.margin_used (set by paper_trading or position_sync ← Phemex)
-                    #   2. notional / p.leverage (if leverage stored but margin not)
-                    #   3. Look up leverage from most recent Trade for this agent/symbol
-                    #   4. notional / 1.0 (conservative fallback)
+                    def _is_position_risk_free(p) -> bool:
+                        _sl = getattr(p, 'stop_loss_price', None)
+                        _entry = float(getattr(p, 'entry_price', 0) or 0)
+                        if _sl is None or _entry <= 0:
+                            return False
+                        _side = str(getattr(getattr(p, 'side', None), 'value', getattr(p, 'side', ''))).lower()
+                        if _side in ('sell', 'short'):
+                            return _sl <= _entry
+                        return _sl >= _entry
                     async def _p_margin_async(p) -> float:
                         notional = p.quantity * (p.current_price or p.entry_price or 0)
                         margin = float(getattr(p, 'margin_used', 0) or 0)
@@ -5765,7 +6940,6 @@ class AgentScheduler:
                         lev = float(getattr(p, 'leverage', 1.0) or 1.0)
                         if lev > 1.0:
                             return notional / lev
-                        # Leverage missing from position record — look up from Trade history
                         try:
                             from app.database import get_async_session
                             from app.models import Trade as _Trade, OrderSide as _OS
@@ -5785,11 +6959,34 @@ class AgentScheduler:
                                     return notional / float(_t.leverage)
                         except Exception:
                             pass
-                        return notional  # conservative: treat as 1× if unknown
+                        return notional
 
+                    _same_sym_positions = [
+                        p for p in _all_open
+                        if p.symbol == symbol and p.side == _target_side
+                        and not _is_position_risk_free(p)
+                    ]
+                    _max_same = getattr(_limits, 'max_same_asset_positions', 2)
+                    if len(_same_sym_positions) >= _max_same:
+                        _corr_reason = (
+                            f"Correlation limit: already {len(_same_sym_positions)} open {_direction_label} "
+                            f"positions on {symbol} (max {_max_same})"
+                        )
+                        logger.info(f"Concentration gate: {_corr_reason}")
+                        self._record_run(agent_id, symbol, signal, confidence, current_price, False, error=_corr_reason)
+                        await team_chat.log_trade_blocked(
+                            trader_name=_trader_name, trader_avatar=_trader_avatar,
+                            agent_name=name, symbol=symbol, side=signal,
+                            reason=_corr_reason,
+                        )
+                        return AgentRun(
+                            agent_id=agent_id, timestamp=datetime.now(), symbol=symbol,
+                            signal="hold", confidence=0, price=current_price,
+                            executed=False, error=_corr_reason,
+                        )
                     _dir_value = 0.0
                     for _p in _all_open:
-                        if _p.side == _target_side:
+                        if _p.side == _target_side and not _is_position_risk_free(_p):
                             _dir_value += await _p_margin_async(_p)
                     _existing_dir_pct = _dir_value / total_fund * 100 if total_fund > 0 else 0
                     _new_dir_pct = (_dir_value + position_value) / total_fund * 100 if total_fund > 0 else 0
@@ -5816,7 +7013,7 @@ class AgentScheduler:
                         _old_val = position_value
                         position_value = total_fund * _remaining_pct / 100
                         quantity = position_value / current_price if current_price > 0 else 0
-                        margin_used = position_value
+                        margin_used = position_value / leverage
                         leveraged_notional = position_value
                         logger.info(
                             f"Concentration resize: {_direction_label} {symbol} "
@@ -5840,9 +7037,103 @@ class AgentScheduler:
                             "current_price": _p.current_price,
                             "leverage": getattr(_p, "leverage", 1.0) or 1.0,
                             "margin_used": float(getattr(_p, "margin_used", 0) or 0),
+                            "created_at": getattr(_p, "created_at", None),
+                            "stop_loss_price": float(getattr(_p, "stop_loss_price", 0) or 0) or None,
                         }
                         for _p in _all_open
                     ]
+
+                    # ── Opposing-direction gate for correlated pairs ──────────────
+                    # If we already hold a position in one direction on a highly
+                    # correlated asset, block opposite-direction entries to prevent
+                    # unintentional hedge pairs that burn fees on both legs.
+                    # Exception: if the opposing position is old enough that the
+                    # market thesis likely changed, allow the reversal.
+                    # Two modes (flip_gate_mode):
+                    #   "simple" — flat hour threshold (flip_simple_age_hours)
+                    #   "smart"  — composite score from regime/TA/MTF/age
+                    _opposing_signal = signal.lower() == "buy"  # intended direction
+                    _flip_mode = getattr(_gates, "flip_gate_mode", "smart")
+                    from datetime import timezone as _tz_util
+                    try:
+                        from app.services.correlation_service import correlation_service
+                        _cm = correlation_service.matrix
+                        if _cm is not None:
+                            for _cp in _current_for_corr:
+                                _cp_side = _cp.get("side", "").lower()
+                                _cp_dir = _cp_side == "buy"
+                                _direction_label = "LONG" if _opposing_signal else "SHORT"
+                                _existing_label = "LONG" if _cp_dir else "SHORT"
+                                if _cp_dir == _opposing_signal:
+                                    continue  # same direction — fine
+                                _rho = _cm.correlation(symbol, _cp.get("symbol", ""))
+                                if _rho is not None and _rho >= 0.65:
+                                    _cp_created = _cp.get("created_at")
+                                    _cp_age_hours = None
+                                    if _cp_created is not None:
+                                        _cp_age = datetime.now(_tz_util.utc) - _cp_created
+                                        _cp_age_hours = _cp_age.total_seconds() / 3600
+                                    _allow_flip = False
+                                    _flip_reason = ""
+                                    if _flip_mode == "simple":
+                                        _age_limit = getattr(_gates, "flip_simple_age_hours", 4.0) or 4.0
+                                        if _cp_age_hours is not None and _cp_age_hours >= _age_limit:
+                                            _allow_flip = True
+                                            _flip_reason = f"age={_cp_age_hours:.1f}h ≥ {_age_limit:.0f}h threshold"
+                                    else:
+                                        # Hard age override: if the position is older than the
+                                        # simple mode threshold, allow the flip regardless of
+                                        # the smart score. This prevents a day-old position
+                                        # from being blocked just because regime/TA checks
+                                        # didn't find a signal change.
+                                        _age_limit = getattr(_gates, "flip_simple_age_hours", 4.0) or 4.0
+                                        if _cp_age_hours is not None and _cp_age_hours >= _age_limit:
+                                            _allow_flip = True
+                                            _flip_reason = f"age={_cp_age_hours:.1f}h ≥ {_age_limit:.0f}h threshold"
+                                        else:
+                                            _threshold = getattr(_gates, "flip_score_threshold", 50.0) or 50.0
+                                            _flip_score, _flip_reasons = await self._compute_flip_score(
+                                                symbol=symbol,
+                                                existing_side="buy" if _cp_dir else "sell",
+                                                intended_side=signal,
+                                                position_entry_time=_cp_created,
+                                                position_age_hours=_cp_age_hours or 0,
+                                                technical_report=technical_report,
+                                                gates=_gates,
+                                            )
+                                            if _flip_score >= _threshold:
+                                                _allow_flip = True
+                                                _flip_reason = f"flip_score={_flip_score:.0f} ≥ {_threshold:.0f} ({'; '.join(_flip_reasons)})"
+                                    if _allow_flip:
+                                        logger.info(
+                                            f"Opposing correlation gate: ALLOWING {symbol} reversal — "
+                                            f"existing {_existing_label} position is "
+                                            f"{f'{_cp_age_hours:.1f}h old, ' if _cp_age_hours else ''}"
+                                            f"{_flip_reason}"
+                                        )
+                                        continue
+                                    _age_info = f" ({_cp_age_hours:.1f}h old)" if _cp_age_hours else ""
+                                    _corr_reason = (
+                                        f"Opposing correlation gate: {_direction_label} {symbol} "
+                                        f"conflicts with {_existing_label} {_cp['symbol']}{_age_info} "
+                                        f"(ρ={_rho:.2f}) — opposing positions on correlated pairs "
+                                        f"waste fees on both legs"
+                                    )
+                                    logger.info(f"Correlation gate: {_corr_reason}")
+                                    self._record_run(agent_id, symbol, signal, confidence, current_price, False, error=_corr_reason)
+                                    await team_chat.log_trade_blocked(
+                                        trader_name=_trader_name, trader_avatar=_trader_avatar,
+                                        agent_name=name, symbol=symbol, side=signal,
+                                        reason=_corr_reason,
+                                    )
+                                    return AgentRun(
+                                        agent_id=agent_id, timestamp=datetime.now(), symbol=symbol,
+                                        signal="hold", confidence=0, price=current_price,
+                                        executed=False, error=_corr_reason,
+                                    )
+                    except Exception as _corr_err:
+                        logger.debug(f"Opposing correlation gate skipped: {_corr_err}")
+
                     _corr_check = risk_manager.check_correlation_concentration(
                         intended_trade=_intended_trade,
                         current_positions=_current_for_corr,
@@ -5865,7 +7156,7 @@ class AgentScheduler:
                             _old_margin = position_value
                             position_value = min(position_value, _corr_room)
                             quantity = position_value / current_price if current_price > 0 else 0
-                            margin_used = position_value
+                            margin_used = position_value / leverage
                             leveraged_notional = position_value
                             logger.info(
                                 f"Correlation resize: {_direction_label} {symbol} "
@@ -5979,6 +7270,7 @@ class AgentScheduler:
                 # Default SL/TP from risk manager (percentage-based)
                 adjusted_sl = risk_check.stop_loss_price
                 adjusted_tp = risk_check.take_profit_price
+                _risk_tp = risk_check.take_profit_price  # preserve original for snap-revert
                 _is_short_signal = signal.lower() == 'sell'
 
                 if technical_report.patterns:
@@ -6016,6 +7308,15 @@ class AgentScheduler:
                                 adjusted_tp = min(risk_check.take_profit_price, best_pattern.take_profit_1)
                         elif best_pattern.take_profit_1:
                             adjusted_tp = best_pattern.take_profit_1
+                        # Clamp TP to at least 0.1% above entry — a sub-entry TP is a guaranteed loss.
+                        if not _is_short_signal and adjusted_tp <= current_price:
+                            adjusted_tp = current_price * 1.001
+                        # Clamp short TP to at most 0.1% below current — a super-price TP is nonsense for a short.
+                        if _is_short_signal and adjusted_tp >= current_price:
+                            adjusted_tp = current_price * 0.999
+                        # Clamp short SL to at least 0.1% above current — a sub-price SL is a guaranteed loss for a short.
+                        if _is_short_signal and adjusted_sl <= current_price:
+                            adjusted_sl = current_price * 1.001
                         tp2 = best_pattern.take_profit_2
                         logger.info(f"TA levels applied (conservative): SL ${best_pattern.stop_loss:.2f}, TP1 ${best_pattern.take_profit_1:.2f} → using ${adjusted_tp:.2f}" + (f", TP2 ${tp2:.2f}" if tp2 else ""))
 
@@ -6061,6 +7362,29 @@ class AgentScheduler:
                             f"SL ${_old_sl:.4f}→${adjusted_sl:.4f} (round-number adjustment)"
                         )
 
+                # ── Sanity gate: cap absurd TP distances ──────────────────────
+                # Pattern detectors can return historical support/resistance levels
+                # that are 50%+ away from current price. Reject anything beyond
+                # a reasonable maximum distance (25%) to prevent uneconomic targets.
+                _MAX_TP_DISTANCE_PCT = 0.25
+                if adjusted_tp and current_price:
+                    if _is_short_signal:
+                        _tp_distance = (current_price - adjusted_tp) / current_price
+                        if _tp_distance > _MAX_TP_DISTANCE_PCT:
+                            logger.warning(
+                                f"Absurd short TP distance {_tp_distance:.1%} capped at {_MAX_TP_DISTANCE_PCT:.0%} "
+                                f"for {symbol}: ${adjusted_tp:.2f} → ${current_price * (1 - _MAX_TP_DISTANCE_PCT):.2f}"
+                            )
+                            adjusted_tp = current_price * (1 - _MAX_TP_DISTANCE_PCT)
+                    else:
+                        _tp_distance = (adjusted_tp - current_price) / current_price
+                        if _tp_distance > _MAX_TP_DISTANCE_PCT:
+                            logger.warning(
+                                f"Absurd long TP distance {_tp_distance:.1%} capped at {_MAX_TP_DISTANCE_PCT:.0%} "
+                                f"for {symbol}: ${adjusted_tp:.2f} → ${current_price * (1 + _MAX_TP_DISTANCE_PCT):.2f}"
+                            )
+                            adjusted_tp = current_price * (1 + _MAX_TP_DISTANCE_PCT)
+
                 # ── Post-snap minimum profit gate ────────────────────────────
                 # The pre-trade fee gate checked the percentage-based TP, but
                 # TA pattern overrides + structural/psychological snaps can
@@ -6074,24 +7398,43 @@ class AgentScheduler:
                     _final_fee_pct = round_trip_fee_pct
                     _final_net_pct = _final_tp_pct - _final_fee_pct
                     if _final_net_pct < _min_net_tp_pct:
-                        fnl_tp_s = f"${adjusted_tp:.6f}"
-                        logger.warning(
-                            f"Trade skipped: post-snap TP {fnl_tp_s} = {_final_tp_pct:.4f}% "
-                            f"minus fees {_final_fee_pct:.2f}% = {_final_net_pct:.4f}% net — "
-                            f"below {_min_net_tp_pct:.2f}% minimum"
-                        )
-                        self._record_run(agent_id, symbol, signal, confidence, current_price, False,
-                                         error="Post-snap TP too low after fees")
-                        await team_chat.log_trade_blocked(
-                            trader_name=_trader_name, trader_avatar=_trader_avatar,
-                            agent_name=name, symbol=symbol, side=signal,
-                            reason=f"Post-snap TP {_final_tp_pct:.4f}% minus fees = {_final_net_pct:.4f}% net — below {_min_net_tp_pct:.2f}% minimum",
-                        )
-                        return AgentRun(
-                            agent_id=agent_id, timestamp=datetime.now(), symbol=symbol,
-                            signal="hold", confidence=0, price=current_price,
-                            executed=False, error="Post-snap TP too low after fees"
-                        )
+                        # Snaps degraded the TP — check if the original risk-manager
+                        # TP is still viable and revert if so.
+                        _should_reject = True
+                        if adjusted_tp != _risk_tp and _risk_tp and current_price:
+                            if _is_short_signal:
+                                _risk_tp_pct = (current_price - _risk_tp) / current_price * 100
+                            else:
+                                _risk_tp_pct = (_risk_tp - current_price) / current_price * 100
+                            _risk_net = _risk_tp_pct - round_trip_fee_pct
+                            if _risk_net >= _min_net_tp_pct:
+                                _should_reject = False
+                                logger.info(
+                                    f"Snap revert: snapped TP ${adjusted_tp:.2f} = {_final_tp_pct:.4f}% net {_final_net_pct:.4f}% "
+                                    f"(below {_min_net_tp_pct:.2f}% min) — reverting to risk-manager TP ${_risk_tp:.2f} ({_risk_net:.4f}% net)"
+                                )
+                                adjusted_tp = _risk_tp
+                                _final_net_pct = _risk_net
+                                _final_tp_pct = _risk_tp_pct
+                        if _should_reject:
+                            fnl_tp_s = f"${adjusted_tp:.6f}"
+                            logger.warning(
+                                f"Trade skipped: post-snap TP {fnl_tp_s} = {_final_tp_pct:.4f}% "
+                                f"minus fees {_final_fee_pct:.2f}% = {_final_net_pct:.4f}% net — "
+                                f"below {_min_net_tp_pct:.2f}% minimum"
+                            )
+                            self._record_run(agent_id, symbol, signal, confidence, current_price, False,
+                                             error="Post-snap TP too low after fees")
+                            await team_chat.log_trade_blocked(
+                                trader_name=_trader_name, trader_avatar=_trader_avatar,
+                                agent_name=name, symbol=symbol, side=signal,
+                                reason=f"Post-snap TP {_final_tp_pct:.4f}% minus fees = {_final_net_pct:.4f}% net — below {_min_net_tp_pct:.2f}% minimum",
+                            )
+                            return AgentRun(
+                                agent_id=agent_id, timestamp=datetime.now(), symbol=symbol,
+                                signal="hold", confidence=0, price=current_price,
+                                executed=False, error="Post-snap TP too low after fees"
+                            )
                 
                 if technical_report.price_levels.support or technical_report.price_levels.resistance:
                     nearest_support = min(technical_report.price_levels.support, key=lambda x: abs(x - current_price)) if technical_report.price_levels.support else None
@@ -6274,23 +7617,25 @@ class AgentScheduler:
                 _pattern_order_type = "Market"
                 _pattern_entry_price: Optional[float] = None
                 _pattern_type_name: Optional[str] = None
+                _pattern_timeframe: str = "1h"
                 try:
-                    from app.services.pattern_entry import select_pattern_entry
-                    from app.api.routes.settings import get_risk_limits as _pattern_gates
-                    _pg = _pattern_gates()
-                    if getattr(_pg, "pattern_entry_orders_enabled", True) and technical_report:
-                        _plan = select_pattern_entry(
-                            side=signal,
-                            current_price=current_price,
-                            patterns=technical_report.patterns or [],
-                            min_confidence=float(getattr(_pg, "pattern_entry_min_confidence", 0.65) or 0.65),
-                            enabled=True,
-                        )
-                        if _plan:
-                            _pattern_order_type = _plan.order_type
-                            _pattern_entry_price = _plan.entry_price
-                            _pattern_type_name = _plan.pattern_type
-                            logger.info(f"Pattern entry routing: {_plan.rationale}")
+                        from app.services.pattern_entry import select_pattern_entry
+                        from app.api.routes.settings import get_risk_limits as _pattern_gates
+                        _pg = _pattern_gates()
+                        if getattr(_pg, "pattern_entry_orders_enabled", True) and technical_report:
+                            _plan = select_pattern_entry(
+                                side=signal,
+                                current_price=current_price,
+                                patterns=technical_report.patterns or [],
+                                min_confidence=float(getattr(_pg, "pattern_entry_min_confidence", 0.65) or 0.65),
+                                enabled=True,
+                            )
+                            if _plan:
+                                _pattern_order_type = _plan.order_type
+                                _pattern_entry_price = _plan.entry_price
+                                _pattern_type_name = _plan.pattern_type
+                                _pattern_timeframe = _plan.timeframe
+                                logger.info(f"Pattern entry routing: {_plan.rationale}")
                 except Exception as _pat_err:
                     logger.debug(f"Pattern entry selection skipped: {_pat_err}")
 
@@ -6334,6 +7679,44 @@ class AgentScheduler:
                                 logger.info(f"Pullback entry routing: {_pb_plan.rationale}")
                     except Exception as _pb_err:
                         logger.debug(f"Pullback detection skipped: {_pb_err}")
+                # ── Fallback: pattern-driven entry from TP/SL override ──────────
+                # If no pattern was selected by the confidence-gated selector or
+                # pullback detector, but the TP/SL override used a pattern's levels
+                # (which bypasses the 0.65 min_confidence gate), route the entry
+                # from that pattern's entry_price. Without this, the order enters
+                # at current_price (Market) which may be at the measured move target.
+                if _pattern_order_type == "Market" and _pattern_entry_price is None:
+                    try:
+                        _tp_patterns = [p for p in (technical_report.patterns or [])
+                                        if getattr(p, "direction", "") == ("bearish" if signal == "sell" else "bullish")
+                                        and getattr(p, "entry_price", 0) > 0]
+                        if _tp_patterns:
+                            _best_tp = max(_tp_patterns, key=lambda p: p.confidence)
+                            _entry = float(_best_tp.entry_price)
+                            # Only route through pattern entry if the entry is within
+                            # a reasonable distance — otherwise it'll defer indefinitely.
+                            _dist_pct = abs(_entry - current_price) / current_price
+                            if _dist_pct > 0.02:
+                                logger.info(
+                                    f"Pattern entry fallback SKIPPED for {symbol}: "
+                                    f"entry ${_entry:.4g} is {_dist_pct*100:.1f}% from current "
+                                    f"${current_price:.4g} — would defer indefinitely"
+                                )
+                                _best_tp = None
+                            else:
+                                if not _is_short_signal:
+                                    _pattern_order_type = "Stop" if _entry > current_price else "Limit"
+                                else:
+                                    _pattern_order_type = "Stop" if _entry < current_price else "Limit"
+                                _pattern_entry_price = _entry
+                                _pattern_type_name = _best_tp.pattern_type
+                                logger.info(
+                                    f"Pattern entry routing (fallback from TP/SL levels): "
+                                    f"{_pattern_order_type} @ {_entry:.6g} vs current {current_price:.6g} "
+                                    f"(Δ {_dist_pct*100:.1f}%)"
+                                )
+                    except Exception as _tp_err:
+                        logger.debug(f"Pattern entry fallback skipped: {_tp_err}")
                 # ─────────────────────────────────────────────────────────────────
 
                 if use_paper and paper_trading._enabled:
@@ -6396,7 +7779,7 @@ class AgentScheduler:
                         }
                         _scale_pairs = _SCALE_PROFILES.get(strategy_type, [])
                         _scale_levels = [
-                            {"pct_of_tp": pct, "close_pct": cpct, "triggered": False}
+                            {"pct_of_tp": pct, "close_pct": cpct, "triggered": False, "original_qty": quantity}
                             for pct, cpct in _scale_pairs
                         ]
 
@@ -6445,6 +7828,14 @@ class AgentScheduler:
                                         }
                                     except Exception as _ei_err:
                                         logger.debug(f"Entry indicator snapshot failed (non-fatal): {_ei_err}")
+                                    # Snapshot the GMM regime label at entry so the close path can
+                                    # attribute realised PnL to a regime bucket without a post-hoc join.
+                                    try:
+                                        _gmm_e = self._gmm_regime_cache.get(symbol)
+                                        if _gmm_e:
+                                            _pos.entry_regime = _gmm_e[0]
+                                    except Exception as _rge_err:
+                                        logger.debug(f"Entry regime snapshot failed (non-fatal): {_rge_err}")
                                     await _db.commit()
                         except Exception as _sol_err:
                             logger.debug(f"Scale-out level write failed: {_sol_err}")
@@ -6470,12 +7861,12 @@ class AgentScheduler:
                             sl_price=adjusted_sl, tp_price=adjusted_tp, is_paper=True,
                         )))
                     except PatternEntryDeferred as _ped:
-                        logger.info(f"Pattern entry deferred (paper): {_ped}")
+                        logger.info(f"Pattern entry deferred (paper): limit order placed at {_ped.entry_price:.6g} ({_pattern_type_name}, {_pattern_timeframe})")
                         self._record_run(agent_id, symbol, signal, confidence, current_price, False, error=str(_ped))
                         await team_chat.log_trade_blocked(
                             trader_name=_trader_name, trader_avatar=_trader_avatar,
                             agent_name=name, symbol=symbol, side=signal,
-                            reason=f"Pattern entry deferred — waiting for {_ped.entry_price:.6g} ({_ped.pattern_type or 'no pattern'})",
+                            reason=f"Pattern entry deferred — limit order placed at {_ped.entry_price:.6g} ({_pattern_type_name}, {_pattern_timeframe}). Will fill when price reaches level.",
                         )
                         _wk_ped = f"{agent_id}:{symbol}"
                         _wl_ttl_ped = self._WATCHLIST_TF_SECS.get(timeframe, 3600) * 4
@@ -6566,7 +7957,7 @@ class AgentScheduler:
                         # Attach scale-out levels to live position (same schedule as paper)
                         _live_scale_pairs = _SCALE_PROFILES.get(strategy_type, [])
                         _live_scale_levels = [
-                            {"pct_of_tp": pct, "close_pct": cpct, "triggered": False}
+                            {"pct_of_tp": pct, "close_pct": cpct, "triggered": False, "original_qty": quantity}
                             for pct, cpct in _live_scale_pairs
                         ]
                         try:
@@ -6612,6 +8003,13 @@ class AgentScheduler:
                                         }
                                     except Exception as _ei2_err:
                                         logger.debug(f"Live entry indicator snapshot failed (non-fatal): {_ei2_err}")
+                                    # Same regime snapshot as paper path.
+                                    try:
+                                        _gmm_e2 = self._gmm_regime_cache.get(symbol)
+                                        if _gmm_e2:
+                                            _live_pos.entry_regime = _gmm_e2[0]
+                                    except Exception as _rge2_err:
+                                        logger.debug(f"Live entry regime snapshot failed (non-fatal): {_rge2_err}")
                                     await _db.commit()
                         except Exception as _sol_err:
                             logger.debug(f"Live scale-out level write failed: {_sol_err}")
@@ -6721,6 +8119,7 @@ class AgentScheduler:
         strategy_type: Optional[str] = None,
         use_paper: bool = True,
         llm_reasoning: Optional[str] = None,
+        entry_regime: Optional[str] = None,
     ):
         run = AgentRun(
             agent_id=agent_id,
@@ -6767,6 +8166,19 @@ class AgentScheduler:
                 _vs["wins"] += 1
             _vs["pnl"] = round(_vs["pnl"] + pnl, 4)
             _vs["win_rate"] = round(_vs["wins"] / _vs["trades"], 4) if _vs["trades"] > 0 else 0.0
+            # Per-regime attribution (only when entry_regime was captured).
+            # This is the single place where regime_stats is mutated; the dict
+            # mirrors the venue_stats shape so dashboards can reuse the same
+            # rendering logic.
+            if entry_regime:
+                _rs = metrics.regime_stats.setdefault(
+                    entry_regime, {"trades": 0, "wins": 0, "pnl": 0.0}
+                )
+                _rs["trades"] += 1
+                if pnl > 0:
+                    _rs["wins"] += 1
+                _rs["pnl"] = round(_rs["pnl"] + pnl, 4)
+                _rs["win_rate"] = round(_rs["wins"] / _rs["trades"], 4) if _rs["trades"] > 0 else 0.0
         # Win rate = winning closed trades / all closed trades.
         # Only computed once we have a statistically meaningful sample — below
         # _WIN_RATE_MIN_SAMPLE the value is None so strategy_review scores
@@ -6817,6 +8229,7 @@ class AgentScheduler:
                     avg_pnl=metrics.avg_pnl,
                     last_run=metrics.last_run,
                     venue_stats=metrics.venue_stats,
+                    regime_stats=metrics.regime_stats,
                 ).on_conflict_do_update(
                     index_elements=["agent_id", "is_paper"],
                     set_=dict(
@@ -6833,6 +8246,7 @@ class AgentScheduler:
                         avg_pnl=metrics.avg_pnl,
                         last_run=metrics.last_run,
                         venue_stats=metrics.venue_stats,
+                        regime_stats=metrics.regime_stats,
                     ),
                 )
                 await db.execute(stmt)
@@ -6865,6 +8279,8 @@ class AgentScheduler:
                         win_rate=row.win_rate,
                         avg_pnl=row.avg_pnl,
                         last_run=row.last_run,
+                        venue_stats=row.venue_stats or {},
+                        regime_stats=row.regime_stats or {},
                     )
         except Exception as e:
             logger.error(f"Failed to fetch agent metrics from DB: {e}")
@@ -6895,6 +8311,8 @@ class AgentScheduler:
                             win_rate=r.win_rate,
                             avg_pnl=r.avg_pnl,
                             last_run=r.last_run,
+                            venue_stats=r.venue_stats or {},
+                            regime_stats=r.regime_stats or {},
                         )
                         for r in rows
                     ]
@@ -7054,14 +8472,28 @@ class AgentScheduler:
                 else:
                     params["allocation_change_pct"] = -5
             elif rec.recommendation in ("add_new_strategy", "diversify"):
-                # All supported strategy types for diversification
-                ALL_STRATEGIES = ["momentum", "mean_reversion", "breakout", "scalping", "trend_following", "grid"]
+                # All supported strategy types — read dynamically from registry
+                try:
+                    import app.strategies as _strat_reg
+                    ALL_STRATEGIES = list(_strat_reg.get_all().keys())
+                except Exception:
+                    ALL_STRATEGIES = ["momentum", "mean_reversion", "breakout", "scalping", "trend_following", "grid"]
                 existing = {a.get("strategy_type") for a in agents_list}
 
                 # Try to extract a specific strategy from the rationale
+                _rationale_lower = rec.rationale.lower()
+                # Map common aliases to registry keys
+                _alias_map = {"fvg": "fair_value_gap", "fair value gap": "fair_value_gap"}
                 found_stype = None
                 for stype in ALL_STRATEGIES:
-                    if stype.replace("_", " ") in rec.rationale.lower() or stype in rec.rationale.lower():
+                    if stype.replace("_", " ") in _rationale_lower or stype in _rationale_lower:
+                        found_stype = stype
+                        break
+                if not found_stype:
+                    for alias, mapped in _alias_map.items():
+                        if alias in _rationale_lower and mapped in ALL_STRATEGIES:
+                            found_stype = mapped
+                            break
                         found_stype = stype
                         break
 

@@ -550,7 +550,7 @@ class LiveTradingService:
             return {"available": 0.0, "total": 0.0, "currency": "USDT", "error": str(e)}
 
     @classmethod
-    def fee_rate_for(cls, symbol: str) -> float:
+    def fee_rate_for(cls, symbol: str, venue: str = "phemex") -> float:  # noqa: ARG003
         """Phemex perpetual contract taker fee: 0.06%."""
         return 0.0006
 

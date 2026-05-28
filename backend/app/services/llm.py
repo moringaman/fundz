@@ -347,7 +347,12 @@ Provide your analysis in JSON format:
         )
 
         content = response.choices[0].message.content
-        data = json.loads(content)
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
 
         return LLMResponse(
             content=content,
@@ -377,7 +382,12 @@ Provide your analysis in JSON format:
         )
 
         content = response.content[0].text
-        data = json.loads(content)
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
 
         return LLMResponse(
             content=content,
@@ -519,8 +529,8 @@ Return JSON: {{"trend": "strong_bullish|bullish|neutral|bearish|strong_bearish",
                 _ta_support = ta.get('support', 0) or 0
                 _ta_resist  = ta.get('resistance', 0) or 0
                 parts.append(f"""TECHNICAL ANALYST (Marcus Webb) REPORT:
-- Overall Signal: {ta.get('signal', 'N/A')} (confidence: {ta.get('confidence', 0):.0%})
-- Multi-Timeframe Alignment: {ta.get('alignment', 'N/A')} (confluence: {ta.get('confluence_score', 0):.0%})
+- Overall Signal: {ta.get('signal', 'N/A')} (confidence: {ta.get('confidence', 0) or 0:.0%})
+- Multi-Timeframe Alignment: {ta.get('alignment', 'N/A')} (confluence: {ta.get('confluence_score', 0) or 0:.0%})
 - Patterns Detected: {ta.get('patterns_count', 0)} — {ta.get('patterns_summary', 'none')}
 - Key Support: {fmt_price(_ta_support)} | Resistance: {fmt_price(_ta_resist)}
 - Key Observations: {ta.get('observations', 'N/A')}""")
@@ -549,7 +559,7 @@ Return JSON: {{"trend": "strong_bullish|bullish|neutral|bearish|strong_bearish",
             perf = team_context.get("agent_performance")
             if perf:
                 parts.append(f"""YOUR TRACK RECORD:
-- Win Rate: {perf.get('win_rate', 0):.0%} ({perf.get('total_runs', 0)} trades)
+- Win Rate: {perf.get('win_rate', 0) or 0:.0%} ({perf.get('total_runs', 0)} trades)
 - Total P&L: ${perf.get('total_pnl', 0):+,.2f}
 - Recent Streak: {perf.get('streak', 'N/A')}""")
 
@@ -598,8 +608,8 @@ Return JSON: {{"trend": "strong_bullish|bullish|neutral|bearish|strong_bearish",
 
             rr = team_context.get("rr_erosion")
             if rr:
-                tp_hit = rr.get("tp_hit_rate", 0)
-                avg_eff = rr.get("avg_exit_efficiency_vs_tp", 0)
+                tp_hit = rr.get("tp_hit_rate", 0) or 0
+                avg_eff = rr.get("avg_exit_efficiency_vs_tp", 0) or 0
                 total = rr.get("total", 0)
                 if total >= 3:
                     if tp_hit > 0.40 and avg_eff < 0.50:

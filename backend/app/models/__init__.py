@@ -199,6 +199,11 @@ class Trade(Base):
     status = Column(Enum(OrderStatus), default=OrderStatus.PENDING)
     phemex_order_id = Column(String(100), nullable=True)
     is_paper = Column(Boolean, default=True)
+    # GMM regime label active at the moment this trade fired (risk_off | range | risk_on | unknown).
+    # Snapshotted from the per-cycle regime cache so trade attribution by regime
+    # doesn't require a post-hoc join against regime_states.
+    entry_regime = Column(String(20), nullable=True)
+    entry_regime_confidence = Column(Float, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     filled_at = Column(DateTime(timezone=True), nullable=True)
 
@@ -237,6 +242,10 @@ class Position(Base):
     # needing to post-hoc approximate from market data.
     # Subset stored: {rsi, atr_pct, macd_hist_sign, trend, adx, bb_position}
     entry_indicators = Column(JSON, nullable=True)
+    # GMM regime label at entry — used at close to attribute the realised PnL
+    # to a regime bucket on AgentMetricRecord.regime_stats.
+    entry_regime = Column(String(20), nullable=True)
+    entry_regime_confidence = Column(Float, nullable=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     __table_args__ = (
@@ -269,16 +278,20 @@ class AccumulationConfig(Base):
     # DCA
     dca_enabled = Column(Boolean, default=False)
     dca_amount_usd = Column(Float, default=50.0)
+    dca_balance_pct = Column(Float, default=0.0)         # % of available USDC per DCA (0 = use fixed amount)
     dca_interval_hours = Column(Integer, default=168)    # 7 days
     dca_next_at = Column(DateTime(timezone=True), nullable=True)
+    dca_count = Column(Integer, default=0)
     # Value averaging
     va_enabled = Column(Boolean, default=False)
     va_target_growth_rate = Column(Float, default=1.0)   # % per period
     va_period_hours = Column(Integer, default=168)
     va_next_at = Column(DateTime(timezone=True), nullable=True)
+    va_count = Column(Integer, default=0)
     # Dip buying
     dip_enabled = Column(Boolean, default=False)
     dip_levels = Column(JSON, default=list)               # [{-5%, $50}, {-10%, $100}]
+    dip_count = Column(Integer, default=0)
     # Scale-out (bull market profit-taking → trading fund)
     scale_out_enabled = Column(Boolean, default=False)
     scale_out_target_pct = Column(Float, default=30.0)   # portfolio gain % to trigger
@@ -425,6 +438,12 @@ class AgentMetricRecord(Base):
     # e.g. {"phemex": {"trades": 12, "pnl": 45.2, "win_rate": 0.58},
     #        "hyperliquid": {"trades": 4, "pnl": 22.1, "win_rate": 0.75}}
     venue_stats = Column(JSON, default=dict)
+    # Per-regime breakdown — same shape as venue_stats, keyed by GMM label.
+    # e.g. {"risk_on":  {"trades": 8, "wins": 5, "pnl": 31.2, "win_rate": 0.625},
+    #        "range":    {"trades": 4, "wins": 1, "pnl":  -3.4, "win_rate": 0.250},
+    #        "risk_off": {"trades": 6, "wins": 1, "pnl": -22.1, "win_rate": 0.167}}
+    # Updated when a position closes; entry_regime on Position is the source of truth.
+    regime_stats = Column(JSON, default=dict)
 
     __table_args__ = (
         UniqueConstraint("agent_id", "is_paper", name="uq_agent_metric_agent_mode"),
@@ -835,6 +854,26 @@ from app.models import AnalystReport, PortfolioDecision, RiskAssessmentRecord, E
 from app.models import TeamChatMessageRecord, DailyReport
 from app.models import BacktestRecord, StrategyAction
 from app.models import WhaleAddress, WhaleSnapshot
+
+
+class AccumulationExecutionRecord(Base):
+    """Tracks each accumulation strategy execution (DCA, VA, Dip, Scale-out)."""
+    __tablename__ = "accumulation_execution_records"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    user_id = Column(String(36), ForeignKey("users.id"), nullable=False)
+    asset = Column(String(20), nullable=False)
+    strategy = Column(String(20), nullable=False)  # dca, value_averaging, dip_buy, scale_out
+    amount_usd = Column(Float, default=0.0)
+    quantity = Column(Float, default=0.0)
+    price = Column(Float, default=0.0)
+    details = Column(JSON, default=dict)
+    executed_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("idx_acc_exec_asset_strategy", "asset", "strategy"),
+        Index("idx_acc_exec_executed_at", "executed_at"),
+    )
 
 
 class AppSetting(Base):

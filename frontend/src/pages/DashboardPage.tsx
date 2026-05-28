@@ -61,7 +61,7 @@ export function DashboardPage() {
   const paperEnabled = paperStatus?.enabled ?? false;
   const maxDailyFeesPct = settingsData?.gates?.max_daily_fees_pct ?? 0.5;
   const feeCoverageGuardEnabled = settingsData?.gates?.fee_coverage_guard_enabled ?? true;
-  const feeCoverageMinRatio = settingsData?.gates?.fee_coverage_min_ratio ?? 2.5;
+  const feeCoverageMinRatio = settingsData?.gates?.fee_coverage_min_ratio ?? 1.5;
   const feeCoverageMinFeesUsd = settingsData?.gates?.fee_coverage_min_fees_usd ?? 25;
   const feeBudgetUsd = (50000 * maxDailyFeesPct) / 100;
   const dailyFeesForBudget =
@@ -715,6 +715,16 @@ export function DashboardPage() {
                       <div className="stat-label">Sell Vol</div>
                       <div className="stat-value" style={{ fontSize: '.88rem' }}>${paperPnl.sell_volume?.toFixed(0) ?? '0'}</div>
                     </div>
+                    {(paperPnl.apr ?? 0) > 0 && (
+                      <div className="stat-card" style={{ gridColumn: 'span 2' }}>
+                        <div className="stat-label" title={`${paperPnl.trade_span_days ?? '?'} days of data, starting capital $${(paperPnl.starting_capital ?? 0).toLocaleString()}`}>
+                          APR · Annualized Return
+                        </div>
+                        <div className={`stat-value ${paperPnl.apr >= 0 ? 'positive' : 'negative'}`} style={{ fontSize: '.95rem' }}>
+                          {paperPnl.apr >= 0 ? '+' : ''}{paperPnl.apr.toFixed(1)}%
+                        </div>
+                      </div>
+                    )}
                   </div>
                 </>
               ) : (

@@ -35,6 +35,23 @@ _DEFAULT_LADDER = _TF_LADDER["1h"]
 
 
 @dataclass
+class VolumeProfileResult:
+    """Results from volume profile calculation."""
+    poc: float
+    value_area_high: float
+    value_area_low: float
+    high_volume_nodes: List[float]
+    low_volume_nodes: List[float]
+    shape: str
+    total_volume: float
+    row_count: int
+    session_high: float
+    session_low: float
+    prev_value_area_high: Optional[float] = None
+    prev_value_area_low: Optional[float] = None
+
+
+@dataclass
 class PriceLevels:
     support: List[float]
     resistance: List[float]
@@ -45,6 +62,8 @@ class PriceLevels:
     # Retail anchors orders to these levels; institutions use them for stop-runs.
     # Shape: {"level": float, "distance_pct": float, "direction": "above"|"below"|"at"}
     round_number_proximity: Optional[Dict] = None
+    # Volume Profile — POC, value area, high/low volume nodes
+    volume_profile: Optional[Dict] = None
 
     # ── Structural-level helpers ──────────────────────────────────────────────
     def all_levels_above(self, price: float) -> List[float]:
@@ -128,7 +147,11 @@ def snap_tp_to_structure(
                 if lvl <= candidate_tp:
                     best = lvl
         if best and abs(best - candidate_tp) / max(candidate_tp, 1e-10) <= max_adjust_pct:
-            return round(best * (1 - MARGIN), 8)  # just below resistance
+            snapped = round(best * (1 - MARGIN), 8)
+            # Never snap TP below current price — that guarantees a loss.
+            if snapped <= current_price:
+                return current_price * 1.001  # 0.1% minimum gap above entry
+            return snapped
 
     return candidate_tp
 
@@ -363,6 +386,36 @@ class TechnicalAnalyst:
             current_price = data_primary['close'].iloc[-1]
 
             price_levels = self._calculate_price_levels(data_primary)
+
+            # ── Volume Profile ──────────────────────────────────────────────
+            # Fetch 5m klines for volume profile (needs shorter timeframe for
+            # sufficient row resolution). Falls back gracefully.
+            _vp_data = data_primary  # fallback: use primary data
+            try:
+                _vp_klines = await self.phemex.get_klines(symbol, "5m", 96)  # ~8 hours of 5m
+                _vp_parsed = self._parse_klines(_vp_klines)
+                if _vp_parsed is not None and len(_vp_parsed) >= 12:
+                    _vp_data = _vp_parsed
+            except Exception:
+                pass
+
+            _vp_result = self._compute_volume_profile(_vp_data)
+            if _vp_result:
+                price_levels.volume_profile = {
+                    "poc": _vp_result.poc,
+                    "value_area_high": _vp_result.value_area_high,
+                    "value_area_low": _vp_result.value_area_low,
+                    "high_volume_nodes": _vp_result.high_volume_nodes,
+                    "low_volume_nodes": _vp_result.low_volume_nodes,
+                    "shape": _vp_result.shape,
+                    "session_high": _vp_result.session_high,
+                    "session_low": _vp_result.session_low,
+                }
+                # Add POC and VA edges to support/resistance
+                if _vp_result.poc > 0:
+                    price_levels.support.append(_vp_result.value_area_low)
+                    price_levels.resistance.append(_vp_result.value_area_high)
+
             patterns = self._identify_patterns(data_primary, current_price, price_levels, tf_primary)
             multi_tf = self._analyze_multitimeframe(data_primary, data_mid, data_high, current_price, symbol, tf_primary, tf_mid, tf_high)
 
@@ -602,6 +655,94 @@ class TechnicalAnalyst:
         
         rectangle_patterns = self._detect_rectangle(df, current_price, timeframe)
         patterns.extend(rectangle_patterns)
+
+        fvg_patterns = self._detect_fair_value_gaps(df, current_price, timeframe)
+        patterns.extend(fvg_patterns)
+
+        # ── Volume Profile patterns ──────────────────────────────────────────
+        _vp = price_levels.volume_profile if price_levels else None
+        if _vp:
+            _vp_shape = _vp.get("shape", "")
+            _vp_poc = _vp.get("poc", 0)
+            _vp_va_high = _vp.get("value_area_high", 0)
+            _vp_va_low = _vp.get("value_area_low", 0)
+            _vp_session_high = _vp.get("session_high", 0)
+            _vp_session_low = _vp.get("session_low", 0)
+            _vp_hvns = _vp.get("high_volume_nodes", [])
+            _vp_hvn_near = [h for h in _vp_hvns if abs(h - current_price) / max(current_price, 1) < 0.015]
+            _vp_at_va_edge = abs(current_price - _vp_va_high) / max(current_price, 1) < 0.005 or abs(current_price - _vp_va_low) / max(current_price, 1) < 0.005
+
+            # D shape: balanced, fade extremes
+            if _vp_shape == "D" and _vp_at_va_edge:
+                if abs(current_price - _vp_va_high) / max(current_price, 1) < 0.005:
+                    patterns.append(PatternSignal(
+                        pattern_type="vp_balance_fade", direction="bearish",
+                        confidence=0.60, entry_price=current_price,
+                        stop_loss=round(_vp_va_high * 1.005, 8),
+                        take_profit_1=round(_vp_poc, 8),
+                        take_profit_2=round(_vp_va_low, 8),
+                        risk_reward=2.0,
+                        reasoning=f"Volume Profile D-shape: fading VA top ${_vp_va_high:.4f} → POC ${_vp_poc:.4f}",
+                        timeframe=timeframe,
+                    ))
+                elif abs(current_price - _vp_va_low) / max(current_price, 1) < 0.005:
+                    patterns.append(PatternSignal(
+                        pattern_type="vp_balance_fade", direction="bullish",
+                        confidence=0.60, entry_price=current_price,
+                        stop_loss=round(_vp_va_low * 0.995, 8),
+                        take_profit_1=round(_vp_poc, 8),
+                        take_profit_2=round(_vp_va_high, 8),
+                        risk_reward=2.0,
+                        reasoning=f"Volume Profile D-shape: fading VA bottom ${_vp_va_low:.4f} → POC ${_vp_poc:.4f}",
+                        timeframe=timeframe,
+                    ))
+
+            # P shape: bullish, buy pullbacks to POC
+            elif _vp_shape == "P":
+                _near_poc = abs(current_price - _vp_poc) / max(current_price, 1) < 0.01
+                if _near_poc:
+                    patterns.append(PatternSignal(
+                        pattern_type="vp_bullish_pullback", direction="bullish",
+                        confidence=0.68, entry_price=current_price,
+                        stop_loss=round(_vp_va_low * 0.995, 8),
+                        take_profit_1=round(_vp_session_high, 8),
+                        take_profit_2=round(_vp_session_high * 1.01, 8),
+                        risk_reward=2.5,
+                        reasoning=f"Volume Profile P-shape: pullback to POC ${_vp_poc:.4f}. Bullish structure.",
+                        timeframe=timeframe,
+                    ))
+
+            # B shape: bearish, short bounces to POC
+            elif _vp_shape == "B":
+                _near_poc = abs(current_price - _vp_poc) / max(current_price, 1) < 0.01
+                if _near_poc:
+                    patterns.append(PatternSignal(
+                        pattern_type="vp_bearish_bounce", direction="bearish",
+                        confidence=0.68, entry_price=current_price,
+                        stop_loss=round(_vp_va_high * 1.005, 8),
+                        take_profit_1=round(_vp_session_low, 8),
+                        take_profit_2=round(_vp_session_low * 0.99, 8),
+                        risk_reward=2.5,
+                        reasoning=f"Volume Profile B-shape: bounce at POC ${_vp_poc:.4f}. Bearish structure.",
+                        timeframe=timeframe,
+                    ))
+
+            # HVN edge + confirmation (signal candle near high volume node)
+            if _vp_hvn_near:
+                _nearest_hvn = min(_vp_hvn_near, key=lambda x: abs(x - current_price))
+                _hvn_dir = "bullish" if current_price <= _nearest_hvn else "bearish"
+                patterns.append(PatternSignal(
+                    pattern_type="vp_hvn_edge", direction=_hvn_dir,
+                    confidence=0.62, entry_price=current_price,
+                    stop_loss=round(_nearest_hvn * (0.995 if _hvn_dir == "bullish" else 1.005), 8),
+                    take_profit_1=round(current_price * (1.02 if _hvn_dir == "bullish" else 0.98), 8),
+                    take_profit_2=round(current_price * (1.04 if _hvn_dir == "bullish" else 0.96), 8),
+                    risk_reward=2.0,
+                    reasoning=f"Volume Profile: price at HVN edge ${_nearest_hvn:.4f}. Expecting rejection/bounce.",
+                    timeframe=timeframe,
+                ))
+
+        # ── End Volume Profile patterns ─────────────────────────────────────
 
         # Existing patterns below
 
@@ -1655,6 +1796,268 @@ class TechnicalAnalyst:
                 ))
         
         return patterns
+
+    def _detect_swing_high(self, highs: np.ndarray, i: int) -> bool:
+        return highs[i] > highs[i - 1] and highs[i] > highs[i + 1]
+
+    def _detect_swing_low(self, lows: np.ndarray, i: int) -> bool:
+        return lows[i] < lows[i - 1] and lows[i] < lows[i + 1]
+
+    def _check_bos(self, highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, i: int,
+                   direction: str, swing_window: int = 20) -> bool:
+        """Check whether a Break of Structure occurred before the FVG at index i.
+
+        Scans the preceding *swing_window* candles for the most recent swing
+        high (bullish) or swing low (bearish). Returns True if the 3-candle
+        sequence starting at *i* broke through that swing level — i.e. the
+        FVG formed as part of a structural break, not inside a range.
+        """
+        start = max(1, i - swing_window)
+        last_swing_high = None
+        last_swing_low = None
+        for j in range(start, i):
+            if self._detect_swing_high(highs, j):
+                last_swing_high = highs[j]
+            if self._detect_swing_low(lows, j):
+                last_swing_low = lows[j]
+
+        if direction == "bullish":
+            if last_swing_high is None:
+                return False
+            # Price must break above the most recent swing high
+            peak = max(highs[i], highs[i + 1], highs[i + 2])
+            return peak > last_swing_high * 1.001  # 0.1% buffer to avoid noise
+        else:
+            if last_swing_low is None:
+                return False
+            trough = min(lows[i], lows[i + 1], lows[i + 2])
+            return trough < last_swing_low * 0.999
+
+    def _detect_fair_value_gaps(self, df: pd.DataFrame, current_price: float, timeframe: str = "1h") -> List[PatternSignal]:
+        """Detect Fair Value Gaps (FVG) — three-candle imbalances with BOS filter.
+
+        A bullish FVG occurs when three consecutive bullish candles leave a gap
+        between candle 1's wick high and candle 3's wick low (candle 3's low >
+        candle 1's high). This gap represents unfilled orders and acts as a
+        magnet for price to return to the midpoint.
+
+        A bearish FVG is the inverse: three bearish candles, candle 3's high <
+        candle 1's low.
+
+        Only emits patterns that formed after a Break of Structure (BOS), i.e.
+        price broke through a recent swing high/low during the 3-candle sequence.
+        Gaps inside consolidation ranges without BOS are filtered out.
+
+        Entry: midpoint of the FVG zone
+        SL: just beyond the FVG zone extreme
+        TP1: gap height (distance from FVG midpoint to zone edge)
+        TP2: 2× gap height
+        """
+        patterns = []
+        if len(df) < 5:
+            return patterns
+
+        closes = df['close'].values.astype(float)
+        highs  = df['high'].values.astype(float)
+        lows   = df['low'].values.astype(float)
+        opens  = df['open'].values.astype(float)
+
+        lookback = min(60, len(df) - 3)
+
+        for i in range(lookback - 2):
+            if i < 3:
+                continue
+            c1_close, c1_open = closes[i], opens[i]
+            c3_low, c3_high   = lows[i + 2], highs[i + 2]
+            c1_high, c1_low   = highs[i], lows[i]
+
+            # ── Bullish FVG ──────────────────────────────────────────────
+            if c1_close > c1_open and c3_low > c1_high:
+                gap_low  = c1_high
+                gap_high = c3_low
+                mid      = (gap_low + gap_high) / 2
+                gap_dist = gap_high - gap_low
+
+                if gap_dist / mid < 0.0005:
+                    continue
+
+                # BOS filter: skip if no structural break occurred
+                if not self._check_bos(highs, lows, closes, i, "bullish"):
+                    continue
+
+                confidence = 0.72
+
+                near_mid = abs(current_price - mid) / mid < 0.02
+
+                patterns.append(PatternSignal(
+                    pattern_type="fair_value_gap",
+                    direction="bullish",
+                    confidence=confidence,
+                    entry_price=round(mid, 8),
+                    stop_loss=round(gap_low * 0.998, 8),
+                    take_profit_1=round(mid + gap_dist * 1.0, 8),
+                    take_profit_2=round(mid + gap_dist * 2.0, 8),
+                    risk_reward=round(gap_dist / (mid - gap_low * 0.998 + 0.0001) if near_mid else 2.5, 2),
+                    reasoning=(
+                        f"Bullish FVG @ ${mid:.4f} (gap ${gap_low:.4f}–${gap_high:.4f}). "
+                        f"BOS confirmed — broke swing high. "
+                        f"{'Price near midpoint — ready for entry.' if near_mid else 'Waiting for retrace to midpoint.'}"
+                    ),
+                    timeframe=timeframe,
+                ))
+
+            # ── Bearish FVG ──────────────────────────────────────────────
+            if c1_close < c1_open and c3_high < c1_low:
+                gap_high = c1_low
+                gap_low  = c3_high
+                mid      = (gap_low + gap_high) / 2
+                gap_dist = gap_high - gap_low
+
+                if gap_dist / mid < 0.0005:
+                    continue
+
+                if not self._check_bos(highs, lows, closes, i, "bearish"):
+                    continue
+
+                confidence = 0.72
+
+                near_mid = abs(current_price - mid) / mid < 0.02
+
+                patterns.append(PatternSignal(
+                    pattern_type="fair_value_gap",
+                    direction="bearish",
+                    confidence=confidence,
+                    entry_price=round(mid, 8),
+                    stop_loss=round(gap_high * 1.002, 8),
+                    take_profit_1=round(mid - gap_dist * 1.0, 8),
+                    take_profit_2=round(mid - gap_dist * 2.0, 8),
+                    risk_reward=round(gap_dist / (gap_high * 1.002 - mid + 0.0001) if near_mid else 2.5, 2),
+                    reasoning=(
+                        f"Bearish FVG @ ${mid:.4f} (gap ${gap_high:.4f}–${gap_low:.4f}). "
+                        f"BOS confirmed — broke swing low. "
+                        f"{'Price near midpoint — ready for entry.' if near_mid else 'Waiting for retrace to midpoint.'}"
+                    ),
+                    timeframe=timeframe,
+                ))
+
+        return patterns
+
+    def _compute_volume_profile(self, df: pd.DataFrame, prev_df: Optional[pd.DataFrame] = None) -> Optional[VolumeProfileResult]:
+        """Compute volume profile from klines.
+
+        Bins each candle's volume across its high-low range into price buckets
+        (rows), then identifies POC, value area (70% of total volume), high/low
+        volume nodes, and shape classification (D/P/B/thin).
+
+        Requires at least 12 candles for a meaningful profile. For session-based
+        analysis, pass a full session's worth of 5m/15m klines.
+        """
+        if df is None or len(df) < 12:
+            return None
+
+        try:
+            highs = df['high'].values.astype(float)
+            lows = df['low'].values.astype(float)
+            closes = df['close'].values.astype(float)
+            volumes = df['volume'].values.astype(float)
+        except (KeyError, ValueError, AttributeError):
+            return None
+
+        min_price = float(np.min(lows))
+        max_price = float(np.max(highs))
+        price_range = max_price - min_price
+        if price_range <= 0:
+            return None
+
+        # Target ~400 rows (per video recommendation) or as many as the range allows
+        target_rows = min(400, max(50, int(price_range / (price_range / 400))))
+        row_width = price_range / target_rows if target_rows > 0 else price_range
+        if row_width <= 0:
+            return None
+
+        # Bin volume across price rows
+        bins = np.zeros(target_rows)
+        for i in range(len(df)):
+            h = highs[i]
+            l = lows[i]
+            v = volumes[i]
+            if v <= 0 or h <= l:
+                continue
+            start_row = max(0, int((l - min_price) / row_width))
+            end_row = min(target_rows - 1, int((h - min_price) / row_width))
+            if end_row <= start_row:
+                bins[start_row] += v
+            else:
+                vol_per_row = v / (end_row - start_row + 1)
+                for r in range(start_row, end_row + 1):
+                    bins[r] += vol_per_row
+
+        # Point of Control
+        poc_idx = int(np.argmax(bins))
+        poc = min_price + (poc_idx + 0.5) * row_width
+
+        # Value Area: central ~70% of volume around POC
+        total_v = float(np.sum(bins))
+        va_target = total_v * 0.70
+        cum_v = bins[poc_idx]
+        va_low_idx = poc_idx
+        va_high_idx = poc_idx
+        while cum_v < va_target:
+            left_v = bins[va_low_idx - 1] if va_low_idx > 0 else 0
+            right_v = bins[va_high_idx + 1] if va_high_idx < target_rows - 1 else 0
+            if left_v >= right_v and va_low_idx > 0:
+                va_low_idx -= 1
+                cum_v += left_v
+            elif va_high_idx < target_rows - 1:
+                va_high_idx += 1
+                cum_v += right_v
+            else:
+                break
+
+        value_area_low = min_price + va_low_idx * row_width
+        value_area_high = min_price + (va_high_idx + 1) * row_width
+
+        # High / low volume nodes
+        mean_vol = float(np.mean(bins[bins > 0])) if np.any(bins > 0) else 0
+        std_vol = float(np.std(bins[bins > 0])) if np.any(bins > 0) else 0
+        high_nodes = []
+        low_nodes = []
+        for i in range(target_rows):
+            price_lvl = min_price + (i + 0.5) * row_width
+            if bins[i] > mean_vol + std_vol:
+                high_nodes.append(round(price_lvl, 8))
+            elif bins[i] > 0 and bins[i] < mean_vol * 0.3:
+                low_nodes.append(round(price_lvl, 8))
+
+        # Shape classification
+        upper_vol = float(np.sum(bins[poc_idx:])) / max(total_v, 1)
+        lower_vol = float(np.sum(bins[:poc_idx + 1])) / max(total_v, 1)
+        profile_width_pct = price_range / poc if poc > 0 else 0
+        hvn_ratio = len(high_nodes) / max(target_rows, 1)
+
+        if hvn_ratio < 0.08:
+            shape = "thin"
+        elif upper_vol > 0.62 and lower_vol < 0.38:
+            shape = "P"   # heavy at top
+        elif lower_vol > 0.62 and upper_vol < 0.38:
+            shape = "B"   # heavy at bottom
+        else:
+            shape = "D"   # balanced
+
+        return VolumeProfileResult(
+            poc=round(poc, 8),
+            value_area_high=round(value_area_high, 8),
+            value_area_low=round(value_area_low, 8),
+            high_volume_nodes=[round(p, 8) for p in high_nodes[:10]],  # top 10
+            low_volume_nodes=[round(p, 8) for p in low_nodes[:10]],    # top 10
+            shape=shape,
+            total_volume=round(total_v, 2),
+            row_count=target_rows,
+            session_high=max_price,
+            session_low=min_price,
+            prev_value_area_high=None,
+            prev_value_area_low=None,
+        )
 
     async def get_confluence_scores(self, symbols: List[str], timeframe: str = "1h") -> Dict[str, Dict[str, Any]]:
         """

@@ -63,5 +63,9 @@ class HyperliquidClient:
         """Returns mid prices for all assets as {coin: price_str}, e.g. {"BTC": "50000.0"}."""
         return await self._post({"type": "allMids"})
 
+    async def spot_user_state(self, address: str) -> Dict[str, Any]:
+        """Returns spot wallet balances: { balances: [{ coin, total, locked }], ... }."""
+        return await self._post({"type": "spotClearinghouseState", "user": address})
+
     async def close(self) -> None:
         await self._client.aclose()

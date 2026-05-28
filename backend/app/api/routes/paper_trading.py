@@ -140,24 +140,40 @@ async def get_paper_portfolio():
     balances = await paper_trading.get_all_balances()
     positions = await paper_trading.get_positions_live()
 
-    # Cash balances
+    # Cash balances — only show USDT (this is a futures system, not spot;
+    # reset_trading_session seeds fake BTC/ETH/SOL rows that are never used)
     balance_list = [
         {"asset": b.asset, "available": b.available, "locked": b.locked}
-        for b in balances
+        for b in balances if b.asset == "USDT"
     ]
     usdt_bal = next((b for b in balances if b.asset == "USDT"), None)
     usdt_total = (usdt_bal.available + usdt_bal.locked) if usdt_bal else 0.0
 
-    # Open positions value
-    positions_value = sum(
-        p.get("quantity", 0) * p.get("current_price", p.get("entry_price", 0))
-        for p in positions
-    )
+    # Open positions — compute equity contribution by direction.
+    # LONG:  you own the asset → add its market value to capital
+    # SHORT: you owe the asset → add only unrealized P&L (entry − current)
+    #        Adding the full notional inflates the portfolio and causes wild
+    #        swings when positions open/close.
+    positions_value = 0.0
+    total_exposure = 0.0  # total notional at risk (for exposure %)
+    for p in positions:
+        qty = p.get("quantity", 0)
+        entry = p.get("entry_price", 0)
+        current = p.get("current_price", entry)
+        side = (p.get("side", "") or "").upper()
+        notional = qty * current
+
+        if side == "BUY":
+            positions_value += notional
+        else:  # SELL (short)
+            positions_value += qty * (entry - current)
+
+        total_exposure += notional
 
     total_capital = usdt_total + positions_value
 
-    # Exposure = positions value / total capital (same as risk manager)
-    exposure_pct = (positions_value / total_capital * 100) if total_capital > 0 else 0.0
+    # Exposure = total notional / total capital
+    exposure_pct = (total_exposure / total_capital * 100) if total_capital > 0 else 0.0
 
     # Concentration
     largest_position = None
@@ -250,7 +266,28 @@ async def get_paper_positions(symbol: Optional[str] = None):
 
 @router.get("/pnl")
 async def get_paper_pnl():
-    return await paper_trading.calculate_pnl()
+    data = await paper_trading.calculate_pnl()
+    try:
+        total = data.get("total_pnl", 0) or 0
+        trades = await paper_trading.get_closed_trades(limit=9999)
+        if trades:
+            t0 = trades[-1]
+            fd = t0.get("exit_time") or t0.get("filled_at") or t0.get("created_at")
+            if fd:
+                if isinstance(fd, str):
+                    fd = fd.replace("Z", "+00:00")
+                    fd = datetime.fromisoformat(fd)
+                days = max(1, (datetime.utcnow() - fd).total_seconds() / 86400)
+                balances = await paper_trading.get_all_balances()
+                usdt = next((b for b in balances if b.asset == "USDT"), None)
+                current_bal = (usdt.available + (usdt.locked or 0)) if usdt else 50000.0
+                cap = max(0, current_bal - total)
+                data["apr"] = round((total / cap) * (365 / days) * 100, 2) if cap > 0 else 0
+                data["starting_capital"] = round(cap, 2)
+                data["trade_span_days"] = round(days, 1)
+    except Exception:
+        pass
+    return data
 
 
 class UpdatePositionRequest(BaseModel):

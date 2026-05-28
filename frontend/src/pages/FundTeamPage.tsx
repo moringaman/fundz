@@ -115,8 +115,11 @@ export function FundTeamPage() {
       {/* <div style={{ marginBottom: '2rem' }}>
         <WhaleIntelligencePanel />
       </div> */}
+      {/* Team Discussion — placed at top for quick access */}
+      <TeamChatPanel />
+
       {/* Main Grid — analyst panels only */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '1.5rem' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '1.5rem', marginTop: '1.5rem' }}>
 
         {/* === Research Analyst === */}
         <div className="panel" style={{ gridColumn: 'span 2', minWidth: 0 }}>
@@ -685,7 +688,6 @@ export function FundTeamPage() {
 
         {/* ── Left column: Team Discussion + Strategy Actions ── */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
-          <TeamChatPanel />
 
           {/* Strategy Actions — FM + TA Cooperation Log */}
           <div className="card">

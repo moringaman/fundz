@@ -9,6 +9,16 @@ pathway so they survive restarts.
 
 Regime classification
 ─────────────────────
+  The base regime is computed per strategy type from each strategy's own win
+  rate and PnL. The overall regime uses the WORST strategy's classification
+  (weakest link determines the gate tightness).
+
+  Two preemptive overlays adjust the result BEFORE the win-rate check:
+    1. GMM regime (risk_on / range / risk_off) — if the statistical model
+       says the market turned dangerous, shift one notch defensive before
+       looking at win rates.
+    2. Per-strategy fees and churn — checked before win-rate regime.
+
   AGGRESSIVE  win_rate > 62 % AND today's PnL ≥ 0
   BALANCED    win_rate 48–62 % (or no data yet)
   CAUTIOUS    win_rate 35–48 % OR today's PnL negative
@@ -49,9 +59,13 @@ REGIME_COLORS = {
 
 # Fee drag detection thresholds
 _FEE_DRAG_MIN_FEES_USD      = 50.0   # don't activate on cold-start noise
-_FEE_DRAG_SEVERE_RATIO      = 1.5    # gross PnL / fees < 1.5 → severe
-_FEE_DRAG_MODERATE_RATIO    = 2.5    # gross PnL / fees < 2.5 → moderate
-_FEE_DRAG_MIN_CLOSED_TRADES = 20     # need meaningful sample before activating
+_FEE_DRAG_SEVERE_RATIO      = 1.2    # gross PnL / fees < 1.2 → severe
+_FEE_DRAG_MODERATE_RATIO    = 2.0    # gross PnL / fees < 2.0 → moderate
+_FEE_DRAG_MIN_CLOSED_TRADES = 10     # need meaningful sample before activating
+
+# Hysteresis: require this many consecutive evaluations before switching regimes
+# (runs every 30 min, so 2 = 1 hour of sustained evidence)
+_REGIME_SWITCH_THRESHOLD = 2
 
 _AUTOPILOT_SETTING_KEY = "gate_autopilot"
 _RUN_INTERVAL_SECONDS  = 1800   # 30 minutes
@@ -63,10 +77,14 @@ class GateAutopilot:
     def __init__(self) -> None:
         self._enabled: bool = False
         self._last_regime: str = REGIME_BALANCED
+        self._pending_regime: Optional[str] = None
+        self._pending_count: int = 0
         self._last_reason: str = "Autopilot not yet run"
         self._last_run: Optional[datetime] = None
         self._changes: dict = {}
         self._loaded: bool = False
+        # Fields the autopilot has modified (so BALANCED only resets what we touched)
+        self._autopilot_fields: set = set()
 
     # ── Public accessors ──────────────────────────────────────────────────────
 
@@ -78,6 +96,8 @@ class GateAutopilot:
         return {
             "enabled":     self._enabled,
             "regime":      self._last_regime,
+            "pending_regime": self._pending_regime,
+            "pending_count": self._pending_count,
             "reason":      self._last_reason,
             "last_run":    self._last_run.isoformat() if self._last_run else None,
             "changes":     self._changes,
@@ -143,8 +163,38 @@ class GateAutopilot:
         from app.api.routes.settings import get_trading_gates, TradingGates, _load_setting
 
         metrics = await self._gather_metrics()
-        regime  = self._classify_regime(metrics)
+        raw_regime  = self._classify_regime(metrics)
         gates   = get_trading_gates()
+
+        # ── Hysteresis: don't switch regimes on a single data point ───────────────
+        # Require _REGIME_SWITCH_THRESHOLD consecutive evaluations to agree
+        # before leaving the current regime. This stops thrashing when WR
+        # oscillates right on a boundary (e.g. 47→49→47→49).
+        if raw_regime == self._last_regime:
+            self._pending_regime = None
+            self._pending_count = 0
+            regime = raw_regime
+        else:
+            if raw_regime == self._pending_regime:
+                self._pending_count += 1
+            else:
+                self._pending_regime = raw_regime
+                self._pending_count = 1
+
+            if self._pending_count >= _REGIME_SWITCH_THRESHOLD:
+                logger.info(
+                    f"Gate autopilot switching regime {self._last_regime} → {raw_regime} "
+                    f"({self._pending_count} consecutive evaluations)"
+                )
+                regime = raw_regime
+                self._pending_regime = None
+                self._pending_count = 0
+            else:
+                logger.info(
+                    f"Gate autopilot holding {self._last_regime} (raw={raw_regime}, "
+                    f"pending {self._pending_count}/{_REGIME_SWITCH_THRESHOLD})"
+                )
+                regime = self._last_regime
 
         # Arrr, respect the captain's manual orders.
         # Use the operator's saved baseline so adjustments are relative to THEIR
@@ -157,7 +207,10 @@ class GateAutopilot:
         except Exception:
             user_baseline = TradingGates()
 
-        new_gates, changes, reason = self._compute_adjustments(gates, regime, metrics, user_baseline)
+        new_gates, changes, reason = self._compute_adjustments(
+            gates, regime, metrics, user_baseline,
+            autopilot_fields=self._autopilot_fields,
+        )
 
         # Only write to DB if something actually changed
         if changes:
@@ -168,6 +221,13 @@ class GateAutopilot:
             logger.info(f"Gate autopilot [{regime}] applied {len(changes)} adjustment(s): {changes}")
         else:
             logger.debug(f"Gate autopilot [{regime}] — no changes needed")
+
+        # Track which fields the autopilot has touched so BALANCED only resets those
+        self._autopilot_fields.update(changes.keys())
+        # If we just returned to BALANCED, clear the tracked set so future regimes
+        # start fresh.
+        if regime == REGIME_BALANCED:
+            self._autopilot_fields.clear()
 
         self._last_regime = regime
         self._last_reason = reason
@@ -181,7 +241,7 @@ class GateAutopilot:
     async def _gather_metrics(self) -> dict:
         """Pull rolling 7-day win rate, today's PnL, consecutive loss count, and daily fees."""
         from app.database import get_async_session
-        from app.models import AgentMetricRecord, AgentRunRecord, RiskAssessmentRecord, Trade, OrderStatus
+        from app.models import AgentMetricRecord, AgentRunRecord, RiskAssessmentRecord, Trade, OrderStatus, RegimeStateRecord
         from sqlalchemy import select, func as sqlfunc
 
         metrics = {
@@ -226,6 +286,13 @@ class GateAutopilot:
                 )
                 metrics["filled_paper_trades"] = int(filled_paper_trades.scalar_one_or_none() or 0)
 
+                # ── Active agent count (for per-agent churn scaling) ──────────────
+                from app.models import Agent as _AgentModel
+                _agent_count_result = await db.execute(
+                    select(sqlfunc.count(_AgentModel.id)).where(_AgentModel.enabled.is_(True))
+                )
+                metrics["active_agents"] = int(_agent_count_result.scalar_one_or_none() or 1)
+
                 # ── Today's PnL from the most recent risk assessment ──────────
                 now = datetime.now(timezone.utc)
                 day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -239,20 +306,24 @@ class GateAutopilot:
                 if pnl_row is not None:
                     metrics["daily_pnl"] = float(pnl_row)
 
-                # ── Consecutive losing days (last 5 daily risk assessments) ───
+                # ── Consecutive losing days (last 5 daily risk assessments) ──────────
+                # Use the LAST assessment of each UTC day (ordered desc), not the
+                # minimum, so a flash dip during a green day doesn't count as a loss.
                 results = await db.execute(
                     select(
                         sqlfunc.date_trunc("day", RiskAssessmentRecord.timestamp).label("day"),
-                        sqlfunc.min(RiskAssessmentRecord.daily_pnl).label("worst_pnl"),
-                    )
-                    .group_by(sqlfunc.date_trunc("day", RiskAssessmentRecord.timestamp))
-                    .order_by(sqlfunc.date_trunc("day", RiskAssessmentRecord.timestamp).desc())
-                    .limit(5)
+                        RiskAssessmentRecord.daily_pnl.label("last_pnl"),
+                    ).distinct(
+                        sqlfunc.date_trunc("day", RiskAssessmentRecord.timestamp)
+                    ).order_by(
+                        sqlfunc.date_trunc("day", RiskAssessmentRecord.timestamp).desc(),
+                        RiskAssessmentRecord.timestamp.desc(),
+                    ).limit(5)
                 )
                 days = results.all()
                 consecutive = 0
                 for day_row in days:
-                    if day_row.worst_pnl is not None and day_row.worst_pnl < 0:
+                    if day_row.last_pnl is not None and day_row.last_pnl < 0:
                         consecutive += 1
                     else:
                         break
@@ -284,12 +355,12 @@ class GateAutopilot:
         except Exception as exc:
             logger.debug(f"Failed to gather UTC-day fees: {exc}")
 
-        # ── Lifetime fee drag metrics (gross PnL vs total fees ever paid) ──────
-        # Trade model has no pnl column; net PnL lives in AgentRunRecord.pnl.
-        # gross_pnl = net_pnl + total_fees  (fees paid are part of gross returns).
+        # ── Rolling 14-day fee drag metrics ─────────────────────────────────
+        # Replace lifetime cumulative with a 14-day window so stale history
+        # from a different market regime doesn't permanently poison the overlay.
         try:
+            _window_start = datetime.now(timezone.utc) - timedelta(days=14)
             async with get_async_session() as db:
-                # Total fees from all filled paper orders
                 fees_row = await db.execute(
                     select(
                         sqlfunc.coalesce(sqlfunc.sum(Trade.fee), 0.0).label("total_fees"),
@@ -297,11 +368,11 @@ class GateAutopilot:
                         Trade.user_id == "default-user",
                         Trade.is_paper.is_(True),
                         Trade.status == OrderStatus.FILLED,
+                        Trade.created_at >= _window_start,
                     )
                 )
                 _total_fees = float((fees_row.one_or_none() or (0.0,))[0] or 0.0)
 
-                # Net PnL and closed trade count from AgentRunRecord
                 pnl_row = await db.execute(
                     select(
                         sqlfunc.coalesce(sqlfunc.sum(AgentRunRecord.pnl), 0.0).label("net_pnl"),
@@ -309,13 +380,13 @@ class GateAutopilot:
                     ).where(
                         AgentRunRecord.pnl.isnot(None),
                         AgentRunRecord.use_paper.is_(True),
+                        AgentRunRecord.timestamp >= _window_start,
                     )
                 )
                 pnl_data = pnl_row.one_or_none()
                 _net_pnl     = float((pnl_data.net_pnl    if pnl_data else 0.0) or 0.0)
                 _trade_count = int((pnl_data.closed_count  if pnl_data else 0)   or 0)
 
-            # gross = price-movement earnings before fees were deducted
             _gross_pnl = _net_pnl + _total_fees
             metrics["total_fees_lifetime"]  = _total_fees
             metrics["gross_realized_pnl"]   = _gross_pnl
@@ -325,6 +396,69 @@ class GateAutopilot:
             metrics["lifetime_trade_count"] = _trade_count
         except Exception as exc:
             logger.debug(f"Failed to gather fee drag metrics: {exc}")
+
+        # ── GMM market regime from RegimeStateRecord (preemptive overlay) ─────────
+        # The statistical model classifies each symbol independently. We take the
+        # most common label across all tracked symbols. If the most conservative
+        # label is risk_off, that's the one that matters.
+        try:
+            from app.models import RegimeStateRecord
+            async with get_async_session() as db:
+                regime_rows = await db.execute(
+                    select(
+                        RegimeStateRecord.regime_label,
+                        sqlfunc.count(RegimeStateRecord.id).label("cnt"),
+                    )
+                    .group_by(RegimeStateRecord.regime_label)
+                    .order_by(sqlfunc.count(RegimeStateRecord.id).desc())
+                )
+                _gmm_labels = {row.regime_label: row.cnt for row in regime_rows.all()}
+                # Prefer the most conservative label present
+                if _gmm_labels.get("risk_off"):
+                    metrics["gmm_regime"] = "risk_off"
+                elif _gmm_labels.get("range"):
+                    metrics["gmm_regime"] = "range"
+                elif _gmm_labels.get("risk_on"):
+                    metrics["gmm_regime"] = "risk_on"
+                else:
+                    metrics["gmm_regime"] = "unknown"
+        except Exception as exc:
+            metrics["gmm_regime"] = "unknown"
+            logger.debug(f"Failed to gather GMM regime: {exc}")
+
+        # ── Per-strategy metrics ──────────────────────────────────────────────────
+        # Group by strategy_type to identify which strategies are dragging
+        # performance down. The worst strategy determines the gate tightness.
+        try:
+            async with get_async_session() as db:
+                strat_rows = await db.execute(
+                    select(
+                        AgentRunRecord.strategy_type,
+                        sqlfunc.count(AgentRunRecord.id).label("closed_count"),
+                        sqlfunc.sum(sqlfunc.cast(AgentRunRecord.pnl > 0, sqlfunc.Integer)).label("winners"),
+                        sqlfunc.sum(AgentRunRecord.pnl).label("total_pnl"),
+                    ).where(
+                        AgentRunRecord.pnl.isnot(None),
+                        AgentRunRecord.strategy_type.isnot(None),
+                    ).group_by(AgentRunRecord.strategy_type)
+                )
+                per_strategy = {}
+                for row in strat_rows.all():
+                    st = row.strategy_type
+                    cc = int(row.closed_count or 0)
+                    w  = int(row.winners or 0)
+                    tp = float(row.total_pnl or 0.0)
+                    per_strategy[st] = {
+                        "trades": cc,
+                        "wins": w,
+                        "win_rate": (w / cc) if cc > 0 else 0.5,
+                        "total_pnl": tp,
+                        "avg_pnl": tp / cc if cc > 0 else 0.0,
+                    }
+                metrics["per_strategy"] = per_strategy
+        except Exception as exc:
+            metrics["per_strategy"] = {}
+            logger.debug(f"Failed to gather per-strategy metrics: {exc}")
 
         # ── Trades executed in the last 60 minutes (churn detection) ──────────────
         try:
@@ -354,17 +488,63 @@ class GateAutopilot:
         cld = metrics["consecutive_losing_days"]
         n   = metrics["total_trades"]
 
+        # ── Preemptive overlay: GMM market regime ────────────────────────────────
+        # If the statistical model classifies the market as risk_off, shift the
+        # base classification one notch defensive before looking at win rates.
+        # This catches the May 4→5 scenario: the GMM would have detected the
+        # trend reversal hours before the losses piled up.
+        gmm_regime = metrics.get("gmm_regime", "unknown")
+        gmm_penalty = 0
+        if gmm_regime == "risk_off":
+            gmm_penalty = 1  # shift one notch defensive
+            logger.info(f"GMM preemptive overlay: risk_off detected — will shift regime one notch defensive")
+        elif gmm_regime == "range":
+            gmm_penalty = 0  # ranging is neutral, no shift
+        # risk_on → no penalty (allow aggressive)
+
+        # ── Per-strategy win rates (weakest-link) ──────────────────────────────
+        # The worst-performing strategy determines the gate tightness, since
+        # one bleeding strategy can drag the whole portfolio down (agent 03316f19
+        # lost 6 of the 11 losses while other strategies were fine).
+        per_strategy = metrics.get("per_strategy", {})
+        _worst_strategy = None
+        _strat_wr = wr  # default to global
+        _strat_n  = n
+        _strat_pnl = pnl
+        for st_name, st_data in per_strategy.items():
+            st_wr = st_data.get("win_rate", 0.5)
+            st_n  = st_data.get("trades", 0)
+            st_pnl = st_data.get("total_pnl", 0.0)
+            if st_n >= 3 and st_wr < _strat_wr:
+                _worst_strategy = st_name
+                _strat_wr = st_wr
+                _strat_n  = st_n
+                _strat_pnl = st_pnl
+
+        # Use worst strategy metrics for classification
+        wr = _strat_wr
+        n  = _strat_n
+
+        # Apply GMM penalty to win rate (shift classification notch)
+        if gmm_penalty == 1 and n >= 3:
+            # risk_off: penalize the effective win rate by 10 points
+            # so a strategy at 45% WR gets classified as defensive instead of cautious
+            wr = wr - 0.10
+
         # Insufficient data → stay balanced
         if n < 5:
+            # Still check GMM: risk_off with little data → cautious anyway
+            if gmm_regime == "risk_off":
+                return REGIME_CAUTIOUS
             return REGIME_BALANCED
-        # ── High churn detection (checked before fee drag) ──────────────────────────
-        # Many trades per hour combined with poor coverage = churn not edge.
-        # Trigger BEFORE FEE_DRAG so the regime fires early in the day when
-        # the fee budget is still intact but the hourly rate is already high.
+
+        # ── High churn detection (checked before fee drag) ────────────────────
         _trades_1h   = metrics.get("trades_last_hour", 0)
         _coverage_hc = metrics.get("fee_coverage_ratio")
         _lifetime_hc = metrics.get("lifetime_trade_count", 0)
-        _HIGH_CHURN_TRADES_THRESHOLD = 5   # > 5 trades in last 60 min = churning
+        _active_agents = max(1, metrics.get("active_agents", 1))
+        # Scale threshold with fleet size: 0.8 trades/hour per agent, min 5
+        _HIGH_CHURN_TRADES_THRESHOLD = max(5, int(_active_agents * 0.8))
         if (
             _trades_1h > _HIGH_CHURN_TRADES_THRESHOLD
             and _coverage_hc is not None
@@ -372,10 +552,7 @@ class GateAutopilot:
             and _lifetime_hc >= 5
         ):
             return REGIME_HIGH_CHURN
-        # ── Fee drag detection (checked before win-rate regime) ───────────────
-        # High-frequency low-profit trading can show an acceptable win rate while
-        # fees silently consume the majority of gross returns.  Detect and
-        # correct independently of the standard win-rate classification.
+
         _coverage   = metrics.get("fee_coverage_ratio")
         _lifetime_n = metrics.get("lifetime_trade_count", 0)
         _total_fees = metrics.get("total_fees_lifetime", 0.0)
@@ -407,6 +584,7 @@ class GateAutopilot:
         regime: str,
         metrics: dict,
         user_baseline=None,
+        autopilot_fields: Optional[set] = None,
     ):
         """Return (new_gates, changes_dict, human_reason)."""
         from app.api.routes.settings import TradingGates
@@ -422,6 +600,7 @@ class GateAutopilot:
         wr   = metrics["win_rate"]
         n    = metrics["total_trades"]
         trade_sample_summary = GateAutopilot._trade_sample_summary(metrics)
+        _ap_fields = autopilot_fields or set()
 
         def _set(field: str, value: float) -> None:
             old = d.get(field)
@@ -445,15 +624,24 @@ class GateAutopilot:
                       f"capture more of the current edge. Fast entry enabled. {trade_sample_summary}")
 
         elif regime == REGIME_BALANCED:
-            # Restore to defaults
+            # Restore to defaults ONLY for fields the autopilot previously modified.
+            # This preserves manual operator tweaks on fields the autopilot never touched.
             for field in (
                 "min_entry_confidence", "mtf_mixed_penalty", "mtf_opposed_penalty",
                 "ta_penalty_multiplier", "dead_zone_penalty", "sr_proximity_block_pct",
                 "circuit_breaker_max_trades", "fast_entry_enabled",
             ):
-                _set(field, getattr(defaults, field))
-            reason = (f"Win rate {wr:.0%} is within balanced range → "
-                      f"restored gate thresholds to defaults. {trade_sample_summary}")
+                if field in _ap_fields:
+                    _set(field, getattr(defaults, field))
+            _gmm_r = metrics.get("gmm_regime", "unknown")
+            _gmm_info = f" GMM={_gmm_r}," if _gmm_r not in ("unknown",) else ""
+            _ps = metrics.get("per_strategy", {})
+            _worst_st = None
+            if _ps:
+                _worst_st = min(_ps, key=lambda s: _ps[s].get("win_rate", 1))
+            _worst_info = f" worst={_worst_st}({_ps[_worst_st]['win_rate']:.0%})" if _worst_st else ""
+            reason = (f"Win rate {wr:.0%} within balanced range → "
+                      f"restored autopilot-modified gate thresholds to defaults.{_gmm_info}{_worst_info} {trade_sample_summary}")
 
         elif regime == REGIME_CAUTIOUS:
             _set("min_entry_confidence",   _clamp(defaults.min_entry_confidence + 0.05, 0.50, 0.72))
@@ -463,7 +651,6 @@ class GateAutopilot:
             _set("dead_zone_penalty",      _clamp(defaults.dead_zone_penalty    + 0.04, 0.15, 0.30))
             _set("sr_proximity_block_pct", _clamp(defaults.sr_proximity_block_pct + 0.0015, 0.003, 0.02))
             _set("max_position_size_pct",  _clamp(defaults.max_position_size_pct - 1.0, 2.0, 5.0))
-            _set("max_open_positions",     max(3, int(defaults.max_open_positions - 1)))
             _set("fast_entry_enabled", False)
             reason = (f"Win rate {wr:.0%} below target or negative daily PnL → "
                       f"tightened gates to reduce low-quality entries. Fast entry disabled. {trade_sample_summary}")
@@ -522,7 +709,6 @@ class GateAutopilot:
             _set("min_notional",               _clamp(defaults.min_notional + 10.0, 15.0, 75.0))
             _set("max_position_size_pct",      _clamp(defaults.max_position_size_pct - 2.0, 1.0, 4.0))
             _set("max_daily_loss_pct",         _clamp(defaults.max_daily_loss_pct - 2.0, 1.0, 3.0))
-            _set("max_open_positions",         max(2, int(defaults.max_open_positions - 2)))
             _set("fast_entry_enabled", False)
             reason = (
                 f"Fee drag SEVERE: coverage ratio {_coverage:.2f}x "
@@ -543,7 +729,6 @@ class GateAutopilot:
             _set("circuit_breaker_max_trades", _clamp(defaults.circuit_breaker_max_trades - 10, 10, 30))
             _set("max_position_size_pct",  _clamp(defaults.max_position_size_pct - 2.0, 1.0, 3.0))
             _set("max_daily_loss_pct",     _clamp(defaults.max_daily_loss_pct - 2.0, 1.0, 3.0))
-            _set("max_open_positions",     max(2, int(defaults.max_open_positions - 2)))
             _set("fast_entry_enabled", False)
             reason = (f"Win rate {wr:.0%} critically low or {cld} consecutive losing day(s) → "
                       f"gates significantly tightened. Capital preservation priority. Fast entry disabled. {trade_sample_summary}")
@@ -556,6 +741,29 @@ class GateAutopilot:
         if cld >= 3:
             if d["circuit_breaker_max_trades"] > 20:
                 _set("circuit_breaker_max_trades", 20)
+
+        # ── Per-strategy confidence floors ──────────────────────────────────────
+        # Even in a BALANCED overall regime, an individual strategy with a poor
+        # win rate should require higher confidence to enter. This prevents a
+        # single bleeding strategy from diluting the portfolio while allowing
+        # healthy strategies to keep trading normally.
+        # The gates are global (not per-strategy), so we raise the global floor
+        # high enough to protect the weakest strategy.
+        per_strategy = metrics.get("per_strategy", {})
+        _strat_floors = []
+        for st_name, st_data in per_strategy.items():
+            st_wr = st_data.get("win_rate", 0.5)
+            st_n  = st_data.get("trades", 0)
+            if st_n < 3:
+                continue
+            if st_wr < 0.35:
+                _strat_floors.append(0.72)
+            elif st_wr < 0.48:
+                _strat_floors.append(0.65)
+        if _strat_floors:
+            _per_strat_floor = max(_strat_floors)
+            if d["min_entry_confidence"] < _per_strat_floor:
+                _set("min_entry_confidence", _per_strat_floor)
 
         # ── Daily Fee Budget Circuit Breaker (hard override) ──────────────────
         # If daily fees exceed max_daily_fees_pct, hard-block all new entries
@@ -582,9 +790,12 @@ class GateAutopilot:
             await _save_setting(_AUTOPILOT_SETTING_KEY, {
                 "enabled":    self._enabled,
                 "regime":     self._last_regime,
+                "pending_regime": self._pending_regime,
+                "pending_count": self._pending_count,
                 "reason":     self._last_reason,
                 "last_run":   self._last_run.isoformat() if self._last_run else None,
                 "changes":    self._changes,
+                "autopilot_fields": list(self._autopilot_fields),
             })
         except Exception as exc:
             logger.warning(f"Gate autopilot state persist failed: {exc}")
@@ -598,8 +809,11 @@ class GateAutopilot:
             if data:
                 self._enabled     = bool(data.get("enabled", False))
                 self._last_regime = data.get("regime", REGIME_BALANCED)
+                self._pending_regime = data.get("pending_regime")
+                self._pending_count = int(data.get("pending_count", 0))
                 self._last_reason = data.get("reason", "Loaded from DB")
                 self._changes     = data.get("changes", {})
+                self._autopilot_fields = set(data.get("autopilot_fields", []))
                 raw_ts = data.get("last_run")
                 if raw_ts:
                     try:

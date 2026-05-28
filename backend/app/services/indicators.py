@@ -945,8 +945,26 @@ class IndicatorService:
                 divergence_weight=_divergence.get("divergence_weight", 0.0),
             )
         elif strategy == "mean_reversion":
+            # BB width ratio — same compute pattern as breakout. Mean reversion
+            # works on stable / mildly-deviating volatility; if bands are
+            # expanding aggressively, an extreme touch is the START of an
+            # impulse leg, not the end. We pass the ratio so the signal
+            # function can suppress reversion entries during vol expansion.
+            if _precomputed_indicators is not None:
+                _bb_width_ratio_mr = _precomputed_indicators.get("_bb_width_ratio")
+            else:
+                _bb_width_ratio_mr = None
+                if bb_upper and bb_lower and bb_middle and bb_middle > 0 and len(df) >= 40:
+                    _close_bb = df["close"].astype(float)
+                    _bb_hist = self.calculate_bollinger_bands(_close_bb)
+                    _bb_widths = (_bb_hist["upper"] - _bb_hist["lower"]) / _bb_hist["middle"].replace(0, float("nan"))
+                    _avg_width = float(_bb_widths.iloc[-40:-1].mean()) if _bb_widths.iloc[-40:-1].notna().any() else None
+                    _cur_width = float(_bb_widths.iloc[-1]) if not pd.isna(_bb_widths.iloc[-1]) else None
+                    if _avg_width and _cur_width and _avg_width > 0:
+                        _bb_width_ratio_mr = round(_cur_width / _avg_width, 3)
             signals = self._mean_reversion_signals(
-                rsi, price, bb_lower, bb_upper, bb_middle, sma_20, volume_ratio, sma_50
+                rsi, price, bb_lower, bb_upper, bb_middle, sma_20, volume_ratio, sma_50,
+                bb_width_ratio=_bb_width_ratio_mr, df=df,
             )
         elif strategy == "breakout":
             # BB width ratio — pre-computed when called from backtest, else derived on-the-fly.
@@ -995,6 +1013,8 @@ class IndicatorService:
                 adx, indicators.get("plus_di"), indicators.get("minus_di"),
                 volume_ratio, bb_width_pct=_bb_width_pct,
             )
+        elif strategy == "fair_value_gap":
+            signals = self._fvg_signals(price, market_context=market_context)
         else:
             signals = self._default_signals(
                 rsi, price, bb_lower, bb_upper, sma_20, sma_50, macd, macd_signal_val, volume_ratio
@@ -1546,7 +1566,9 @@ class IndicatorService:
 
         return signals
 
-    def _mean_reversion_signals(self, rsi, price, bb_lower, bb_upper, bb_middle, sma_20, volume_ratio=None, sma_50=None):
+    def _mean_reversion_signals(self, rsi, price, bb_lower, bb_upper, bb_middle, sma_20,
+                                 volume_ratio=None, sma_50=None,
+                                 bb_width_ratio=None, df=None):
         """Mean reversion: only trade genuine extremes, not mild deviations.
 
         Mean reversion assumes price will revert toward a stable mean (SMA20).
@@ -1555,8 +1577,42 @@ class IndicatorService:
         Defense-in-depth gate: suppress counter-trend signals when SMA20/SMA50
         confirm a trend structure (regime gate handles the common case, but can
         lag by up to 5 minutes after a regime shift).
+
+        Volatility-expansion guard: when Bollinger Bands are expanding
+        aggressively (bb_width_ratio > 1.4), a band-extreme touch is the
+        OPENING of an impulse leg, not exhaustion. Reversion entries here
+        get run over by the trend. We hard-suppress reversion signals during
+        vol expansion and require a wick-rejection candle (close back inside
+        the band) before entering normal-vol reversions.
         """
         signals = []
+
+        # ── Volatility expansion gate ──────────────────────────────────
+        # Bands wider than ~1.4× their 20-bar average mean we are in a
+        # volatility-expansion regime. Any "extreme" touch here is the
+        # leading edge of a breakout, not a reversion setup.
+        _vol_expanding = bb_width_ratio is not None and bb_width_ratio > 1.4
+
+        # ── Wick-rejection check ───────────────────────────────────────
+        # A genuine reversion shows up as a candle that POKED the band
+        # but CLOSED back inside. Without that confirmation we are buying
+        # mid-impulse. Skipped when df is unavailable (defensive default).
+        _wick_rejection_long = True
+        _wick_rejection_short = True
+        if df is not None and len(df) >= 1 and bb_lower and bb_upper:
+            try:
+                _last = df.iloc[-1]
+                _low = float(_last.get("low", _last.get("close", price)))
+                _high = float(_last.get("high", _last.get("close", price)))
+                _close = float(_last.get("close", price))
+                # Long reversion: low pierced lower band, but close back above it
+                _wick_rejection_long = (_low <= bb_lower) and (_close > bb_lower)
+                # Short reversion: high pierced upper band, but close back below it
+                _wick_rejection_short = (_high >= bb_upper) and (_close < bb_upper)
+            except Exception:
+                # Defensive: if df shape is unexpected, don't block signals
+                _wick_rejection_long = True
+                _wick_rejection_short = True
 
         # Trend structure gate: suppress BUY signals in confirmed downtrends
         # and SELL signals in confirmed uptrends. Allow neutral (SMA20 ≈ SMA50).
@@ -1574,15 +1630,18 @@ class IndicatorService:
             elif rsi > 70 and not _in_uptrend:
                 signals.append((Signal.SELL, 0.35, f"RSI overbought for reversion ({rsi:.1f})"))
 
-        # Bollinger Band reversion — only at the extremes, and only when not in a trend
-        if bb_lower and bb_upper and bb_middle:
+        # Bollinger Band reversion — only at the extremes, only when not in a
+        # trend, only when bands aren't expanding (vol-spike → breakout, not
+        # reversion), and only with a wick-rejection candle confirming the
+        # extreme was rejected, not absorbed.
+        if bb_lower and bb_upper and bb_middle and not _vol_expanding:
             bb_range = bb_upper - bb_lower
             if bb_range > 0:
                 position_in_band = (price - bb_lower) / bb_range
-                if position_in_band < 0.10 and not _in_downtrend:
-                    signals.append((Signal.BUY, 0.45, f"Price at lower BB extreme ({position_in_band:.0%} of range)"))
-                elif position_in_band > 0.90 and not _in_uptrend:
-                    signals.append((Signal.SELL, 0.45, f"Price at upper BB extreme ({position_in_band:.0%} of range)"))
+                if position_in_band < 0.10 and not _in_downtrend and _wick_rejection_long:
+                    signals.append((Signal.BUY, 0.45, f"Price at lower BB extreme ({position_in_band:.0%} of range) with wick rejection"))
+                elif position_in_band > 0.90 and not _in_uptrend and _wick_rejection_short:
+                    signals.append((Signal.SELL, 0.45, f"Price at upper BB extreme ({position_in_band:.0%} of range) with wick rejection"))
 
         # Price vs SMA20 deviation — require larger deviation, respect trend
         if sma_20 and sma_20 > 0:
@@ -1623,6 +1682,13 @@ class IndicatorService:
                 sell_w = sum(w for s, w, _ in signals if s == Signal.SELL)
                 dom = Signal.BUY if buy_w >= sell_w else Signal.SELL
                 signals.append((dom, 0.10, f"Low volume ({volume_ratio:.1f}\u00d7) at extreme \u2014 exhaustion reversal"))
+
+        # ── Vol-expansion dampener ─────────────────────────────────────
+        # If bands are still mildly expanding (1.2 < ratio <= 1.4) the BB gate
+        # above already let signals through (only > 1.4 is hard-blocked), but
+        # we soften them since reversion edge is weaker when vol is still rising.
+        if bb_width_ratio is not None and 1.2 < bb_width_ratio <= 1.4 and signals:
+            signals = [(s, w * 0.6, r + f" [vol expanding {bb_width_ratio:.2f}\u00d7]") for s, w, r in signals]
 
         return signals
 
@@ -2324,5 +2390,47 @@ class IndicatorService:
                     base = 0.40
                     reason = f"TRENDING SHORT (below EMA, no pullback): ADX {adx:.1f}{_di_info}"
                     signals.append((Signal.SELL, round(base, 3), reason))
+
+        return signals
+
+    def _fvg_signals(self, price: float, market_context: Optional[Dict] = None) -> List[tuple]:
+        """Fair Value Gap strategy: trades when FVG patterns are detected by the TA.
+
+        Unlike other strategies, FVG has no indicator-based logic. It reads pattern
+        data from market_context (populated from the TA cache by agent_scheduler's
+        _build_market_context). If FVG patterns are present, it trades in their
+        direction; otherwise it holds.
+        """
+        signals = []
+        if not market_context:
+            return signals
+
+        patterns = market_context.get("ta_patterns", [])
+        if not patterns:
+            return signals
+
+        bull_weight = 0.0
+        bear_weight = 0.0
+        for p in patterns:
+            if p.get("type") != "fair_value_gap":
+                continue
+            conf = p.get("confidence", 0.5)
+            if p.get("direction") == "bullish":
+                bull_weight += conf
+            elif p.get("direction") == "bearish":
+                bear_weight += conf
+
+        if bull_weight > bear_weight and bull_weight > 0:
+            signals.append((
+                Signal.BUY,
+                min(bull_weight + 0.10, 0.85),
+                f"Bullish FVG (confidence {bull_weight:.0%}) — entering at gap midpoint",
+            ))
+        elif bear_weight > bull_weight and bear_weight > 0:
+            signals.append((
+                Signal.SELL,
+                min(bear_weight + 0.10, 0.85),
+                f"Bearish FVG (confidence {bear_weight:.0%}) — entering at gap midpoint",
+            ))
 
         return signals

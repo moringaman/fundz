@@ -80,11 +80,25 @@ class RiskManager:
             lev = max(pos.get('leverage', 1.0) or 1.0, 1.0)
             return notional / lev
 
-        total_exposure = sum(_margin(p) for p in current_positions)
+        def _is_risk_free(pos: Dict[str, Any]) -> bool:
+            """True if the position's SL is on the profitable side of entry
+            (no downside risk)."""
+            _sl = pos.get("stop_loss_price")
+            _entry = pos.get("entry_price", 0) or 0
+            if _sl is None or _entry <= 0:
+                return False
+            _side = str(pos.get("side", "")).lower()
+            if _side in ("sell", "short"):
+                return float(_sl) <= _entry
+            return float(_sl) >= _entry
+
+        _active_positions = [p for p in current_positions if not _is_risk_free(p)]
+
+        total_exposure = sum(_margin(p) for p in _active_positions)
 
         total_leveraged_notional = sum(
             pos.get('notional', pos.get('quantity', 0) * pos.get('entry_price', 0))
-            for pos in current_positions
+            for pos in _active_positions
         )
 
         # Incoming trade: use configured leverage from risk_config
@@ -482,13 +496,13 @@ class RiskManager:
                             _w_info = 0.65
                             _w_bull = 0.30
                         if bear_pct >= _w_caution:
-                            # Strong bearish whale positioning — genuine caution signal
+                            # Strong bearish whale positioning — directional signal, not blanket risk.
+                            # Favors SHORT trades; only escalates risk if we're on the wrong side
+                            # (handled by per-position opposition check above).
                             whale_signals.append(
                                 f"🐋 Macro whale sentiment: {bear_pct:.0%} SHORT across all tracked coins "
-                                f"— broad bearish smart-money positioning"
+                                f"— broad bearish smart-money positioning, favours SHORT entries"
                             )
-                            if risk_level == "safe":
-                                risk_level = "caution"
                         elif bear_pct >= _w_info:
                             # Moderately bearish — note it but don't elevate risk level
                             whale_signals.append(

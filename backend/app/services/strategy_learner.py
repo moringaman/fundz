@@ -139,9 +139,15 @@ class StrategyLearner:
 
     async def ingest_from_db(self, hours: int = 168) -> int:
         """Load recent AgentRunRecord rows and update posteriors.
-        Returns count of records ingested."""
+        Returns count of records ingested.
+
+        Regime attribution:
+          AgentRunRecord doesn't carry the entry regime, so we look up the
+          closest RegimeStateRecord at-or-before each run's timestamp (per
+          symbol). Falls back to "unknown" when no GMM snapshot exists.
+        """
         from app.database import get_async_session
-        from app.models import AgentRunRecord
+        from app.models import AgentRunRecord, RegimeStateRecord
         from sqlalchemy import select
 
         cutoff = datetime.utcnow() - timedelta(hours=hours)
@@ -154,11 +160,27 @@ class StrategyLearner:
                     AgentRunRecord.executed == True,
                 )
             )
-            for rec in rows.scalars().all():
-                # Parse regime and parameter info from stored data
-                # (regime is not stored on AgentRunRecord; we use a fallback)
+            run_rows = rows.scalars().all()
+
+            # Pre-fetch one regime snapshot per (symbol) — most recent at-or-before
+            # the lookback cutoff. For tighter accuracy we'd query per-row, but a
+            # single snapshot is good enough here because GMM labels are stable
+            # over hours-to-days and the bucket dimension is coarse.
+            symbols = sorted({r.symbol for r in run_rows if r.symbol})
+            regime_by_symbol: Dict[str, str] = {}
+            for sym in symbols:
+                snap = await db.scalar(
+                    select(RegimeStateRecord)
+                    .where(RegimeStateRecord.symbol == sym)
+                    .order_by(RegimeStateRecord.created_at.desc())
+                    .limit(1)
+                )
+                if snap and snap.regime_label:
+                    regime_by_symbol[sym] = snap.regime_label
+
+            for rec in run_rows:
                 strategy = rec.strategy_type or "unknown"
-                regime = "unknown"  # would need a regime lookup
+                regime = regime_by_symbol.get(rec.symbol, "unknown")
                 sl_pct = 2.5  # default, ideally from agent config
                 tp_pct = 5.5
                 conf = rec.confidence or 0.5

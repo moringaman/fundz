@@ -32,6 +32,8 @@ DEFAULT_LEVEL_BUFFER = 0.01  # 1% outside BB to set grid bounds
 ATR_MULT_RANGE = 1.5         # grid_high/low = mid ± ATR_MULT_RANGE × ATR
 ATR_SPIKE_MULT = 2.0         # cancel if current ATR > ATR_SPIKE_MULT × regime_ATR
 PRICE_BREAK_BUFFER = 0.01    # 1% beyond grid edge triggers cancel
+MIN_GRID_SPACING_PCT = 0.8   # absolute floor: spacing must be ≥ 0.8% of price
+MIN_GRID_SPACING_ATR_MULT = 1.2  # or ≥ 1.2 × ATR%, whichever is larger
 
 
 class GridEngine:
@@ -83,6 +85,23 @@ class GridEngine:
 
             spacing = (grid_high - grid_low) / (n_levels - 1)
             spacing_pct = spacing / current_price * 100
+
+            # ── Minimum spacing enforcement ─────────────────────────────────
+            # Grid spacing must be large enough relative to volatility,
+            # otherwise every cell opens with inverted R/R (TP < SL distance).
+            _min_spacing_pct = max(MIN_GRID_SPACING_PCT, atr_pct * MIN_GRID_SPACING_ATR_MULT)
+            if spacing_pct < _min_spacing_pct:
+                _old_n = n_levels
+                _min_spacing = current_price * _min_spacing_pct / 100
+                n_levels = max(2, int((grid_high - grid_low) / _min_spacing) + 1)
+                spacing = (grid_high - grid_low) / (n_levels - 1)
+                spacing_pct = spacing / current_price * 100
+                logger.warning(
+                    f"Grid spacing widened: {_old_n}→{n_levels} levels to meet "
+                    f"min spacing {_min_spacing_pct:.2f}% (was {spacing_pct:.2f}%) "
+                    f"for {symbol}"
+                )
+
             capital_per_level = capital / n_levels
 
             grid = GridState(
@@ -429,6 +448,13 @@ class GridEngine:
                 return grid
 
             spacing = (new_high - new_low) / max(grid.grid_levels - 1, 1)
+            _rebal_spacing_pct = spacing / current_price * 100
+            _min_rebal_spacing = max(MIN_GRID_SPACING_PCT, atr_pct * MIN_GRID_SPACING_ATR_MULT)
+            if _rebal_spacing_pct < _min_rebal_spacing:
+                logger.warning(
+                    f"Grid rebalance spacing too tight ({_rebal_spacing_pct:.2f}% < "
+                    f"{_min_rebal_spacing:.2f}%) — consider cancelling and re-initialising {grid_id[:8]}"
+                )
 
             # Cancel pending levels outside new range
             pending = (await db.scalars(

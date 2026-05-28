@@ -32,6 +32,7 @@ class OrderPlan:
     pattern_type: Optional[str] = None
     pattern_confidence: Optional[float] = None
     rationale: str = ""
+    timeframe: str = "1h"
 
 
 def select_pattern_entry(
@@ -76,6 +77,7 @@ def select_pattern_entry(
         entry_price=entry_price,
         pattern_type=getattr(best, "pattern_type", None),
         pattern_confidence=float(getattr(best, "confidence", 0.0)),
+        timeframe=getattr(best, "timeframe", "1h"),
         rationale=(
             f"{best.pattern_type} ({best.confidence:.0%}) → {order_type} "
             f"@ {entry_price:.6g} vs current {current_price:.6g}"

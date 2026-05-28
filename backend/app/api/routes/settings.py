@@ -102,6 +102,13 @@ class TradingPreferences(BaseModel):
             "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT",
         ]
     )
+    trading_venue: str = Field(default="hyperliquid",
+        pattern="^(hyperliquid|phemex|alpaca)$",
+        description=(
+            "Global trading venue override. When set, all agents will trade "
+            "on this venue regardless of their individual venue setting. "
+            "Affects fee rates and execution routing."
+        ))
 
 
 class LlmConfig(BaseModel):
@@ -157,8 +164,6 @@ class TradingGates(BaseModel):
         description="Maximum % of capital for single position")
     max_daily_loss_pct: float = Field(default=5.0, ge=0.1, le=50,
         description="Maximum daily loss as % of capital before circuit breaker")
-    max_open_positions: int = Field(default=5, ge=1, le=50,
-        description="Maximum concurrent open positions")
     # Correlation limits
     max_same_asset_positions: int = Field(default=2, ge=1, le=10,
         description="Maximum concurrent positions on the same symbol")
@@ -251,8 +256,8 @@ class TradingGates(BaseModel):
     # minimum multiple. When below target, entry quality thresholds tighten.
     fee_coverage_guard_enabled: bool = Field(default=True,
         description="When enabled, tighten entry quality when realized PnL is not covering fees by the target multiple.")
-    fee_coverage_min_ratio: float = Field(default=2.5, ge=0.5, le=10.0,
-        description="Minimum realized PnL-to-fees coverage ratio target (2.5 = realized PnL should be 2.5x fees).")
+    fee_coverage_min_ratio: float = Field(default=1.5, ge=0.5, le=10.0,
+        description="Minimum realized PnL-to-fees coverage ratio target (1.5 = realized PnL should be 1.5x fees).")
     fee_coverage_min_fees_usd: float = Field(default=25.0, ge=0.0, le=5000.0,
         description="Minimum total fees before fee-coverage guard activates to avoid early-session noise.")
     fee_coverage_window_trades: int = Field(default=60, ge=5, le=500,
@@ -261,8 +266,8 @@ class TradingGates(BaseModel):
         description="Minimum closed trades required before fee-coverage guard can activate.")
     fee_coverage_include_slippage: bool = Field(default=True,
         description="Include estimated slippage costs in fee-coverage net-edge calculation.")
-    fee_coverage_slippage_bps: float = Field(default=2.0, ge=0.0, le=50.0,
-        description="Estimated slippage per execution leg in basis points (2.0 = 2 bps per entry and exit leg).")
+    fee_coverage_slippage_bps: float = Field(default=1.0, ge=0.0, le=50.0,
+        description="Estimated slippage per execution leg in basis points (1.0 = 1 bp per entry and exit leg).")
     fee_coverage_include_funding: bool = Field(default=True,
         description="Include funding costs in fee-coverage net-edge calculation when available.")
     # ── Trader Perf Gate ─────────────────────────────────────────────────────
@@ -354,6 +359,25 @@ class TradingGates(BaseModel):
         description="Minimum confidence for tier 3 leverage.")
     leverage_tier_3_multiplier: float = Field(default=5.0, ge=1.0, le=5.0,
         description="Leverage multiplier for highest-confidence trades.")
+    # ── Flip Gate (opposing-direction reversal logic) ─────────────────────────
+    # Controls when the system allows a trader to open a position in the
+    # opposite direction on the same pair. "simple" mode uses a flat hour
+    # threshold. "smart" mode computes a composite score from regime change,
+    # TA signal shift, MTF alignment, and position age.
+    flip_gate_mode: str = Field(default="smart", pattern="^(simple|smart)$",
+        description="'simple' = flat hour threshold; 'smart' = composite score from regime/TA/MTF/age")
+    flip_simple_age_hours: float = Field(default=4.0, ge=0.5, le=168.0,
+        description="Hours after which flip is allowed in 'simple' mode. Set to 0 to disable entirely.")
+    flip_score_threshold: float = Field(default=50.0, ge=0.0, le=100.0,
+        description="Minimum composite score (0-100) to allow a flip in 'smart' mode. 50 = moderate confluence needed.")
+    flip_regime_weight: float = Field(default=40.0, ge=0.0, le=100.0,
+        description="Points awarded when the GMM regime label changed since the position was opened.")
+    flip_ta_weight: float = Field(default=30.0, ge=0.0, le=100.0,
+        description="Max points when current TA signal opposes the existing position's direction.")
+    flip_mtf_weight: float = Field(default=20.0, ge=0.0, le=100.0,
+        description="Points when higher timeframe trend aligns with the intended flip direction.")
+    flip_age_weight: float = Field(default=10.0, ge=0.0, le=100.0,
+        description="Points awarded based on position age relative to an 8h baseline.")
 
 
 
@@ -428,6 +452,7 @@ class TelegramSettingsModel(BaseModel):
 
 _runtime_risk_limits: Optional[RiskLimits] = None
 _runtime_trading_prefs: Optional[TradingPreferences] = None
+_runtime_trading_prefs_before: Optional[TradingPreferences] = None
 _runtime_trading_gates: Optional[TradingGates] = None
 _settings_loaded = False
 
@@ -474,7 +499,7 @@ async def _save_setting(key: str, value: dict):
 
 async def _load_all_settings():
     """Load risk limits, trading prefs and Telegram config from DB, fall back to defaults."""
-    global _runtime_risk_limits, _runtime_trading_prefs, _runtime_trading_gates, _settings_loaded
+    global _runtime_risk_limits, _runtime_trading_prefs, _runtime_trading_gates, _settings_loaded, _runtime_trading_prefs_before
 
     if _settings_loaded:
         return
@@ -519,6 +544,7 @@ async def _load_all_settings():
             logger.warning(f"Failed to apply Telegram settings: {e}")
 
     _settings_loaded = True
+    _runtime_trading_prefs_before = _runtime_trading_prefs
 
 
 def _apply_telegram_config(model: TelegramSettingsModel) -> None:
@@ -653,7 +679,21 @@ async def update_trading_prefs(req: TradingPreferencesUpdateRequest):
     """Update trading preferences (persisted to DB)."""
     global _runtime_trading_prefs
     _runtime_trading_prefs = TradingPreferences(**req.model_dump())
-    await _save_setting("trading_prefs", req.model_dump())
+    payload = req.model_dump()
+    await _save_setting("trading_prefs", payload)
+
+    # Auto-sync paper DB when switching accumulation from live → paper
+    if not payload.get("accumulation_live_enabled", False):
+        prev = _runtime_trading_prefs_before
+        if prev is not None and prev.accumulation_live_enabled:
+            try:
+                from app.services.accumulation_service import accumulation_service
+                await accumulation_service.sync_live_to_paper()
+                logger.info("Accumulation switched to paper — auto-synced DB from Hyperliquid")
+            except Exception as _sync_err:
+                logger.warning(f"Accumulation live→paper sync failed (non-fatal): {_sync_err}")
+    _runtime_trading_prefs_before = _runtime_trading_prefs
+
     return _runtime_trading_prefs
 
 
@@ -674,11 +714,38 @@ async def update_trading_gates(req: TradingGatesUpdateRequest):
     global _runtime_trading_gates
     _runtime_trading_gates = TradingGates(**req.model_dump())
     payload = req.model_dump()
+
+    # ── Auto-clear circuit breaker ──────────────────────────────────────────
+    # If the user is manually raising max_daily_fees_pct and min_entry_confidence
+    # is locked at 1.0 by the circuit breaker, restore it so trades can proceed.
+    # The autopilot re-evaluates the breaker on its next cycle anyway, so this
+    # just gives the user a way to override a too-aggressive breaker.
+    _new_fee_budget = payload.get("max_daily_fees_pct", 0.5)
+    _current_conf = payload.get("min_entry_confidence", 0.6)
+    if _current_conf >= 1.0 and _new_fee_budget > 0.5:
+        _restored_conf = 0.60
+        payload["min_entry_confidence"] = _restored_conf
+        _runtime_trading_gates.min_entry_confidence = _restored_conf
+        logger.info(
+            f"Circuit breaker auto-cleared: max_daily_fees_pct={_new_fee_budget}%, "
+            f"min_entry_confidence restored to {_restored_conf}"
+        )
+        # Disable autopilot so it doesn't re-activate the breaker on its next cycle
+        try:
+            from app.services.gate_autopilot import gate_autopilot
+            if gate_autopilot.enabled:
+                await gate_autopilot.set_enabled(False)
+                logger.info("Autopilot disabled after circuit breaker manual override")
+        except Exception:
+            pass
+
+    logger.info(f"Updating trading gates: max_daily_fees_pct={payload.get('max_daily_fees_pct')}, flip_gate_mode={payload.get('flip_gate_mode')}")
     await _save_setting("trading_gates", payload)
     # Arrr, stash the captain's preferences so the autopilot knows whose seas it's sailing.
     # Without this the BALANCED regime always resets to factory defaults,
     # making every manual save pointless — the 30-min cycle undoes the lot.
     await _save_setting("trading_gates_user_baseline", payload)
+    logger.info(f"Trading gates saved successfully")
     return _runtime_trading_gates
 
 

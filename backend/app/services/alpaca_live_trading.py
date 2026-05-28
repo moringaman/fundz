@@ -36,7 +36,7 @@ class AlpacaLiveTradingService:
     # ── Fee ────────────────────────────────────────────────────────────
 
     @classmethod
-    def fee_rate_for(cls, symbol: str) -> float:
+    def fee_rate_for(cls, symbol: str, venue: str = "alpaca") -> float:  # noqa: ARG003
         return cls.DEFAULT_FEE_RATE
 
     # ── Orders ─────────────────────────────────────────────────────────
