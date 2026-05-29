@@ -25,40 +25,29 @@ Railway dashboard → New → Database → Postgres. This auto-sets `DATABASE_UR
 
 Set root directory to `backend/`. Railway auto-detects the Python Dockerfile.
 
-#### Required Environment Variables
+#### Backend Environment Variables
 
 | Variable | Source | Notes |
 |----------|--------|-------|
 | `DATABASE_URL` | Railway Postgres | Auto-set by plugin |
-| `CLERK_SECRET_KEY` | Clerk Dashboard → API Keys | Secret key |
-| `CLERK_PUBLISHABLE_KEY` | Clerk Dashboard → API Keys | Public key |
-| `CLERK_JWKS_URL` | Clerk | `https://<domain>.clerk.accounts.dev/.well-known/jwks.json` |
+| `CLERK_SECRET_KEY` | Clerk Dashboard → API Keys | Secret key for JWT validation |
+| `CLERK_JWKS_URL` | Clerk | `https://divine-barnacle-59.clerk.accounts.dev/.well-known/jwks.json` |
 | `CREDENTIAL_ENCRYPTION_KEY` | Self-generated | `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
 | `REDIS_URL` | Railway Redis (optional) | For caching |
 | `OPENROUTER_API_KEY` | OpenRouter | Fallback if not in credential store |
 | `LLM_PROVIDER` | You | `openrouter` (default) |
 | `LLM_MODEL` | You | `openai/gpt-4o-mini` (default) |
 
-#### Optional Variables
-
-| Variable | Notes |
-|----------|-------|
-| `MAIL_SERVER_API_KEY` | Email reports (Resend/Mailgun) |
-| `MAIL_TO_ADDRESS` | Report recipient |
-| `MAIL_FROM_ADDRESS` | Sender |
-| `PHEMEX_API_KEY` / `PHEMEX_API_SECRET` | Fallback if not in credential store |
-| `HYPERLIQUID_WALLET_ADDRESS` / `HYPERLIQUID_WALLET_KEY` | Fallback |
-
 ### 4. Deploy Frontend
 
 Set root directory to `frontend/`. Railway auto-detects the Node+Dockerfile.
 
-#### Required Environment Variables
+#### Frontend Environment Variables
 
 | Variable | Value |
 |----------|-------|
 | `BACKEND_HOST` | `backend.railway.internal` |
-| `VITE_CLERK_PUBLISHABLE_KEY` | Same as backend's CLERK_PUBLISHABLE_KEY |
+| `VITE_CLERK_PUBLISHABLE_KEY` | Same as Clerk publishable key (starts `pk_`) |
 | `VITE_API_URL` | `/api` (proxied via nginx) |
 
 ### 5. Configure Clerk

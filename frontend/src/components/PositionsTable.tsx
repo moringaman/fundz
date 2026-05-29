@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import axios from 'axios';
+import api from '../lib/api';
 import styled from 'styled-components';
 
 interface Position {
@@ -255,7 +255,7 @@ export const PositionsTableComponent: React.FC = () => {
   // Load current mode once on mount (and re-check every 60s)
   useEffect(() => {
     const checkMode = () =>
-      axios.get('/api/settings').then((r) => {
+      api.get('settings').then((r) => {
         setIsPaper(r.data?.trading?.paper_trading_default ?? true);
       }).catch(() => {});
     checkMode();
@@ -265,8 +265,8 @@ export const PositionsTableComponent: React.FC = () => {
 
   const fetchPositions = useCallback(async () => {
     try {
-      const url = isPaper ? '/api/paper/positions' : '/api/trading/positions';
-      const response = await axios.get(url);
+      const url = isPaper ? 'paper/positions' : 'trading/positions';
+      const response = await api.get(url);
       const data = response.data;
       setPositions(Array.isArray(data) ? data : []);
       setError(null);

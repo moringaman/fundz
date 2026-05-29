@@ -7,7 +7,7 @@
  */
 
 import React, { useState, useEffect, useCallback } from 'react';
-import axios from 'axios';
+import api from '../lib/api';
 
 interface LiveStatus {
   mode: 'live' | 'paper';
@@ -26,7 +26,7 @@ export const LiveModeBanner: React.FC = () => {
 
   const fetchStatus = useCallback(async () => {
     try {
-      const res = await axios.get('/api/live/status');
+      const res = await api.get('live/status');
       setStatus(res.data);
     } catch {
       // Silently fail — may be in paper mode or backend down
@@ -42,7 +42,7 @@ export const LiveModeBanner: React.FC = () => {
   const handleSync = async () => {
     setSyncing(true);
     try {
-      await axios.post('/api/live/sync');
+      await api.post('live/sync');
       setLastSync(new Date());
       await fetchStatus();
     } catch {
@@ -55,7 +55,7 @@ export const LiveModeBanner: React.FC = () => {
   const handleEmergencyStop = async () => {
     setStopping(true);
     try {
-      await axios.post('/api/live/emergency-stop');
+      await api.post('live/emergency-stop');
       await fetchStatus();
     } catch {
       //
