@@ -19,4 +19,12 @@ ENV BACKEND_HOST=phemex-ai-trader-backend
 
 EXPOSE 3000
 
-CMD ["/bin/sh", "-c", "envsubst '${BACKEND_HOST}' < /etc/nginx/templates/default.conf.template > /etc/nginx/conf.d/default.conf && exec nginx -g 'daemon off;'"]
+# Runtime entrypoint: inject env vars into env.js (for Clerk publishable key, etc.)
+# then start nginx. Vite vars are baked at build time — this allows Railway
+# to inject VITE_CLERK_PUBLISHABLE_KEY at deploy time instead.
+CMD ["/bin/sh", "-c", "\
+  echo \"window.__ENV = {\" > /usr/share/nginx/html/env.js && \
+  echo \"  VITE_CLERK_PUBLISHABLE_KEY: '${VITE_CLERK_PUBLISHABLE_KEY}'\",\" >> /usr/share/nginx/html/env.js && \
+  echo \"};\" >> /usr/share/nginx/html/env.js && \
+  envsubst '${BACKEND_HOST}' < /etc/nginx/templates/default.conf.template > /etc/nginx/conf.d/default.conf && \
+  exec nginx -g 'daemon off;'"]

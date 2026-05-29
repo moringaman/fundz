@@ -1933,7 +1933,7 @@ class AgentScheduler:
                 )
                 daily_fees_paid = float(result.scalar_one_or_none() or 0.0)
 
-            capital_base = self._total_capital or 50_000.0
+            capital_base = 50_000.0  # fixed baseline — fee budget should not swing with P&L
             daily_fees_pct = (daily_fees_paid / capital_base) * 100 if capital_base > 0 else 0.0
             budget_used_ratio = (daily_fees_pct / max_daily_fees_pct) if max_daily_fees_pct > 0 else 0.0
 

@@ -20,7 +20,11 @@ const queryClient = new QueryClient({
 
 setQueryClient(queryClient);
 
-const PUBLISHABLE_KEY = import.meta.env.VITE_CLERK_PUBLISHABLE_KEY || '';
+// Read Clerk publishable key: runtime injection (Railway) first, Vite env (local dev) fallback
+const PUBLISHABLE_KEY =
+  window.__ENV?.VITE_CLERK_PUBLISHABLE_KEY ||
+  import.meta.env.VITE_CLERK_PUBLISHABLE_KEY ||
+  '';
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
