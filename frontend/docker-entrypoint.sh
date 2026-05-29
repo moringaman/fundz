@@ -9,9 +9,9 @@ window.__ENV = {
 };
 EOF
 
-# BACKEND_HOST: Railway service name (e.g. "backend.railway.internal") or public domain
-# BACKEND_PORT: ":8000" for internal DNS, "" (empty) for public Railway domains
-export BACKEND_PORT="${BACKEND_PORT:-:8000}"
+# BACKEND_HOST: Railway service's public domain (e.g. fundz-api-production.up.railway.app)
+# or internal DNS (e.g. backend.railway.internal). Internal needs BACKEND_PORT=:8000.
+export BACKEND_PORT="${BACKEND_PORT:-}"
 
 envsubst '$BACKEND_HOST $BACKEND_PORT' < /etc/nginx/templates/default.conf.template > /etc/nginx/conf.d/default.conf
 exec nginx -g 'daemon off;'
