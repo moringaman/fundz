@@ -482,6 +482,10 @@ async def lifespan(app: FastAPI):
         ("agent_metric_records", "regime_stats", "ALTER TABLE agent_metric_records ADD COLUMN regime_stats JSON DEFAULT '{}'::json"),
         ("traders", "config", "ALTER TABLE traders ADD COLUMN config JSON DEFAULT '{}'::json"),
         ("traders", "performance_metrics", "ALTER TABLE traders ADD COLUMN performance_metrics JSON DEFAULT '{}'::json"),
+        ("agents", "is_pnl_suspended", "ALTER TABLE agents ADD COLUMN is_pnl_suspended BOOLEAN DEFAULT FALSE"),
+        ("agents", "pnl_suspended_reason", "ALTER TABLE agents ADD COLUMN pnl_suspended_reason TEXT"),
+        ("agents", "pnl_suspended_at", "ALTER TABLE agents ADD COLUMN pnl_suspended_at TIMESTAMP WITH TIME ZONE"),
+        ("strategy_insight_records", "tenant_id", "ALTER TABLE strategy_insight_records ADD COLUMN tenant_id VARCHAR(255)"),
     ]
     for table, column, ddl in _migrations:
         try:

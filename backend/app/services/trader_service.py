@@ -409,7 +409,7 @@ Review your portfolio of agents. You may propose actions:
 - "create_agent": Create a new agent (name, strategy_type, trading_pairs, stop_loss_pct, take_profit_pct, venue)
 - "disable_agent": Disable an underperforming agent (agent_id, reason)
 - "enable_agent": Re-enable a previously disabled agent (agent_id, reason)
-- "adjust_params": Adjust parameters of an existing agent (agent_id, params: {stop_loss_pct, take_profit_pct, trailing_stop_pct, allocation_percentage, venue})
+- "adjust_params": Adjust parameters of an existing agent (agent_id, params: {{stop_loss_pct, take_profit_pct, trailing_stop_pct, allocation_percentage, venue}})
 
 Rules:
 - Maximum 4 agents per trader
