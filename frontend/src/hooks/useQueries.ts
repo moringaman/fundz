@@ -11,7 +11,7 @@ export function setQueryClient(qc: QueryClient) {
 }
 
 /** Axios helper that returns response.data and throws on non-2xx. */
-function safeGet<T = unknown>(path: string): Promise<T> {
+function safeGet<T = any>(path: string): Promise<T> {
   return api.get(path).then(r => r.data as T);
 }
 
