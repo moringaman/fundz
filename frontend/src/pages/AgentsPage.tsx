@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { Play } from 'lucide-react';
 import { useAppSelector } from '../store/hooks';
-import { automationApi } from '../lib/api';
+import api, { automationApi } from '../lib/api';
 import { useAgents, useAutomationMetrics, useTraders, useStrategies } from '../hooks/useQueries';
 import { timeAgo } from '../utils/timeAgo';
 import { usePagination, Paginator } from '../components/common/Paginator';
@@ -48,21 +48,16 @@ export function AgentsPage() {
 
   const fetchGridSummary = useCallback(async (agentId: string) => {
     try {
-      const res = await fetch(`/api/grid/${agentId}/summary`);
-      if (res.ok) {
-        const data = await res.json();
-        setGridSummaries(prev => ({ ...prev, [agentId]: data }));
-      }
+      const res = await api.get(`grid/${agentId}/summary`);
+      setGridSummaries(prev => ({ ...prev, [agentId]: res.data }));
     } catch { /* ignore */ }
   }, []);
 
   const cancelGrid = useCallback(async (agentId: string) => {
     setCancellingGrid(agentId);
     try {
-      const res = await fetch(`/api/grid/${agentId}/cancel`, { method: 'POST' });
-      if (res.ok) {
-        await fetchGridSummary(agentId);
-      }
+      await api.post(`grid/${agentId}/cancel`);
+      await fetchGridSummary(agentId);
     } catch { /* ignore */ }
     setCancellingGrid(null);
   }, [fetchGridSummary]);
@@ -134,11 +129,7 @@ export function AgentsPage() {
 
   const createAgent = async () => {
     try {
-      await fetch('/api/agents', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(formData),
-      });
+      await api.post('agents', formData);
       setShowForm(false);
       setFormData({
         name: '',
@@ -161,11 +152,7 @@ export function AgentsPage() {
 
   const updateAgent = async (id: string) => {
     try {
-      await fetch(`/api/agents/${id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(formData),
-      });
+      await api.put(`agents/${id}`, formData);
       setEditingId(null);
       refetchAgents();
     } catch (error) {
@@ -175,7 +162,7 @@ export function AgentsPage() {
 
   const toggleAgent = async (id: string) => {
     try {
-      await fetch(`/api/agents/${id}/toggle`, { method: 'POST' });
+      await api.post(`agents/${id}/toggle`);
       refetchAgents();
     } catch (error) {
       console.error('Failed to toggle agent:', error);
@@ -184,7 +171,7 @@ export function AgentsPage() {
 
   const deleteAgent = async (id: string) => {
     try {
-      await fetch(`/api/agents/${id}`, { method: 'DELETE' });
+      await api.delete(`agents/${id}`);
       refetchAgents();
     } catch (error) {
       console.error('Failed to delete agent:', error);
@@ -214,9 +201,8 @@ export function AgentsPage() {
     }, 2800);
 
     try {
-      const res = await fetch(`/api/agents/${agentId}/backtest?symbol=${symbol}&interval=${timeframe}`, { method: 'POST' });
-      const data = await res.json();
-      setBacktestResults((prev) => ({ ...prev, [agentId]: data }));
+      const res = await api.post(`agents/${agentId}/backtest?symbol=${symbol}&interval=${timeframe}`);
+      setBacktestResults((prev) => ({ ...prev, [agentId]: res.data }));
     } catch (error) {
       console.error('Failed to run backtest:', error);
     } finally {
@@ -237,33 +223,19 @@ export function AgentsPage() {
     setWalkForwardError({});
     setWalkForwardProgress(prev => ({ ...prev, [agentId]: { current: 0, total: 12 } }));
     try {
-      const res = await fetch('/api/backtest/walk-forward', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          symbol,
-          interval: timeframe,
-          strategy,
-          n_windows: 6,
-          mode: 'anchored',
-          candle_limit: 5000,
-          agent_id: agentId,
-        }),
+      setWalkForwardProgress(prev => ({ ...prev, [agentId]: { current: 4, total: 12 } }));
+      const res = await api.post('backtest/walk-forward', {
+        symbol,
+        interval: timeframe,
+        strategy,
+        n_windows: 6,
+        mode: 'anchored',
+        candle_limit: 5000,
+        agent_id: agentId,
       });
       
-      setWalkForwardProgress(prev => ({ ...prev, [agentId]: { current: 4, total: 12 } }));
-      
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        const errorMsg = err.detail || err.message || 'Walk-forward analysis';
-        console.error('Walk-forward failed:', err);
-        setWalkForwardError(prev => ({ ...prev, [agentId]: errorMsg }));
-        return;
-      }
-      
       setWalkForwardProgress(prev => ({ ...prev, [agentId]: { current: 10, total: 12 } }));
-      const data = await res.json();
-      setWalkForwardResults((prev) => ({ ...prev, [agentId]: data.walk_forward }));
+      setWalkForwardResults((prev) => ({ ...prev, [agentId]: res.data.walk_forward }));
       setWalkForwardProgress(prev => ({ ...prev, [agentId]: { current: 12, total: 12 } }));
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : 'Failed to run walk-forward';
@@ -294,37 +266,23 @@ export function AgentsPage() {
     setSensitivityError({});
     setSensitivityProgress(prev => ({ ...prev, [agentId]: { current: 0, total: 25 } }));
     try {
-      const res = await fetch('/api/backtest/sensitivity', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          symbol,
-          interval: timeframe,
-          strategy,
-          axis_x: 'stop_loss',
-          axis_y: 'take_profit',
-          values_x: [0.01, 0.015, 0.02, 0.025, 0.03],
-          values_y: [0.04, 0.05, 0.06, 0.075, 0.10],
-          chosen_x: chosenStopLoss,
-          chosen_y: chosenTakeProfit,
-          candle_limit: 5000,
-          agent_id: agentId,
-        }),
+      setSensitivityProgress(prev => ({ ...prev, [agentId]: { current: 10, total: 25 } }));
+      const res = await api.post('backtest/sensitivity', {
+        symbol,
+        interval: timeframe,
+        strategy,
+        axis_x: 'stop_loss',
+        axis_y: 'take_profit',
+        values_x: [0.01, 0.015, 0.02, 0.025, 0.03],
+        values_y: [0.04, 0.05, 0.06, 0.075, 0.10],
+        chosen_x: chosenStopLoss,
+        chosen_y: chosenTakeProfit,
+        candle_limit: 5000,
+        agent_id: agentId,
       });
       
-      setSensitivityProgress(prev => ({ ...prev, [agentId]: { current: 10, total: 25 } }));
-      
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        const errorMsg = err.detail || err.message || 'Sensitivity analysis';
-        console.error('Sensitivity failed:', err);
-        setSensitivityError(prev => ({ ...prev, [agentId]: errorMsg }));
-        return;
-      }
-      
       setSensitivityProgress(prev => ({ ...prev, [agentId]: { current: 20, total: 25 } }));
-      const data = await res.json();
-      setSensitivityResults((prev) => ({ ...prev, [agentId]: data }));
+      setSensitivityResults((prev) => ({ ...prev, [agentId]: res.data }));
       setSensitivityProgress(prev => ({ ...prev, [agentId]: { current: 25, total: 25 } }));
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : 'Failed to run sensitivity';

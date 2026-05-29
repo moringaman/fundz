@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Key, Brain, Save, Eye, EyeOff, Check, RefreshCw, Info, AlertTriangle, TrendingUp, Shield, Mail, Send, Bell, Wallet, Plus, Minus, MessageCircle, Volume2, SlidersHorizontal, Zap, ZapOff, Activity, PlayCircle } from 'lucide-react';
 import { useSettings } from '../hooks/useQueries';
-import { settingsApi, paperApi } from '../lib/api';
+import api, { settingsApi, paperApi } from '../lib/api';
 import { notificationService, type NotificationPreferences } from '../lib/notifications';
 import { SoundSettings } from '../components/settings/SoundSettings';
 
@@ -1807,7 +1807,7 @@ export function SettingsPage() {
             onClick={async () => {
               setSendingEmail(true);
               try {
-                const resp = await fetch('/api/settings/test-email', { method: 'POST' });
+                const resp = await api.post('settings/test-email');
                 const data = await resp.json();
                 if (resp.ok) {
                   showToast(data.message || 'Test email sent!', 'success');
