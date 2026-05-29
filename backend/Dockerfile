@@ -11,7 +11,6 @@ COPY . .
 
 EXPOSE 8000
 
-# Listen on 8000 always (internal service-to-service). Railway's $PORT is for
-# public health checks and goes through the platform gateway — internal
-# networking between services uses the fixed port.
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Railway assigns $PORT dynamically (typically 8080). Use it so the platform
+# health check can reach the app. Default to 8000 for local Docker Compose.
+CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}

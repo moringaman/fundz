@@ -1,8 +1,13 @@
 import axios from 'axios';
 
-const API_BASE_URL = 
-  (typeof window !== 'undefined' && window.__ENV?.VITE_API_URL) ||
-  import.meta.env.VITE_API_URL || '';
+const API_BASE_URL = (() => {
+  const raw =
+    (typeof window !== 'undefined' && window.__ENV?.VITE_API_URL) ||
+    import.meta.env.VITE_API_URL || '';
+  if (!raw) return '';
+  // Ensure base URL ends with /api (backend routes are all under /api)
+  return raw.replace(/\/?$/, '/api').replace(/\/api\/api$/, '/api');
+})();
 
 const api = axios.create({
   baseURL: API_BASE_URL,
