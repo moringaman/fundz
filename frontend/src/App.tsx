@@ -133,10 +133,15 @@ function App() {
       <Routes>
         <Route path="/sign-in" element={<SignInPage />} />
         <Route path="/sign-up" element={<SignUpPage />} />
+        <Route path="/dashboard" element={
+          <SignedIn><AppRoutes /></SignedIn>
+        } />
+        <Route path="/*" element={
+          <SignedIn><AppRoutes /></SignedIn>
+        } />
       </Routes>
 
       <SignedIn>
-        <AppRoutes />
         <OnboardingOverlay
           hasLlm={onboarding.hasLlm}
           hasExchange={onboarding.hasExchange}
