@@ -16,16 +16,21 @@ export function useOnboarding() {
 
   const check = useCallback(async () => {
     try {
-      const [llm, exch] = await Promise.all([
-        settingsApi.listLlmCredentials().catch(() => ({}) as Record<string, any>),
-        settingsApi.listExchangeCredentials().catch(() => ({}) as Record<string, any>),
+      const [llmResp, exchResp] = await Promise.allSettled([
+        settingsApi.listLlmCredentials(),
+        settingsApi.listExchangeCredentials(),
       ]);
-      const hasLlm = Object.values(llm || {}).some(
+      // On 401 (not authenticated yet) we assume credentials may exist
+      // so the onboarding doesn't lock the user out.
+      const llm = llmResp.status === 'fulfilled' ? llmResp.value as Record<string, any> : {};
+      const exch = exchResp.status === 'fulfilled' ? exchResp.value as Record<string, any> : {};
+      const hadApiError = llmResp.status === 'rejected' || exchResp.status === 'rejected';
+      const hasLlm = hadApiError || Object.values(llm || {}).some(
         (v: any) => v?.has_key || v?.has_endpoint
       );
-      const hasExchange = Object.keys(exch || {}).length > 0 && Object.values(exch as Record<string, any[]>).some(
+      const hasExchange = hadApiError || (Object.keys(exch || {}).length > 0 && Object.values(exch as Record<string, any[]>).some(
         arr => Array.isArray(arr) && arr.some((e: any) => e?.has_value)
-      );
+      ));
       setState({ hasLlm, hasExchange, loading: false });
     } catch {
       setState(s => ({ ...s, loading: false }));
