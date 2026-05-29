@@ -20,8 +20,8 @@ from app.config import settings
 
 
 # Context var so route handlers can set the current user per-request without
-# refactoring every service method.  Falls back to get_current_user_id().
-_current_user_id: ContextVar[str] = ContextVar("_current_user_id", default=get_current_user_id())
+# refactoring every service method.  Falls back to "default-user".
+_current_user_id: ContextVar[str] = ContextVar("_current_user_id", default="default-user")
 
 def set_current_user_id(uid: str) -> None:
     _current_user_id.set(uid)
