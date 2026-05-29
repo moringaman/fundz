@@ -1807,13 +1807,8 @@ export function SettingsPage() {
             onClick={async () => {
               setSendingEmail(true);
               try {
-                const resp = await api.post('settings/test-email');
-                const data = await resp.json();
-                if (resp.ok) {
-                  showToast(data.message || 'Test email sent!', 'success');
-                } else {
-                  showToast(data.detail || 'Email failed', 'error');
-                }
+                const data = await api.post('settings/test-email').then(r => r.data);
+                showToast(data.message || 'Test email sent!', 'success');
               } catch {
                 showToast('Failed to send test email', 'error');
               } finally {
