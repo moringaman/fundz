@@ -1,14 +1,13 @@
 #!/bin/sh
-# Generate env.js with runtime environment variables.
+# Generate env.js with runtime environment variables for Railway.
 cat > /usr/share/nginx/html/env.js << EOF
 window.__ENV = {
   VITE_CLERK_PUBLISHABLE_KEY: "$VITE_CLERK_PUBLISHABLE_KEY",
+  VITE_API_URL: "$VITE_API_URL",
 };
 EOF
 
-# BACKEND_HOST: Railway public domain (e.g. fundz-api-production.up.railway.app)
-# On Railway, the gateway redirects HTTP→HTTPS, so proxy over HTTPS.
-# Use empty BACKEND_PORT for public domains, or :8000 for internal DNS.
+# BACKEND_HOST etc. only needed if using nginx proxy (currently unused)
 export BACKEND_PORT="${BACKEND_PORT:-}"
 export BACKEND_PROTO="${BACKEND_PROTO:-https}"
 
