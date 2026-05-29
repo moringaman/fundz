@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user_id
 from sqlalchemy import select
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 from datetime import datetime, timezone
 from collections import defaultdict
 
@@ -80,6 +80,15 @@ async def get_paper_status(db: AsyncSession = Depends(get_db)):
                 {"asset": b.asset, "available": b.available, "locked": b.locked}
                 for b in balances
             ]
+        }
+    except IntegrityError as e:
+        logger.warning(f"Paper trading status FK violation (seeding before user exists): {e}")
+        await db.rollback()
+        return {
+            "enabled": False,
+            "balances": [],
+            "initializing": True,
+            "message": "Default balances pending user creation"
         }
     except SQLAlchemyError as e:
         logger.error(f"Database error in paper trading status: {e}")
