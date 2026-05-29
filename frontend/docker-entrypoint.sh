@@ -7,9 +7,13 @@ window.__ENV = {
 };
 EOF
 
-# BACKEND_HOST etc. only needed if using nginx proxy (currently unused)
 export BACKEND_PORT="${BACKEND_PORT:-}"
 export BACKEND_PROTO="${BACKEND_PROTO:-https}"
 
-envsubst '$BACKEND_HOST $BACKEND_PORT $BACKEND_PROTO' < /etc/nginx/templates/default.conf.template > /etc/nginx/conf.d/default.conf
+# Substitute placeholders (double-underscore delimited to avoid conflicting with
+# nginx $variables) so that proxy_pass uses a literal URL — no resolver needed.
+sed -e "s|__BACKEND_PROTO__|${BACKEND_PROTO}|g"      \
+    -e "s|__BACKEND_HOST__|${BACKEND_HOST}|g"         \
+    -e "s|__BACKEND_PORT__|${BACKEND_PORT}|g"         \
+    /etc/nginx/templates/default.conf.template > /etc/nginx/conf.d/default.conf
 exec nginx -g 'daemon off;'

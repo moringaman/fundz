@@ -101,11 +101,7 @@ export function useUpdateStrategy() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ id, data }: { id: string; data: Record<string, unknown> }) =>
-      fetch(`/api/strategies/${id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(data),
-      }).then((r) => { if (!r.ok) throw new Error('Update failed'); return r.json(); }),
+      api.put(`strategies/${id}`, data).then(r => r.data),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['strategies'] }),
   });
 }
@@ -114,10 +110,7 @@ export function useResetStrategy() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (id: string) =>
-      fetch(`/api/strategies/${id}/reset`, { method: 'POST' }).then((r) => {
-        if (!r.ok) throw new Error('Reset failed');
-        return r.json();
-      }),
+      api.post(`strategies/${id}/reset`).then(r => r.data),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['strategies'] }),
   });
 }

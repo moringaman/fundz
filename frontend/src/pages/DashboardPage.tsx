@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { ArrowUpRight, ArrowDownRight, Minus, HelpCircle, RotateCcw, Wallet, Users, Shield, Zap, ZapOff } from 'lucide-react';
 import { useAppSelector, useAppDispatch } from '../store/hooks';
 import { setSelectedSymbol } from '../store/slices/marketSlice';
-import { paperApi } from '../lib/api';
+import api, { paperApi } from '../lib/api';
 import { formatPrice } from '../utils/formatPrice';
 import {
   usePaperStatus,
@@ -654,7 +654,7 @@ export function DashboardPage() {
                   onClick={async () => {
                     if (window.confirm('Reset all trading data? This will clear all trades and restore default balances.')) {
                       try {
-                        await fetch('/api/paper/reset', { method: 'POST' });
+                        await api.post('paper/reset');
                         await refetchPnl();
                         await refetchStatus();
                       } catch (err) {
