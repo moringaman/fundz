@@ -998,6 +998,7 @@ class StrategyInsightRecord(Base):
     __tablename__ = "strategy_insight_records"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String(255), nullable=True, index=True)
     strategy_type = Column(String(64), nullable=False)   # matches registry.yaml key
     is_paper = Column(Boolean, nullable=False, default=True)
     # Confidence multiplier: +0.10 (good), -0.20 (poor), 0.0 (neutral)

@@ -359,6 +359,20 @@ class TechnicalAnalyst:
             api_secret=settings.phemex_api_secret,
             testnet=settings.phemex_testnet
         )
+
+    def _empty_report(self, symbol: str) -> TechnicalAnalystReport:
+        """Return a safe empty report when no market data is available."""
+        return TechnicalAnalystReport(
+            timestamp=datetime.now(),
+            symbol=symbol,
+            current_price=0.0,
+            price_levels=PriceLevels(support=[], resistance=[], pivot_points={}, fibonacci_retracements={}, fibonacci_extensions={}),
+            patterns=[],
+            multi_timeframe=None,
+            overall_signal="neutral",
+            confidence=0.0,
+            key_observations=["Insufficient market data — waiting for candles"],
+        )
     
     async def analyze(self, symbol: str = "BTCUSDT", timeframe: str = "1h") -> TechnicalAnalystReport:
         try:
