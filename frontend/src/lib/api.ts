@@ -35,6 +35,17 @@ api.interceptors.request.use(async (config) => {
   return config;
 });
 
+// Redirect to sign-in on 401 (e.g. expired or missing session token)
+api.interceptors.response.use(
+  r => r,
+  err => {
+    if (err.response?.status === 401 && !window.location.pathname.startsWith('/sign-')) {
+      window.location.href = '/sign-in';
+    }
+    return Promise.reject(err);
+  },
+);
+
 export const marketApi = {
   getKlines: (symbol: string, interval = '1h', limit = 100) =>
     api.get(`market/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`),
