@@ -19,7 +19,9 @@ const PONG_TIMEOUT_MS = 10_000;
 function getWsUrl(): string {
   const apiUrl = import.meta.env.VITE_API_URL || '';
   if (apiUrl.startsWith('http')) {
-    return apiUrl.replace(/^http/, 'ws') + '/api/ws/market';
+    // Strip trailing /api if present, then add /api/ws/market
+    const base = apiUrl.replace(/\/api\/?$/, '');
+    return base.replace(/^http(s?)/, 'ws$1') + '/api/ws/market';
   }
   const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
   return `${proto}://${window.location.host}/api/ws/market`;
