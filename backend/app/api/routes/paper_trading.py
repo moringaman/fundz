@@ -11,12 +11,20 @@ from datetime import datetime, timezone
 from collections import defaultdict
 
 from app.database import get_db
-from app.services.paper_trading import paper_trading
+from app.services.paper_trading import paper_trading, set_current_user_id
 from app.models import OrderSide, OrderStatus, Balance as PaperBalance
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/paper", tags=["paper_trading"])
+
+
+def _user_dep(user_id: Optional[str] = Depends(get_optional_user_id)) -> str:
+    """Set the context var so the service singleton finds the right user."""
+    uid = user_id or "default-user"
+    from app.services.paper_trading import set_current_user_id
+    set_current_user_id(uid)
+    return uid
 
 
 class OrderRequest(BaseModel):
@@ -128,7 +136,7 @@ async def reset_paper_trading():
 
 
 @router.get("/balance", response_model=List[BalanceResponse])
-async def get_paper_balance():
+async def get_paper_balance(_=Depends(_user_dep)):
     balances = await paper_trading.get_all_balances()
     return [
         BalanceResponse(asset=b.asset, available=b.available, locked=b.locked)
@@ -254,7 +262,7 @@ async def cancel_paper_order(order_id: str):
 
 
 @router.get("/orders")
-async def get_paper_orders(symbol: Optional[str] = None, limit: int = 50):
+async def get_paper_orders(symbol: Optional[str] = None, limit: int = 50, _=Depends(_user_dep)):
     orders = await paper_trading.get_orders(symbol=symbol, limit=limit)
     return [
         {
@@ -276,18 +284,18 @@ async def get_paper_orders(symbol: Optional[str] = None, limit: int = 50):
 
 
 @router.get("/closed-trades")
-async def get_closed_trades(symbol: Optional[str] = None, limit: int = 100):
+async def get_closed_trades(symbol: Optional[str] = None, limit: int = 100, _=Depends(_user_dep)):
     """Return FIFO-matched buy→sell round-trips with realised P&L."""
     return await paper_trading.get_closed_trades(symbol=symbol, limit=limit)
 
 
 @router.get("/positions")
-async def get_paper_positions(symbol: Optional[str] = None):
+async def get_paper_positions(symbol: Optional[str] = None, _=Depends(_user_dep)):
     return await paper_trading.get_positions_live(symbol)
 
 
 @router.get("/pnl")
-async def get_paper_pnl():
+async def get_paper_pnl(_=Depends(_user_dep)):
     data = await paper_trading.calculate_pnl()
     try:
         total = data.get("total_pnl", 0) or 0

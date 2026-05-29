@@ -2,6 +2,7 @@ from typing import Optional, List, Dict
 from datetime import datetime
 import uuid
 import logging
+from contextvars import ContextVar
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
@@ -17,6 +18,16 @@ from app.models import (
 from app.clients.phemex import PhemexClient
 from app.config import settings
 
+
+# Context var so route handlers can set the current user per-request without
+# refactoring every service method.  Falls back to get_current_user_id().
+_current_user_id: ContextVar[str] = ContextVar("_current_user_id", default=get_current_user_id())
+
+def set_current_user_id(uid: str) -> None:
+    _current_user_id.set(uid)
+
+def get_current_user_id() -> str:
+    return _current_user_id.get()
 
 class PatternEntryDeferred(Exception):
     def __init__(self, symbol: str, order_type: str, entry_price: float,
@@ -126,7 +137,8 @@ class PaperTradingService:
     # Balance
     # ------------------------------------------------------------------
 
-    async def get_all_balances(self, tenant_id: str = "default-user") -> List[PaperBalance]:
+    async def get_all_balances(self, tenant_id: str = None) -> List[PaperBalance]:
+        tenant_id = tenant_id or get_current_user_id()
         """Return all paper-trading balances for the given tenant (trading fund only)."""
         async with get_async_session() as db:
             result = await db.execute(
@@ -146,7 +158,7 @@ class PaperTradingService:
         async with get_async_session() as db:
             result = await db.execute(
                 select(PaperBalance).where(
-                    PaperBalance.user_id == "default-user",
+                    PaperBalance.user_id == get_current_user_id(),
                     PaperBalance.asset == asset,
                 )
             )
@@ -155,7 +167,7 @@ class PaperTradingService:
                 if amount < 0:
                     raise ValueError(f"No {asset} balance exists to withdraw from")
                 bal = PaperBalance(
-                    user_id="default-user",
+                    user_id=get_current_user_id(),
                     asset=asset,
                     available=amount,
                     locked=0.0,
@@ -230,7 +242,7 @@ class PaperTradingService:
                     async with get_async_session() as _pending_db:
                         _dup_check = await _pending_db.execute(
                             select(PaperOrder).where(
-                                PaperOrder.user_id == "default-user",
+                                PaperOrder.user_id == get_current_user_id(),
                                 PaperOrder.agent_id == agent_id,
                                 PaperOrder.symbol == symbol,
                                 PaperOrder.side == side,
@@ -246,7 +258,7 @@ class PaperTradingService:
                         else:
                             _pending = PaperOrder(
                                 id=str(uuid.uuid4()),
-                                user_id="default-user",
+                                user_id=get_current_user_id(),
                                 agent_id=agent_id,
                                 trader_id=trader_id,
                                 symbol=symbol,
@@ -285,14 +297,14 @@ class PaperTradingService:
             _quote = self.quote_currency(symbol)
             usdt_balance = await db.scalar(
                 select(PaperBalance).where(
-                    PaperBalance.user_id == "default-user",
+                    PaperBalance.user_id == get_current_user_id(),
                     PaperBalance.asset == _quote,
                     PaperBalance.fund_type != "accumulation",
                 )
             )
             if not usdt_balance:
                 usdt_balance = PaperBalance(
-                    user_id="default-user", asset=_quote, available=50000.0, locked=0.0
+                    user_id=get_current_user_id(), asset=_quote, available=50000.0, locked=0.0
                 )
                 db.add(usdt_balance)
                 await db.flush()
@@ -301,13 +313,13 @@ class PaperTradingService:
             base_asset = symbol.replace("USDT", "") if "USDT" in symbol else symbol
             base_balance = await db.scalar(
                 select(PaperBalance).where(
-                    PaperBalance.user_id == "default-user",
+                    PaperBalance.user_id == get_current_user_id(),
                     PaperBalance.asset == base_asset,
                 )
             )
             if not base_balance:
                 base_balance = PaperBalance(
-                    user_id="default-user", asset=base_asset, available=0.0, locked=0.0
+                    user_id=get_current_user_id(), asset=base_asset, available=0.0, locked=0.0
                 )
                 db.add(base_balance)
                 await db.flush()
@@ -320,7 +332,7 @@ class PaperTradingService:
 
             order = PaperOrder(
                 id=str(uuid.uuid4()),
-                user_id="default-user",
+                user_id=get_current_user_id(),
                 agent_id=agent_id,
                 trader_id=trader_id,
                 symbol=symbol,
@@ -345,7 +357,7 @@ class PaperTradingService:
                 # Check if closing an existing SHORT position first
                 short_position = await db.scalar(
                     select(PaperPosition).where(
-                        PaperPosition.user_id == "default-user",
+                        PaperPosition.user_id == get_current_user_id(),
                         PaperPosition.symbol == symbol,
                         PaperPosition.agent_id == agent_id,
                         PaperPosition.side == OrderSide.SELL,
@@ -393,7 +405,7 @@ class PaperTradingService:
                             return order
                         usdt_balance.available -= extra_cost
                         new_pos = PaperPosition(
-                            user_id="default-user",
+                            user_id=get_current_user_id(),
                             agent_id=agent_id,
                             symbol=symbol,
                             side=OrderSide.BUY,
@@ -423,7 +435,7 @@ class PaperTradingService:
 
                     position = await db.scalar(
                         select(PaperPosition).where(
-                            PaperPosition.user_id == "default-user",
+                            PaperPosition.user_id == get_current_user_id(),
                             PaperPosition.symbol == symbol,
                             PaperPosition.agent_id == agent_id,
                             PaperPosition.side == OrderSide.BUY,
@@ -449,7 +461,7 @@ class PaperTradingService:
                             position.trailing_stop_pct = trailing_stop_pct
                     else:
                         position = PaperPosition(
-                            user_id="default-user",
+                            user_id=get_current_user_id(),
                             agent_id=agent_id,
                             symbol=symbol,
                             side=OrderSide.BUY,
@@ -473,7 +485,7 @@ class PaperTradingService:
                 # Check if closing an existing LONG position first
                 long_position = await db.scalar(
                     select(PaperPosition).where(
-                        PaperPosition.user_id == "default-user",
+                        PaperPosition.user_id == get_current_user_id(),
                         PaperPosition.symbol == symbol,
                         PaperPosition.agent_id == agent_id,
                         PaperPosition.side == OrderSide.BUY,
@@ -531,7 +543,7 @@ class PaperTradingService:
                     if remaining_short_qty > 1e-12:
                         short_pos = await db.scalar(
                             select(PaperPosition).where(
-                                PaperPosition.user_id == "default-user",
+                                PaperPosition.user_id == get_current_user_id(),
                                 PaperPosition.symbol == symbol,
                                 PaperPosition.agent_id == agent_id,
                                 PaperPosition.side == OrderSide.SELL,
@@ -558,7 +570,7 @@ class PaperTradingService:
                                 short_pos.trailing_stop_pct = trailing_stop_pct
                         else:
                             short_pos = PaperPosition(
-                                user_id="default-user",
+                                user_id=get_current_user_id(),
                                 agent_id=agent_id,
                                 symbol=symbol,
                                 side=OrderSide.SELL,
@@ -581,12 +593,11 @@ class PaperTradingService:
             await db.commit()
             return order
 
-    async def get_orders(self, symbol: Optional[str] = None, limit: int = 50) -> List[PaperOrder]:
-        """Return paper trade order history for the default user."""
+    async def get_orders(self, symbol: Optional[str] = None, limit: int = 50, user_id: str = get_current_user_id()) -> List[PaperOrder]:
         async with get_async_session() as db:
             query = (
                 select(PaperOrder)
-                .where(PaperOrder.user_id == "default-user")
+                .where(PaperOrder.user_id == user_id)
                 .order_by(PaperOrder.created_at.desc())
                 .limit(limit)
             )
@@ -617,7 +628,7 @@ class PaperTradingService:
     async def get_positions(self, symbol: Optional[str] = None, agent_id: Optional[str] = None) -> List[PaperPosition]:
         """Return open paper trading positions, optionally filtered by symbol and/or agent."""
         async with get_async_session() as db:
-            query = select(PaperPosition).where(PaperPosition.user_id == "default-user")
+            query = select(PaperPosition).where(PaperPosition.user_id == get_current_user_id())
             if symbol:
                 query = query.where(PaperPosition.symbol == symbol)
             if agent_id:
@@ -744,7 +755,7 @@ class PaperTradingService:
         """
         async with get_async_session() as db:
             pos = await db.get(PaperPosition, position_id)
-            if not pos or pos.user_id != "default-user":
+            if not pos or pos.user_id != get_current_user_id():
                 return None
 
             if stop_loss_price is not ...:
@@ -798,7 +809,7 @@ class PaperTradingService:
         """
         async with get_async_session() as db:
             pos = await db.get(PaperPosition, position_id)
-            if not pos or pos.user_id != "default-user":
+            if not pos or pos.user_id != get_current_user_id():
                 return None
 
             symbol = pos.symbol
@@ -859,7 +870,7 @@ class PaperTradingService:
         async with get_async_session() as db:
             orders = await db.execute(
                 select(PaperOrder).where(
-                    PaperOrder.user_id == "default-user",
+                    PaperOrder.user_id == get_current_user_id(),
                     PaperOrder.agent_id == agent_id,
                     PaperOrder.symbol == symbol,
                     PaperOrder.status == OrderStatus.PENDING,
@@ -1096,14 +1107,14 @@ class PaperTradingService:
         async with get_async_session() as db:
             usdt_balance = await db.scalar(
                 select(PaperBalance).where(
-                    PaperBalance.user_id == "default-user",
+                    PaperBalance.user_id == get_current_user_id(),
                     PaperBalance.asset == _pend_quote,
                     PaperBalance.fund_type != "accumulation",
                 )
             )
             if not usdt_balance:
                 usdt_balance = PaperBalance(
-                    user_id="default-user", asset=_pend_quote, available=50000.0, locked=0.0
+                    user_id=get_current_user_id(), asset=_pend_quote, available=50000.0, locked=0.0
                 )
                 db.add(usdt_balance)
                 await db.flush()
@@ -1137,7 +1148,7 @@ class PaperTradingService:
             if side_str.upper() == "BUY":
                 short_pos = await db.scalar(
                     select(PaperPosition).where(
-                        PaperPosition.user_id == "default-user",
+                        PaperPosition.user_id == get_current_user_id(),
                         PaperPosition.symbol == order.symbol,
                         PaperPosition.agent_id == order.agent_id,
                         PaperPosition.side == OrderSide.SELL,
@@ -1155,7 +1166,7 @@ class PaperTradingService:
                     if remaining > 1e-12:
                         existing = await db.scalar(
                             select(PaperPosition).where(
-                                PaperPosition.user_id == "default-user",
+                                PaperPosition.user_id == get_current_user_id(),
                                 PaperPosition.symbol == order.symbol,
                                 PaperPosition.agent_id == order.agent_id,
                                 PaperPosition.side == OrderSide.BUY,
@@ -1166,7 +1177,7 @@ class PaperTradingService:
                         else:
                             db.add(PaperPosition(
                                 id=str(uuid.uuid4()),
-                                user_id="default-user", agent_id=order.agent_id,
+                                user_id=get_current_user_id(), agent_id=order.agent_id,
                                 symbol=order.symbol, side=OrderSide.BUY,
                                 quantity=remaining, entry_price=fill_price,
                                 leverage=order.leverage, is_paper=True,
@@ -1174,7 +1185,7 @@ class PaperTradingService:
                 else:
                     existing = await db.scalar(
                         select(PaperPosition).where(
-                            PaperPosition.user_id == "default-user",
+                            PaperPosition.user_id == get_current_user_id(),
                             PaperPosition.symbol == order.symbol,
                             PaperPosition.agent_id == order.agent_id,
                             PaperPosition.side == OrderSide.BUY,
@@ -1185,7 +1196,7 @@ class PaperTradingService:
                     else:
                         db.add(PaperPosition(
                             id=str(uuid.uuid4()),
-                            user_id="default-user", agent_id=order.agent_id,
+                            user_id=get_current_user_id(), agent_id=order.agent_id,
                             symbol=order.symbol, side=OrderSide.BUY,
                             quantity=order.quantity, entry_price=fill_price,
                             leverage=order.leverage, is_paper=True,
@@ -1193,7 +1204,7 @@ class PaperTradingService:
             else:
                 long_pos = await db.scalar(
                     select(PaperPosition).where(
-                        PaperPosition.user_id == "default-user",
+                        PaperPosition.user_id == get_current_user_id(),
                         PaperPosition.symbol == order.symbol,
                         PaperPosition.agent_id == order.agent_id,
                         PaperPosition.side == OrderSide.BUY,
@@ -1211,7 +1222,7 @@ class PaperTradingService:
                     if remaining > 1e-12:
                         existing = await db.scalar(
                             select(PaperPosition).where(
-                                PaperPosition.user_id == "default-user",
+                                PaperPosition.user_id == get_current_user_id(),
                                 PaperPosition.symbol == order.symbol,
                                 PaperPosition.agent_id == order.agent_id,
                                 PaperPosition.side == OrderSide.SELL,
@@ -1222,7 +1233,7 @@ class PaperTradingService:
                         else:
                             db.add(PaperPosition(
                                 id=str(uuid.uuid4()),
-                                user_id="default-user", agent_id=order.agent_id,
+                                user_id=get_current_user_id(), agent_id=order.agent_id,
                                 symbol=order.symbol, side=OrderSide.SELL,
                                 quantity=remaining, entry_price=fill_price,
                                 leverage=order.leverage, is_paper=True,
@@ -1230,7 +1241,7 @@ class PaperTradingService:
                 else:
                     existing = await db.scalar(
                         select(PaperPosition).where(
-                            PaperPosition.user_id == "default-user",
+                            PaperPosition.user_id == get_current_user_id(),
                             PaperPosition.symbol == order.symbol,
                             PaperPosition.agent_id == order.agent_id,
                             PaperPosition.side == OrderSide.SELL,
@@ -1241,7 +1252,7 @@ class PaperTradingService:
                     else:
                         db.add(PaperPosition(
                             id=str(uuid.uuid4()),
-                            user_id="default-user", agent_id=order.agent_id,
+                            user_id=get_current_user_id(), agent_id=order.agent_id,
                             symbol=order.symbol, side=OrderSide.SELL,
                             quantity=order.quantity, entry_price=fill_price,
                             leverage=order.leverage, is_paper=True,
@@ -1265,7 +1276,7 @@ class PaperTradingService:
             query = (
                 select(PaperOrder)
                 .where(
-                    PaperOrder.user_id == "default-user",
+                    PaperOrder.user_id == get_current_user_id(),
                     PaperOrder.status == OrderStatus.FILLED,
                 )
                 .order_by(PaperOrder.created_at.asc())
@@ -1472,14 +1483,14 @@ class PaperTradingService:
         async with get_async_session() as db:
             orders_result = await db.execute(
                 select(PaperOrder).where(
-                    PaperOrder.user_id == "default-user",
+                    PaperOrder.user_id == get_current_user_id(),
                     PaperOrder.status == OrderStatus.FILLED,
                 )
             )
             orders = orders_result.scalars().all()
 
             positions_result = await db.execute(
-                select(PaperPosition).where(PaperPosition.user_id == "default-user")
+                select(PaperPosition).where(PaperPosition.user_id == get_current_user_id())
             )
             positions = positions_result.scalars().all()
 
@@ -1600,7 +1611,7 @@ class PaperTradingService:
                 import uuid as _arch_uuid
 
                 trades_to_archive = (await db.execute(
-                    select(PaperOrder).where(PaperOrder.user_id == "default-user")
+                    select(PaperOrder).where(PaperOrder.user_id == get_current_user_id())
                 )).scalars().all()
                 for t in trades_to_archive:
                     db.add(ArchivedTrade(
@@ -1625,7 +1636,7 @@ class PaperTradingService:
                     ))
 
                 positions_to_archive = (await db.execute(
-                    select(PaperPosition).where(PaperPosition.user_id == "default-user")
+                    select(PaperPosition).where(PaperPosition.user_id == get_current_user_id())
                 )).scalars().all()
                 for p in positions_to_archive:
                     db.add(ArchivedPosition(
@@ -1656,23 +1667,23 @@ class PaperTradingService:
                 logger.warning(f"Trade archival failed (proceeding with reset): {_arch_err}")
 
             await db.execute(
-                delete(PaperOrder).where(PaperOrder.user_id == "default-user")
+                delete(PaperOrder).where(PaperOrder.user_id == get_current_user_id())
             )
             await db.execute(
-                delete(PaperPosition).where(PaperPosition.user_id == "default-user")
+                delete(PaperPosition).where(PaperPosition.user_id == get_current_user_id())
             )
             # Preserve accumulation fund balances — don't wipe on trading reset.
             _acc_balances = {}
             for _ab in (await db.execute(
                 select(PaperBalance).where(
-                    PaperBalance.user_id == "default-user",
+                    PaperBalance.user_id == get_current_user_id(),
                     PaperBalance.fund_type == "accumulation",
                 )
             )).scalars().all():
                 _acc_balances[_ab.asset] = {"available": _ab.available, "locked": _ab.locked}
             await db.execute(
                 delete(PaperBalance).where(
-                    PaperBalance.user_id == "default-user",
+                    PaperBalance.user_id == get_current_user_id(),
                     PaperBalance.fund_type != "accumulation",
                 )
             )
@@ -1680,14 +1691,14 @@ class PaperTradingService:
             for asset, amount in [("BTC", 1.0), ("USDT", 50000.0), ("ETH", 10.0), ("SOL", 100.0), ("USD", 50000.0)]:
                 db.add(
                     PaperBalance(
-                        user_id="default-user", asset=asset, available=amount, locked=0.0
+                        user_id=get_current_user_id(), asset=asset, available=amount, locked=0.0
                     )
                 )
             # Restore accumulation balances
             for _asset, _bal in _acc_balances.items():
                 db.add(
                     PaperBalance(
-                        user_id="default-user", asset=_asset,
+                        user_id=get_current_user_id(), asset=_asset,
                         available=_bal["available"], locked=_bal["locked"],
                         fund_type="accumulation",
                     )
