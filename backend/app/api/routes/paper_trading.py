@@ -4,7 +4,7 @@ from typing import Optional, List
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import get_current_user_id
+from app.auth import get_current_user_id, get_optional_user_id
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 from datetime import datetime, timezone
@@ -56,18 +56,29 @@ class PositionResponse(BaseModel):
 
 
 @router.get("/status")
-async def get_paper_status(db: AsyncSession = Depends(get_db)):
+async def get_paper_status(
+    db: AsyncSession = Depends(get_db),
+    user_id: Optional[str] = Depends(get_optional_user_id),
+):
+    uid = user_id or "default-user"
     try:
-        query = select(PaperBalance).where(PaperBalance.user_id == "default-user")
+        if user_id:
+            # Ensure the user record exists so FK constraints don't fail
+            from app.models import User
+            existing = await db.get(User, user_id)
+            if not existing:
+                db.add(User(id=user_id, username=user_id, email=f"{user_id}@clerk", hashed_password="clerk"))
+                await db.commit()
+
+        query = select(PaperBalance).where(PaperBalance.user_id == uid)
         result = await db.execute(query)
         balances = result.scalars().all()
 
         if not balances:
-            # If no balances exist, create default balances
             default_balances = [
-                PaperBalance(user_id="default-user", asset="BTC", available=1.0, locked=0.0),
-                PaperBalance(user_id="default-user", asset="USDT", available=50000.0, locked=0.0),
-                PaperBalance(user_id="default-user", asset="ETH", available=10.0, locked=0.0)
+                PaperBalance(user_id=uid, asset="BTC", available=1.0, locked=0.0),
+                PaperBalance(user_id=uid, asset="USDT", available=50000.0, locked=0.0),
+                PaperBalance(user_id=uid, asset="ETH", available=10.0, locked=0.0)
             ]
             for balance in default_balances:
                 db.add(balance)

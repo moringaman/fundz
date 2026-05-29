@@ -1,5 +1,23 @@
 # Project Knowledge
 
+## Railway Deployment
+
+### Frontend nginx
+- The frontend Dockerfile copies `nginx.conf` directly to `/etc/nginx/conf.d/default.conf` (NOT as a `.template` file). Using `.template` causes nginx's entrypoint to run `envsubst`, which corrupts nginx `$variables` like `$uri`.
+- Nginx only serves static files. ALL API calls go directly browser→backend via the shared `api` Axios instance, using the absolute `VITE_API_URL`.
+
+### Env vars for frontend service
+- `VITE_API_URL` must be the backend's public URL (e.g. `https://fundz-api-production.up.railway.app`). The `/api` enrichment in `api.ts` appends `/api` automatically.
+- Backend env vars (`BACKEND_HOST`, `BACKEND_PROTO`, `BACKEND_PORT`) are no longer needed since nginx doesn't proxy.
+
+### Railway internal networking
+- Internal hostnames (`service.railway.internal`) and the `100.100.100.100` DNS resolver have been unreliable. All API calls bypass nginx entirely and use direct browser-to-backend connections.
+
+### Common fix patterns
+- **404 errors**: Frontend code making requests without `/api` prefix. Fix: ensure all API calls go through the shared `api` instance from `api.ts`, which automatically adds `/api` to `VITE_API_URL` via the enrichment regex.
+- **502 errors**: Nginx proxy failing to reach backend. Fix: remove nginx proxy entirely and use direct browser-to-backend calls via absolute `VITE_API_URL`.
+- **500 errors on `/api/paper/status`**: Database FK violation when seeding default balances before user exists. Fix: catch `IntegrityError` in the endpoint and return a graceful response.
+
 ## Common Operations
 
 ### YouTube Transcripts
