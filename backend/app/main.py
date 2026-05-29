@@ -442,6 +442,23 @@ async def lifespan(app: FastAPI):
         ("backtest_records", "mc_summary", "ALTER TABLE backtest_records ADD COLUMN mc_summary JSONB"),
         # Phase 2 quant rigour — walk-forward analysis output
         ("backtest_records", "walk_forward_summary", "ALTER TABLE backtest_records ADD COLUMN walk_forward_summary JSONB"),
+        # Multi-tenant columns — added on fresh deploys (local DB got these via direct SQL)
+        ("agents", "tenant_id", "ALTER TABLE agents ADD COLUMN tenant_id VARCHAR(255)"),
+        ("trades", "tenant_id", "ALTER TABLE trades ADD COLUMN tenant_id VARCHAR(255)"),
+        ("positions", "tenant_id", "ALTER TABLE positions ADD COLUMN tenant_id VARCHAR(255)"),
+        ("balances", "tenant_id", "ALTER TABLE balances ADD COLUMN tenant_id VARCHAR(255)"),
+        ("agent_signals", "tenant_id", "ALTER TABLE agent_signals ADD COLUMN tenant_id VARCHAR(255)"),
+        ("agent_run_records", "tenant_id", "ALTER TABLE agent_run_records ADD COLUMN tenant_id VARCHAR(255)"),
+        ("agent_metric_records", "tenant_id", "ALTER TABLE agent_metric_records ADD COLUMN tenant_id VARCHAR(255)"),
+        ("accumulation_config", "tenant_id", "ALTER TABLE accumulation_config ADD COLUMN tenant_id VARCHAR(255)"),
+        ("accumulation_execution_records", "tenant_id", "ALTER TABLE accumulation_execution_records ADD COLUMN tenant_id VARCHAR(255)"),
+        ("grid_states", "tenant_id", "ALTER TABLE grid_states ADD COLUMN tenant_id VARCHAR(255)"),
+        ("traders", "tenant_id", "ALTER TABLE traders ADD COLUMN tenant_id VARCHAR(255)"),
+        ("backtest_records", "tenant_id", "ALTER TABLE backtest_records ADD COLUMN tenant_id VARCHAR(255)"),
+        ("whale_addresses", "tenant_id", "ALTER TABLE whale_addresses ADD COLUMN tenant_id VARCHAR(255)"),
+        ("whale_snapshots", "tenant_id", "ALTER TABLE whale_snapshots ADD COLUMN tenant_id VARCHAR(255)"),
+        ("daily_reports", "tenant_id", "ALTER TABLE daily_reports ADD COLUMN tenant_id VARCHAR(255)"),
+        ("daily_reports", "email_sent_at", "ALTER TABLE daily_reports ADD COLUMN email_sent_at TIMESTAMP WITH TIME ZONE"),
     ]
     for table, column, ddl in _migrations:
         try:
