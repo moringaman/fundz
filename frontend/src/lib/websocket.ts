@@ -17,7 +17,9 @@ const HEARTBEAT_INTERVAL_MS = 30_000;
 const PONG_TIMEOUT_MS = 10_000;
 
 function getWsUrl(): string {
-  const apiUrl = import.meta.env.VITE_API_URL || '';
+  const apiUrl =
+    (typeof window !== 'undefined' && window.__ENV?.VITE_API_URL) ||
+    import.meta.env.VITE_API_URL || '';
   if (apiUrl.startsWith('http')) {
     // Strip trailing /api if present, then add /api/ws/market
     const base = apiUrl.replace(/\/api\/?$/, '');
