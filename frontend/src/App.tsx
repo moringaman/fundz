@@ -133,7 +133,7 @@ function App() {
       <Routes>
         <Route path="/sign-in" element={<SignInPage />} />
         <Route path="/sign-up" element={<SignUpPage />} />
-        <Route path="/dashboard" element={
+        <Route path="/dashboard/*" element={
           <SignedIn><AppRoutes /></SignedIn>
         } />
         <Route path="/*" element={
