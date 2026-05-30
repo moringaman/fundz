@@ -5,7 +5,7 @@ from typing import Optional
 from pydantic import BaseModel
 
 from app.auth import get_optional_user_id
-from app.services._acc import _acc as _acc, set_ctx_user_id as _acc_set_user
+from app.services.accumulation_service import accumulation_service as _acc, set_ctx_user_id as _acc_set_user
 
 async def _inject_user(user_id: Optional[str] = Depends(get_optional_user_id)):
     _acc_set_user(user_id or "default-user")
