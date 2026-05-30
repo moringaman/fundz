@@ -279,7 +279,7 @@ class GateAutopilot:
 
                 filled_paper_trades = await db.execute(
                     select(sqlfunc.count(Trade.id)).where(
-                        Trade.user_id == "default-user",
+                        Trade.user_id == get_current_user_id(),
                         Trade.is_paper.is_(True),
                         Trade.status == OrderStatus.FILLED,
                     )
@@ -341,7 +341,7 @@ class GateAutopilot:
                 fees_row = await db.execute(
                     select(sqlfunc.coalesce(sqlfunc.sum(Trade.fee), 0.0))
                     .where(
-                        Trade.user_id == "default-user",
+                        Trade.user_id == get_current_user_id(),
                         Trade.is_paper.is_(True),
                         Trade.status == OrderStatus.FILLED,
                         Trade.created_at >= day_start,
@@ -365,7 +365,7 @@ class GateAutopilot:
                     select(
                         sqlfunc.coalesce(sqlfunc.sum(Trade.fee), 0.0).label("total_fees"),
                     ).where(
-                        Trade.user_id == "default-user",
+                        Trade.user_id == get_current_user_id(),
                         Trade.is_paper.is_(True),
                         Trade.status == OrderStatus.FILLED,
                         Trade.created_at >= _window_start,

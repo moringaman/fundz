@@ -32,7 +32,7 @@ async def diagnose_paper_trading() -> Dict[str, Any]:
     try:
         # Get paper trading balances
         async with get_async_session() as db:
-            query = select(PaperBalance).where(PaperBalance.user_id == "default-user")
+            query = select(PaperBalance).where(PaperBalance.user_id == get_current_user_id())
             result = await db.execute(query)
             balances = result.scalars().all()
             

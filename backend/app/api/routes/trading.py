@@ -121,7 +121,7 @@ async def place_order(order: OrderRequest, db: AsyncSession = Depends(get_db)):
     
     db_trade = DBTrade(
         id=result.get("orderID", ""),
-        user_id="default-user",
+        user_id=get_current_user_id(),
         symbol=order.symbol,
         side=OrderSide.BUY if order.side.lower() == "buy" else OrderSide.SELL,
         quantity=order.quantity,
@@ -180,7 +180,7 @@ async def get_positions(db: AsyncSession = Depends(get_db)):
     
     # Fetch live positions only from database
     query = select(DBPosition).where(
-        DBPosition.user_id == "default-user",
+        DBPosition.user_id == get_current_user_id(),
         DBPosition.is_paper == False,  # noqa: E712
     )
     result = await db.execute(query)
@@ -238,7 +238,7 @@ async def get_balance(db: AsyncSession = Depends(get_db)):
 
             stmt = pg_insert(DBBalance).values(
                 id=str(uuid.uuid4()),
-                user_id="default-user",
+                user_id=get_current_user_id(),
                 asset=asset,
                 available=available,
                 locked=locked,
@@ -356,7 +356,7 @@ async def get_trade_history(
 async def get_pnl(db: AsyncSession = Depends(get_db)):
     # Calculate PNL from live positions only
     query = select(DBPosition).where(
-        DBPosition.user_id == "default-user",
+        DBPosition.user_id == get_current_user_id(),
         DBPosition.is_paper == False,  # noqa: E712
     )
     result = await db.execute(query)

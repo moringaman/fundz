@@ -1926,7 +1926,7 @@ class AgentScheduler:
             async with get_async_session() as session:
                 result = await session.execute(
                     select(sqlfunc.coalesce(sqlfunc.sum(Trade.fee), 0.0)).where(
-                        Trade.user_id == "default-user",
+                        Trade.user_id == get_current_user_id(),
                         Trade.is_paper.is_(_is_paper_mode()),
                         Trade.status == OrderStatus.FILLED,
                         Trade.created_at >= day_start,
@@ -2917,7 +2917,7 @@ class AgentScheduler:
                                             if _dup.scalar_one_or_none() is None:
                                                 _new_order = Trade(
                                                     id=str(_uuid.uuid4()),
-                                                    user_id="default-user",
+                                                    user_id=get_current_user_id(),
                                                     agent_id=pos.agent_id,
                                                     trader_id=agent_config.get("trader_id"),
                                                     symbol=pos.symbol,
