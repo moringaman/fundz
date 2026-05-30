@@ -150,32 +150,40 @@ class PhemexClient:
         return await self._get_binance_klines(symbol, interval, limit)
 
     async def _get_binance_klines(self, symbol: str, interval: str, limit: int) -> List[Dict[str, Any]]:
-        """Fallback to Binance for historical data"""
-        try:
-            binance_interval = interval
-            async with httpx.AsyncClient() as client:
-                response = await client.get(
-                    "https://api.binance.com/api/v3/klines",
-                    params={"symbol": symbol, "interval": binance_interval, "limit": limit}
-                )
-                data = response.json()
-                
-                result = []
-                for k in data:
-                    result.append([
-                        int(k[0] / 1000),
-                        "60",
-                        k[1],
-                        k[2],
-                        k[3],
-                        k[4],
-                        k[5],
-                        k[5],
-                        symbol
-                    ])
-                return result
-        except Exception:
-            return []
+        """Fetch klines from Binance (primary data source)."""
+        for attempt in range(3):
+            try:
+                binance_interval = interval
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    response = await client.get(
+                        "https://api.binance.com/api/v3/klines",
+                        params={"symbol": symbol, "interval": binance_interval, "limit": limit}
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    
+                    result = []
+                    for k in data:
+                        result.append([
+                            int(k[0] / 1000),
+                            "60",
+                            k[1],
+                            k[2],
+                            k[3],
+                            k[4],
+                            k[5],
+                            k[5],
+                            symbol
+                        ])
+                    if result:
+                        return result
+            except Exception as exc:
+                logger.warning(f"Binance klines attempt {attempt+1} failed: {exc}")
+                if attempt < 2:
+                    import asyncio
+                    await asyncio.sleep(2 ** attempt)
+        logger.error(f"All Binance klines attempts failed for {symbol}")
+        return []
 
     async def get_ticker(self, symbol: str) -> Dict[str, Any]:
         path = "/md/v2/ticker/24hr"
