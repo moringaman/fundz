@@ -395,15 +395,12 @@ Provide your analysis in JSON format:
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
-        response = await self._client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            response_format={"type": "json_object"}
-        )
+        kwargs = dict(model=model, messages=messages, temperature=temperature, max_tokens=max_tokens)
+        if self.provider not in ("opencode", "ollama", "vllm", "llama_cpp", "custom"):
+            kwargs["response_format"] = {"type": "json_object"}
+        response = await self._client.chat.completions.create(**kwargs)
 
-        content = response.choices[0].message.content
+        content = response.choices[0].message.content if hasattr(response, 'choices') else str(response)
         try:
             data = json.loads(content)
         except json.JSONDecodeError:
