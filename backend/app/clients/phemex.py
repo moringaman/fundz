@@ -199,13 +199,8 @@ class PhemexClient:
                     data = response.json()
                     result = []
                     for k in data:
-                        ts = int(k["t"] / 1000) if isinstance(k.get("t"), (int, float)) else int(k[0] / 1000)
-                        o = k.get("o", k[1])
-                        h = k.get("h", k[2])
-                        l = k.get("l", k[3])
-                        c = k.get("c", k[4])
-                        v = k.get("v", k[5])
-                        result.append([ts, "60", o, h, l, c, v, v, symbol])
+                        ts = int(k["t"] / 1000)
+                        result.append([ts, "60", k["o"], k["h"], k["l"], k["c"], k["v"], k["v"], symbol])
                     if result:
                         return result
                     if attempt < 2:
