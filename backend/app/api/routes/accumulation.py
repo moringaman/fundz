@@ -1,24 +1,32 @@
 """Accumulation Fund API — DCA config, portfolio view, capital transfers."""
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from typing import Optional
 from pydantic import BaseModel
 
-from app.services.accumulation_service import accumulation_service
+from app.auth import get_optional_user_id
+from app.services._acc import _acc as _acc, set_ctx_user_id as _acc_set_user
 
-router = APIRouter(prefix="/accumulation", tags=["accumulation"])
+async def _inject_user(user_id: Optional[str] = Depends(get_optional_user_id)):
+    _acc_set_user(user_id or "default-user")
+
+router = APIRouter(
+    prefix="/accumulation",
+    tags=["accumulation"],
+    dependencies=[Depends(_inject_user)],
+)
 
 
 @router.get("/portfolio")
 async def get_portfolio():
     """Accumulation fund portfolio — positions, balances, unrealized P&L."""
-    return await accumulation_service.get_portfolio()
+    return await _acc.get_portfolio()
 
 
 @router.get("/configs")
 async def get_configs():
     """All accumulation strategy configs per asset."""
-    return await accumulation_service.get_configs()
+    return await _acc.get_configs()
 
 
 class ConfigUpdate(BaseModel):
@@ -44,13 +52,13 @@ async def upsert_config(req: ConfigUpdate):
     """Create or update accumulation strategy config for an asset."""
     data = req.model_dump(exclude_none=True)
     asset = data.pop("asset")
-    return await accumulation_service.upsert_config(asset, data)
+    return await _acc.upsert_config(asset, data)
 
 
 @router.delete("/configs/{asset}")
 async def delete_config(asset: str):
     """Remove accumulation config for an asset."""
-    ok = await accumulation_service.delete_config(asset)
+    ok = await _acc.delete_config(asset)
     if not ok:
         raise HTTPException(status_code=404, detail="Config not found")
     return {"status": "deleted"}
@@ -65,7 +73,7 @@ async def deposit_usdc(req: TransferRequest):
     """Deposit USDC into the accumulation fund (Hyperliquid DEX)."""
     if req.amount <= 0:
         raise HTTPException(status_code=400, detail="Amount must be positive")
-    return await accumulation_service.deposit_usdc(req.amount)
+    return await _acc.deposit_usdc(req.amount)
 
 
 @router.post("/transfer-to-trading")
@@ -74,7 +82,7 @@ async def transfer_to_trading(req: TransferRequest):
     if req.amount <= 0:
         raise HTTPException(status_code=400, detail="Amount must be positive")
     try:
-        return await accumulation_service.transfer_to_trading(req.amount)
+        return await _acc.transfer_to_trading(req.amount)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -85,7 +93,7 @@ async def buy_spot(asset: str, amount: float):
     if amount <= 0:
         raise HTTPException(status_code=400, detail="Amount must be positive")
     try:
-        return await accumulation_service.buy_spot(asset, amount)
+        return await _acc.buy_spot(asset, amount)
     except (ValueError, Exception) as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -93,31 +101,31 @@ async def buy_spot(asset: str, amount: float):
 @router.post("/run-dca")
 async def run_dca_manual():
     """Manually trigger DCA check (bypasses schedule, executes immediately)."""
-    return {"results": await accumulation_service.run_dca(force=True)}
+    return {"results": await _acc.run_dca(force=True)}
 
 
 @router.post("/run-scaleout")
 async def run_scaleout_manual():
     """Manually trigger scale-out check."""
-    return {"results": await accumulation_service.check_scale_outs()}
+    return {"results": await _acc.check_scale_outs()}
 
 
 @router.get("/executions")
 async def get_executions(asset: Optional[str] = None, strategy: Optional[str] = None, limit: int = 100):
     """Historical accumulation execution records."""
-    return await accumulation_service.get_executions(asset=asset, strategy=strategy, limit=limit)
+    return await _acc.get_executions(asset=asset, strategy=strategy, limit=limit)
 
 
 @router.get("/metrics")
 async def get_metrics():
     """Aggregated execution counts per (asset, strategy) + portfolio stats."""
-    return await accumulation_service.get_metrics()
+    return await _acc.get_metrics()
 
 
 @router.get("/performance-chart")
 async def get_performance_chart():
     """Time-series of portfolio value derived from execution history."""
-    return await accumulation_service.get_performance_chart()
+    return await _acc.get_performance_chart()
 
 
 @router.post("/sync-from-live")
@@ -127,12 +135,12 @@ async def sync_from_live():
     Use this after switching accumulation from live mode back to paper mode,
     so the paper DB reflects the actual on-chain holdings rather than stale data.
     """
-    await accumulation_service.sync_live_to_paper()
+    await _acc.sync_live_to_paper()
     return {"status": "synced"}
 
 
 @router.post("/ack-low-balance")
 async def ack_low_balance():
     """Acknowledge low balance alert — suppresses Telegram notifications for 24h."""
-    accumulation_service.ack_low_balance()
+    _acc.ack_low_balance()
     return {"status": "acknowledged"}

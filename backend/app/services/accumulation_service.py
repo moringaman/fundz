@@ -12,6 +12,7 @@ import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
+from contextvars import ContextVar
 
 from sqlalchemy import select, func
 
@@ -25,6 +26,15 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Context var for the current user — set by route handlers.
+ctx_user_id: ContextVar[str] = ContextVar("ctx_user_id", default="default-user")
+
+def set_ctx_user_id(uid: str) -> None:
+    ctx_user_id.set(uid)
+
+def _get_user_id() -> str:
+    return ctx_user_id.get()
+
 FUND_TYPE = "accumulation"
 QUOTE_CURRENCY = "USDC"
 
@@ -34,7 +44,6 @@ class AccumulationService:
     def __init__(self):
         self._exchange = None   # hyperliquid.exchange.Exchange — lazy init
         self._info_client = None  # HyperliquidClient — lazy init
-        self._user_id = "default-user"
 
         # ── Trend filter cache ────────────────────────────────────────
         # 200-day SMA only meaningfully changes once per day, so cache the
@@ -140,7 +149,7 @@ class AccumulationService:
         async with get_async_session() as db:
             rows = await db.execute(
                 select(AccumulationConfig).where(
-                    AccumulationConfig.user_id == self._user_id
+                    AccumulationConfig.user_id == _get_user_id()
                 ).order_by(AccumulationConfig.asset)
             )
             return [
@@ -153,7 +162,7 @@ class AccumulationService:
         async with get_async_session() as db:
             existing = await db.execute(
                 select(AccumulationConfig).where(
-                    AccumulationConfig.user_id == self._user_id,
+                    AccumulationConfig.user_id == _get_user_id(),
                     AccumulationConfig.asset == asset,
                 )
             )
@@ -161,7 +170,7 @@ class AccumulationService:
             if cfg is None:
                 cfg = AccumulationConfig(
                     id=str(uuid.uuid4()),
-                    user_id=self._user_id,
+                    user_id=_get_user_id(),
                     asset=asset,
                 )
                 db.add(cfg)
@@ -176,7 +185,7 @@ class AccumulationService:
         async with get_async_session() as db:
             existing = await db.execute(
                 select(AccumulationConfig).where(
-                    AccumulationConfig.user_id == self._user_id,
+                    AccumulationConfig.user_id == _get_user_id(),
                     AccumulationConfig.asset == asset,
                 )
             )
@@ -291,7 +300,7 @@ class AccumulationService:
         async with get_async_session() as db:
             rows = await db.execute(
                 select(DBBalance).where(
-                    DBBalance.user_id == self._user_id,
+                    DBBalance.user_id == _get_user_id(),
                     DBBalance.fund_type == FUND_TYPE,
                 )
             )
@@ -315,7 +324,7 @@ class AccumulationService:
     async def _ensure_balance(self, asset: str, db) -> DBBalance:
         existing = await db.execute(
             select(DBBalance).where(
-                DBBalance.user_id == self._user_id,
+                DBBalance.user_id == _get_user_id(),
                 DBBalance.asset == asset,
                 DBBalance.fund_type == FUND_TYPE,
             )
@@ -324,7 +333,7 @@ class AccumulationService:
         if bal is None:
             bal = DBBalance(
                 id=str(uuid.uuid4()),
-                user_id=self._user_id,
+                user_id=_get_user_id(),
                 asset=asset,
                 available=0.0,
                 locked=0.0,
@@ -354,7 +363,7 @@ class AccumulationService:
             bal.available -= usd_amount
             trade_bal = await db.execute(
                 select(DBBalance).where(
-                    DBBalance.user_id == self._user_id,
+                    DBBalance.user_id == _get_user_id(),
                     DBBalance.asset == QUOTE_CURRENCY,
                     DBBalance.fund_type == "trading",
                 )
@@ -363,7 +372,7 @@ class AccumulationService:
             if tb is None:
                 tb = DBBalance(
                     id=str(uuid.uuid4()),
-                    user_id=self._user_id,
+                    user_id=_get_user_id(),
                     asset=QUOTE_CURRENCY,
                     available=0.0,
                     locked=0.0,
@@ -388,7 +397,7 @@ class AccumulationService:
         async with get_async_session() as db:
             rows = await db.execute(
                 select(DBBalance).where(
-                    DBBalance.user_id == self._user_id,
+                    DBBalance.user_id == _get_user_id(),
                     DBBalance.fund_type == FUND_TYPE,
                     DBBalance.asset != QUOTE_CURRENCY,
                 )
@@ -585,7 +594,7 @@ class AccumulationService:
         async with get_async_session() as db:
             rows = await db.execute(
                 select(DBBalance).where(
-                    DBBalance.user_id == self._user_id,
+                    DBBalance.user_id == _get_user_id(),
                     DBBalance.fund_type == FUND_TYPE,
                 )
             )
@@ -597,7 +606,7 @@ class AccumulationService:
                 existing["USDC"].locked = 0.0
             else:
                 db.add(DBBalance(
-                    user_id=self._user_id, asset="USDC",
+                    user_id=_get_user_id(), asset="USDC",
                     fund_type=FUND_TYPE,
                     available=live_usdc, locked=0.0,
                 ))
@@ -612,7 +621,7 @@ class AccumulationService:
                         existing[asset].locked = avg_cost
                 else:
                     db.add(DBBalance(
-                        user_id=self._user_id, asset=asset,
+                        user_id=_get_user_id(), asset=asset,
                         fund_type=FUND_TYPE,
                         available=qty, locked=avg_cost,
                     ))
@@ -633,7 +642,7 @@ class AccumulationService:
                 _existing_deposited.available = live_total_invested
             else:
                 db.add(DBBalance(
-                    user_id=self._user_id, asset="_DEPOSITED",
+                    user_id=_get_user_id(), asset="_DEPOSITED",
                     fund_type=FUND_TYPE,
                     available=live_total_invested, locked=0.0,
                 ))
@@ -1022,7 +1031,7 @@ class AccumulationService:
         async with get_async_session() as db:
             rec = AccumulationExecutionRecord(
                 id=str(uuid.uuid4()),
-                user_id=self._user_id,
+                user_id=_get_user_id(),
                 asset=asset,
                 strategy=strategy,
                 amount_usd=amount_usd,
@@ -1038,7 +1047,7 @@ class AccumulationService:
                              limit: int = 100) -> List[Dict[str, Any]]:
         async with get_async_session() as db:
             q = select(AccumulationExecutionRecord).where(
-                AccumulationExecutionRecord.user_id == self._user_id
+                AccumulationExecutionRecord.user_id == _get_user_id()
             )
             if asset:
                 q = q.where(AccumulationExecutionRecord.asset == asset)
@@ -1092,7 +1101,7 @@ class AccumulationService:
                     AccumulationExecutionRecord.strategy,
                     func.max(AccumulationExecutionRecord.executed_at).label("last_at"),
                 ).where(
-                    AccumulationExecutionRecord.user_id == self._user_id
+                    AccumulationExecutionRecord.user_id == _get_user_id()
                 ).group_by(
                     AccumulationExecutionRecord.asset,
                     AccumulationExecutionRecord.strategy,
@@ -1128,7 +1137,7 @@ class AccumulationService:
         async with get_async_session() as db:
             rows = await db.execute(
                 select(AccumulationExecutionRecord).where(
-                    AccumulationExecutionRecord.user_id == self._user_id
+                    AccumulationExecutionRecord.user_id == _get_user_id()
                 ).order_by(AccumulationExecutionRecord.executed_at.asc())
             )
             records = rows.scalars().all()
