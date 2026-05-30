@@ -150,30 +150,27 @@ class PhemexClient:
         return await self._get_binance_klines(symbol, interval, limit)
 
     async def _get_binance_klines(self, symbol: str, interval: str, limit: int) -> List[Dict[str, Any]]:
-        """Fetch klines from Binance (primary data source)."""
+        """Fetch klines from Binance, falling back to Hyperliquid perps candle API."""
+        result = await self._try_binance_klines(symbol, interval, limit)
+        if result:
+            return result
+        return await self._try_hyperliquid_klines(symbol, interval, limit)
+
+    async def _try_binance_klines(self, symbol: str, interval: str, limit: int) -> List[Dict[str, Any]]:
         for attempt in range(3):
             try:
-                binance_interval = interval
                 async with httpx.AsyncClient(timeout=30.0) as client:
                     response = await client.get(
                         "https://api.binance.com/api/v3/klines",
-                        params={"symbol": symbol, "interval": binance_interval, "limit": limit}
+                        params={"symbol": symbol, "interval": interval, "limit": limit}
                     )
                     response.raise_for_status()
                     data = response.json()
-                    
                     result = []
                     for k in data:
                         result.append([
-                            int(k[0] / 1000),
-                            "60",
-                            k[1],
-                            k[2],
-                            k[3],
-                            k[4],
-                            k[5],
-                            k[5],
-                            symbol
+                            int(k[0] / 1000), "60",
+                            k[1], k[2], k[3], k[4], k[5], k[5], symbol
                         ])
                     if result:
                         return result
@@ -182,7 +179,32 @@ class PhemexClient:
                 if attempt < 2:
                     import asyncio
                     await asyncio.sleep(2 ** attempt)
-        logger.error(f"All Binance klines attempts failed for {symbol}")
+        return []
+
+    async def _try_hyperliquid_klines(self, symbol: str, interval: str, limit: int) -> List[Dict[str, Any]]:
+        """Fallback: use Hyperliquid perpetual candle snapshots."""
+        resolution_map = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d"}
+        hl_interval = resolution_map.get(interval, "1h")
+        coin = symbol.replace("USDT", "").replace("USD", "")
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                payload = {"type": "candleSnapshot", "req": {"coin": coin, "interval": hl_interval, "limit": limit}}
+                response = await client.post("https://api.hyperliquid.xyz/info", json=payload)
+                response.raise_for_status()
+                data = response.json()
+                result = []
+                for k in data:
+                    ts = int(k["t"] / 1000) if isinstance(k.get("t"), (int, float)) else int(k[0] / 1000)
+                    o = k.get("o", k[1])
+                    h = k.get("h", k[2])
+                    l = k.get("l", k[3])
+                    c = k.get("c", k[4])
+                    v = k.get("v", k[5])
+                    result.append([ts, "60", o, h, l, c, v, v, symbol])
+                if result:
+                    return result
+        except Exception as exc:
+            logger.warning(f"Hyperliquid klines fallback failed: {exc}")
         return []
 
     async def get_ticker(self, symbol: str) -> Dict[str, Any]:
