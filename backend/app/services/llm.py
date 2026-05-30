@@ -315,7 +315,7 @@ Provide your analysis in JSON format:
         model, temperature, max_tokens = self._resolve_call_config(role)
 
         try:
-            if self.provider in ("openai", "openrouter", "azure"):
+            if self.provider in ("openai", "openrouter", "azure", "opencode", "custom", "ollama", "vllm", "llama_cpp"):
                 return await self._call_openai(
                     prompt,
                     system_prompt=system_prompt,

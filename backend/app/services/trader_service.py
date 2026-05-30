@@ -239,7 +239,7 @@ class TraderService:
                 f"  • {a['name']} ({a.get('strategy_type','?')}) — "
                 f"pairs: {', '.join(pairs)}, "
                 f"venue: {a.get('venue', 'phemex')}, "
-                f"win_rate: {(m.get('win_rate', 0) * 100):.0f}%, "
+                f"win_rate: {((m.get('win_rate') or 0) * 100):.0f}%, "
                 f"P&L: ${m.get('total_pnl', 0):.2f}, "
                 f"runs: {m.get('total_runs', 0)}, "
                 f"enabled: {a.get('is_enabled', False)}"
