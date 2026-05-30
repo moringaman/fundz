@@ -531,6 +531,8 @@ class AccumulationService:
             if qty <= 0:
                 continue
             coin = b["asset"].replace("USDT", "").replace("USDC", "")
+            if tracked_assets and coin not in tracked_assets:
+                continue
             price = await self._hl_mid_price(f"{coin}USDT")
             value = qty * price
             enriched.append({
@@ -544,6 +546,15 @@ class AccumulationService:
                 "unrealized_pnl_pct": 0.0,
             })
 
+        # Only show perp positions for assets that have an accumulation config
+        # (so trading positions in the same wallet aren't mixed in).
+        tracked_assets = set()
+        try:
+            for cfg in await self.get_configs():
+                tracked_assets.add(cfg["asset"].replace("USDT", ""))
+        except Exception:
+            pass
+
         # Perp positions
         if addr:
             try:
@@ -554,6 +565,8 @@ class AccumulationService:
                     if szi == 0:
                         continue
                     coin = pos.get("coin", "")
+                    if tracked_assets and coin not in tracked_assets:
+                        continue
                     entry_px = float(pos.get("entryPx") or 0)
                     pos_value = float(pos.get("positionValue") or 0)
                     unrealized_pnl = float(pos.get("unrealizedPnl") or 0)
