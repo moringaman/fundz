@@ -230,6 +230,11 @@ class LLMService:
         elif self.provider in ("ollama", "vllm", "llama_cpp", "custom", "opencode"):
             from openai import AsyncOpenAI
             url = endpoint_url or settings.llm_endpoint_url or None
+            if url:
+                # Strip /chat/completions suffix if present — the client appends it.
+                url = url.rstrip('/')
+                if url.endswith('/chat/completions'):
+                    url = url[:-len('/chat/completions')]
             key = api_key or "not-needed"
             if url:
                 self._client = AsyncOpenAI(api_key=key, base_url=url)
