@@ -1446,7 +1446,8 @@ class AgentScheduler:
                         asyncio.create_task(_send_telegram(_tg_lb.send(
                             f"⚠️ *Accumulation Fund Low Balance*\n\n"
                             f"USDT remaining: `${_low_bal:.2f}`\n"
-                            f"Deposit more funds for upcoming DCA buys."
+                            f"Deposit more funds for upcoming DCA buys.\n\n"
+                            f"Reply /ack to suppress for 24 h."
                         )))
                 except Exception as _acc_err:
                     logger.error(f"Accumulation cycle failed: {_acc_err}")
@@ -4890,6 +4891,20 @@ class AgentScheduler:
         # Clear the per-cycle signal arbiter so opposing trades can be detected
         # only within the same scheduler pass (not across passes).
         self._cycle_pending_signals = {}
+
+        # Set the user context for paper trading (which uses a ContextVar).
+        # Single-tenant: grab any agent's user_id from the DB.
+        try:
+            from app.database import AsyncSessionLocal
+            from app.models import Agent as DBAgent
+            from sqlalchemy import select as sa_select
+            async with AsyncSessionLocal() as _s:
+                _row = (await _s.execute(sa_select(DBAgent.user_id).limit(1))).scalar()
+            if _row:
+                from app.services.paper_trading import set_current_user_id
+                set_current_user_id(_row)
+        except Exception:
+            pass
 
         # Refresh per-symbol GMM regime cache once per pass so the per-agent
         # _build_market_context (sync) can inject up-to-date regime labels
