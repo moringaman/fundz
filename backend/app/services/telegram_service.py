@@ -359,6 +359,14 @@ class TelegramService:
         if not (self._config.polling_enabled and self.is_enabled()):
             logger.debug("Telegram polling disabled or not configured — skipping")
             return
+        # Clear any stale polling session from a previous instance (409 conflicts).
+        try:
+            url = f"{TELEGRAM_API}/bot{self._config.bot_token}/deleteWebhook"
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                await client.post(url, json={"drop_pending_updates": True})
+        except Exception:
+            pass
+        await asyncio.sleep(1)
         logger.info("Telegram polling started")
         offset = 0
         while True:
