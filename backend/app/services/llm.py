@@ -238,6 +238,7 @@ class LLMService:
             key = api_key or settings.openai_api_key or "not-needed"
             if url:
                 self._client = AsyncOpenAI(api_key=key, base_url=url)
+                logger.info(f"LLM client created: base_url={url}, key_prefix={key[:8]}...")
         logger.info(f"LLM Service initialized with provider: {self.provider}, model: {self.model}")
 
     async def analyze_market(self, market_data: Dict[str, Any]) -> LLMResponse:
