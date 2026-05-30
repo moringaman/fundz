@@ -498,8 +498,17 @@ class AccumulationService:
         When *force_live* is True, reads from Hyperliquid regardless of the
         current paper/live setting (used by sync_live_to_paper).
         """
-        from app.config import settings as _s
-        addr = _s.hyperliquid_wallet_address
+        uid = _get_user_id()
+        addr = None
+        try:
+            from app.services.credential_service import get_exchange_keys
+            hl_creds = await get_exchange_keys(uid, "hyperliquid")
+            addr = hl_creds.get("wallet_address") or None
+        except Exception:
+            pass
+        if not addr:
+            from app.config import settings as _s
+            addr = _s.hyperliquid_wallet_address
 
         balances = await self.get_balances(force_live=force_live)
         spot_usdc_total = 0.0
