@@ -145,25 +145,8 @@ class PhemexClient:
     # ------------------------------------------------------------------
 
     async def get_klines(self, symbol: str, interval: str = "1h", limit: int = 100) -> List[Dict[str, Any]]:
-        resolution_map = {"1m": "1", "5m": "5", "15m": "15", "1h": "60", "4h": "240", "1d": "1440"}
-        resolution = resolution_map.get(interval, "60")
-
-        # Phemex supports all resolutions: 1, 5, 15, 60, 240, 1440.
-        # Previously this guard silently downgraded 1m/5m/15m to 1h, causing stale
-        # signal analysis on short timeframes. All mapped resolutions are valid.
-        if resolution not in {"1", "5", "15", "60", "240", "1440"}:
-            resolution = "60"
-
-        try:
-            path = "/exchange/public/md/v2/kline/last"
-            params = {"symbol": symbol, "resolution": resolution, "size": limit}
-            data = await self._request("GET", path, params)
-            result = data.get("data", {})
-            if result.get("rows") and len(result["rows"]) >= limit:
-                return result["rows"]
-        except Exception:
-            pass
-
+        # Binance is the primary data source (reliable, no auth needed).
+        # Phemex /kline/last caps at 5 rows regardless of size, so it's not useful.
         return await self._get_binance_klines(symbol, interval, limit)
 
     async def _get_binance_klines(self, symbol: str, interval: str, limit: int) -> List[Dict[str, Any]]:
