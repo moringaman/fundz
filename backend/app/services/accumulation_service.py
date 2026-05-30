@@ -202,12 +202,25 @@ class AccumulationService:
         if self._exchange is None:
             from eth_account import Account
             from hyperliquid.exchange import Exchange
-            if not settings.hyperliquid_wallet_key:
+            key = None
+            try:
+                import asyncio
+                from app.services.credential_service import get_exchange_keys
+                uid = _get_user_id()
+                hl_creds = asyncio.get_event_loop().run_until_complete(
+                    get_exchange_keys(uid, "hyperliquid")
+                )
+                key = hl_creds.get("wallet_key") or None
+            except Exception:
+                pass
+            if not key:
+                key = settings.hyperliquid_wallet_key
+            if not key:
                 raise RuntimeError(
                     "HYPERLIQUID_WALLET_KEY is not configured. "
                     "Set it in Settings → API Keys or as an environment variable."
                 )
-            wallet = Account.from_key(settings.hyperliquid_wallet_key)
+            wallet = Account.from_key(key)
             self._exchange = Exchange(wallet, "https://api.hyperliquid.xyz")
         return self._exchange
 
@@ -277,26 +290,33 @@ class AccumulationService:
         balances only — perp positions are shown separately in portfolio.
         """
         if force_live or self._is_live():
-            from app.config import settings as _s
-            addr = _s.hyperliquid_wallet_address
-            if addr:
-                from app.services.hl_live_trading import hl_live_trading as _hl
-                result = []
-
-                try:
-                    state = await _hl._get_info().spot_user_state(addr)
-                    for b in (state.get("balances", []) if isinstance(state, dict) else []):
-                        coin = b.get("coin", "")
-                        total = float(b.get("total", 0))
-                        if total == 0:
-                            continue
-                        hold = float(b.get("hold", 0))
-                        result.append({"asset": coin, "available": total - hold, "locked": hold})
-                except Exception as e:
-                    logger.warning(f"Live HL spot_user_state failed: {e}")
-
-                return result
-            return []
+            uid = _get_user_id()
+            addr = None
+            try:
+                from app.services.credential_service import get_exchange_keys
+                hl_creds = await get_exchange_keys(uid, "hyperliquid")
+                addr = hl_creds.get("wallet_address") or None
+            except Exception:
+                pass
+            if not addr:
+                from app.config import settings as _s
+                addr = _s.hyperliquid_wallet_address
+            if not addr:
+                return []
+            from app.services.hl_live_trading import hl_live_trading as _hl
+            result = []
+            try:
+                state = await _hl._get_info().spot_user_state(addr)
+                for b in (state.get("balances", []) if isinstance(state, dict) else []):
+                    coin = b.get("coin", "")
+                    total = float(b.get("total", 0))
+                    if total == 0:
+                        continue
+                    hold = float(b.get("hold", 0))
+                    result.append({"asset": coin, "available": total - hold, "locked": hold})
+            except Exception as e:
+                logger.warning(f"Live HL spot_user_state failed: {e}")
+            return result
         async with get_async_session() as db:
             rows = await db.execute(
                 select(DBBalance).where(
