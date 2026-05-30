@@ -1,3 +1,4 @@
+import asyncio
 import hmac
 import hashlib
 import json
@@ -144,51 +145,29 @@ class PhemexClient:
     # Market data
     # ------------------------------------------------------------------
 
-    async def get_klines(self, symbol: str, interval: str = "1h", limit: int = 100) -> List[Dict[str, Any]]:
-        # Binance is the primary data source (reliable, no auth needed).
-        # Phemex /kline/last caps at 5 rows regardless of size, so it's not useful.
-        return await self._get_binance_klines(symbol, interval, limit)
+    _hl_last_call: float = 0.0
+    _hl_lock: asyncio.Lock = asyncio.Lock()
 
-    async def _get_binance_klines(self, symbol: str, interval: str, limit: int) -> List[Dict[str, Any]]:
-        """Fetch klines from Binance, falling back to Hyperliquid perps candle API."""
-        result = await self._try_binance_klines(symbol, interval, limit)
-        if result:
-            return result
+    async def get_klines(self, symbol: str, interval: str = "1h", limit: int = 100) -> List[Dict[str, Any]]:
+        # Binance returns 451 from Railway — skip to Hyperliquid directly.
+        # Phemex /kline/last caps at 5 rows regardless of size, not useful.
         return await self._try_hyperliquid_klines(symbol, interval, limit)
 
-    async def _try_binance_klines(self, symbol: str, interval: str, limit: int) -> List[Dict[str, Any]]:
-        for attempt in range(3):
-            try:
-                async with httpx.AsyncClient(timeout=30.0) as client:
-                    response = await client.get(
-                        "https://api.binance.com/api/v3/klines",
-                        params={"symbol": symbol, "interval": interval, "limit": limit}
-                    )
-                    response.raise_for_status()
-                    data = response.json()
-                    result = []
-                    for k in data:
-                        result.append([
-                            int(k[0] / 1000), "60",
-                            k[1], k[2], k[3], k[4], k[5], k[5], symbol
-                        ])
-                    if result:
-                        return result
-            except Exception as exc:
-                logger.warning(f"Binance klines attempt {attempt+1} failed: {exc}")
-                if attempt < 2:
-                    import asyncio
-                    await asyncio.sleep(2 ** attempt)
-        return []
-
     async def _try_hyperliquid_klines(self, symbol: str, interval: str, limit: int) -> List[Dict[str, Any]]:
-        """Fallback: use Hyperliquid perpetual candle snapshots."""
+        """Fetch klines from Hyperliquid perpetual candle snapshots with rate limiting."""
         resolution_map = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d"}
         hl_interval = resolution_map.get(interval, "1h")
         coin = symbol.replace("USDT", "").replace("USD", "")
-        import asyncio
+        import random
         for attempt in range(3):
             try:
+                # Rate limit: max 5 requests/sec per HL API policy
+                async with self._hl_lock:
+                    now = time.time()
+                    if now - self._hl_last_call < 0.2:
+                        await asyncio.sleep(0.2 - (now - self._hl_last_call) + random.uniform(0, 0.1))
+                    self._hl_last_call = time.time()
+
                 end = int(time.time() * 1000)
                 period_ms = {"1m": 60000, "5m": 300000, "15m": 900000, "1h": 3600000, "4h": 14400000, "1d": 86400000}
                 start = end - period_ms.get(interval, 3600000) * limit
@@ -203,12 +182,10 @@ class PhemexClient:
                         result.append([ts, "60", k["o"], k["h"], k["l"], k["c"], k["v"], k["v"], symbol])
                     if result:
                         return result
-                    if attempt < 2:
-                        await asyncio.sleep(1.5 ** attempt)
             except Exception as exc:
-                logger.warning(f"Hyperliquid klines attempt {attempt+1} failed: {exc}")
-                if attempt < 2:
-                    await asyncio.sleep(1.5 ** attempt)
+                logger.warning(f"Hyperliquid klines attempt {attempt+1} for {symbol} {interval}: {exc}")
+            if attempt < 2:
+                await asyncio.sleep(1.0 + random.uniform(0, 0.5))
         return []
 
     async def get_ticker(self, symbol: str) -> Dict[str, Any]:
