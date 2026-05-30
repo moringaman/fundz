@@ -69,6 +69,7 @@ class Settings(BaseSettings):
     llm_model: str = "mistralai/mixtral-8x7b-instruct"
     llm_temperature: float = 0.7
     llm_max_tokens: int = 1000
+    llm_endpoint_url: Optional[str] = None
 
     # Clerk authentication
     clerk_secret_key: Optional[str] = None
