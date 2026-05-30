@@ -2,7 +2,7 @@ import logging
 from typing import Dict, Any
 
 from app.services.agent_scheduler import agent_scheduler
-from app.services.paper_trading import paper_trading
+from app.services.paper_trading import paper_trading, get_current_user_id
 from app.config import settings
 
 logger = logging.getLogger(__name__)

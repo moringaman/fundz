@@ -12,6 +12,7 @@ from app.database import get_db
 from app.clients.phemex import PhemexClient
 from app.clients.hyperliquid import HyperliquidClient
 from app.config import settings
+from app.services.paper_trading import get_current_user_id
 from app.models import (
     Trade as DBTrade, 
     Balance as DBBalance, 
