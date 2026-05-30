@@ -186,25 +186,34 @@ class PhemexClient:
         resolution_map = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d"}
         hl_interval = resolution_map.get(interval, "1h")
         coin = symbol.replace("USDT", "").replace("USD", "")
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                payload = {"type": "candleSnapshot", "req": {"coin": coin, "interval": hl_interval, "limit": limit}}
-                response = await client.post("https://api.hyperliquid.xyz/info", json=payload)
-                response.raise_for_status()
-                data = response.json()
-                result = []
-                for k in data:
-                    ts = int(k["t"] / 1000) if isinstance(k.get("t"), (int, float)) else int(k[0] / 1000)
-                    o = k.get("o", k[1])
-                    h = k.get("h", k[2])
-                    l = k.get("l", k[3])
-                    c = k.get("c", k[4])
-                    v = k.get("v", k[5])
-                    result.append([ts, "60", o, h, l, c, v, v, symbol])
-                if result:
-                    return result
-        except Exception as exc:
-            logger.warning(f"Hyperliquid klines fallback failed: {exc}")
+        import asyncio
+        for attempt in range(3):
+            try:
+                end = int(time.time() * 1000)
+                period_ms = {"1m": 60000, "5m": 300000, "15m": 900000, "1h": 3600000, "4h": 14400000, "1d": 86400000}
+                start = end - period_ms.get(interval, 3600000) * limit
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    payload = {"type": "candleSnapshot", "req": {"coin": coin, "interval": hl_interval, "startTime": start, "endTime": end}}
+                    response = await client.post("https://api.hyperliquid.xyz/info", json=payload)
+                    response.raise_for_status()
+                    data = response.json()
+                    result = []
+                    for k in data:
+                        ts = int(k["t"] / 1000) if isinstance(k.get("t"), (int, float)) else int(k[0] / 1000)
+                        o = k.get("o", k[1])
+                        h = k.get("h", k[2])
+                        l = k.get("l", k[3])
+                        c = k.get("c", k[4])
+                        v = k.get("v", k[5])
+                        result.append([ts, "60", o, h, l, c, v, v, symbol])
+                    if result:
+                        return result
+                    if attempt < 2:
+                        await asyncio.sleep(1.5 ** attempt)
+            except Exception as exc:
+                logger.warning(f"Hyperliquid klines attempt {attempt+1} failed: {exc}")
+                if attempt < 2:
+                    await asyncio.sleep(1.5 ** attempt)
         return []
 
     async def get_ticker(self, symbol: str) -> Dict[str, Any]:
