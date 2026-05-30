@@ -235,7 +235,7 @@ class LLMService:
                 url = url.rstrip('/')
                 if url.endswith('/chat/completions'):
                     url = url[:-len('/chat/completions')]
-            key = api_key or "not-needed"
+            key = api_key or settings.openai_api_key or "not-needed"
             if url:
                 self._client = AsyncOpenAI(api_key=key, base_url=url)
         logger.info(f"LLM Service initialized with provider: {self.provider}, model: {self.model}")
