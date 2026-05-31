@@ -1,8 +1,10 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from typing import Any, List, Optional, Dict
 from pydantic import BaseModel
 from datetime import datetime, date
 
+from app.auth import get_optional_user_id
+from app.services.paper_trading import set_current_user_id
 from app.services.research_analyst import research_analyst
 from app.services.fund_manager import fund_manager
 from app.services.risk_manager import risk_manager
@@ -15,6 +17,13 @@ from app.services.daily_report import daily_report_service
 from app.services.firm_advisor import firm_advisor
 
 router = APIRouter(prefix="/fund", tags=["fund"])
+
+
+def _user_dep(user_id: Optional[str] = Depends(get_optional_user_id)) -> str:
+    """Set user context for multi-tenant DB scoping."""
+    uid = user_id or "default-user"
+    set_current_user_id(uid)
+    return uid
 
 
 # ── Performance gate helper ────────────────────────────────────────────────
@@ -1000,7 +1009,7 @@ async def get_retro_adjustments(
 # ==================== Trader Endpoints ====================
 
 @router.get("/traders/leaderboard")
-async def get_trader_leaderboard():
+async def get_trader_leaderboard(_=Depends(_user_dep)):
     """Get trader leaderboard with allocation and performance data.
 
     P&L and win rate are sourced from actual closed DB trades (net of fees),
