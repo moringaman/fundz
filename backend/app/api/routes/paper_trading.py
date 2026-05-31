@@ -164,10 +164,10 @@ async def adjust_paper_balance(req: AdjustBalanceRequest):
 
 
 @router.get("/portfolio")
-async def get_paper_portfolio(tenant_id: str = Depends(get_current_user_id)):
+async def get_paper_portfolio(_=Depends(_user_dep)):
     """Canonical portfolio summary — single source of truth for balances,
     positions value, total capital, and exposure."""
-    balances = await paper_trading.get_all_balances(tenant_id)
+    balances = await paper_trading.get_all_balances()
     positions = await paper_trading.get_positions_live()
 
     # Cash balances — only show USDT (this is a futures system, not spot;
@@ -431,7 +431,7 @@ async def get_performance_chart(limit: int = 2000):
 
 
 @router.get("/pending-orders")
-async def list_pending_orders(agent_id: Optional[str] = None):
+async def list_pending_orders(agent_id: Optional[str] = None, _=Depends(_user_dep)):
     """List all pending (unfilled) limit/stop orders."""
     return await paper_trading.get_pending_orders(agent_id=agent_id)
 

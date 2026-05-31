@@ -4893,13 +4893,13 @@ class AgentScheduler:
         self._cycle_pending_signals = {}
 
         # Set the user context for paper trading (which uses a ContextVar).
-        # Single-tenant: grab any agent's user_id from the DB.
+        # Single-tenant: grab the first user from the users table.
         try:
             from app.database import AsyncSessionLocal
-            from app.models import Agent as DBAgent
+            from app.models import User
             from sqlalchemy import select as sa_select
             async with AsyncSessionLocal() as _s:
-                _row = (await _s.execute(sa_select(DBAgent.user_id).limit(1))).scalar()
+                _row = (await _s.execute(sa_select(User.id).limit(1))).scalar()
             if _row:
                 from app.services.paper_trading import set_current_user_id
                 set_current_user_id(_row)

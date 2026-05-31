@@ -138,11 +138,11 @@ class PaperTradingService:
     # ------------------------------------------------------------------
 
     async def get_all_balances(self, tenant_id: str = None) -> List[PaperBalance]:
-        tenant_id = tenant_id or get_current_user_id()
-        """Return all paper-trading balances for the given tenant (trading fund only)."""
+        uid = tenant_id or get_current_user_id()
         async with get_async_session() as db:
             result = await db.execute(
                 select(PaperBalance).where(
+                    PaperBalance.user_id == uid,
                     PaperBalance.fund_type != "accumulation",
                 )
             )
@@ -1014,9 +1014,10 @@ class PaperTradingService:
     # ── Pending Orders (limit/stop orders waiting to fill) ───────────────
 
     async def get_pending_orders(self, agent_id: Optional[str] = None) -> List[PaperOrder]:
-        """Return all pending (unfilled) limit/stop orders."""
+        """Return all pending (unfilled) limit/stop orders for the current user."""
         async with get_async_session() as db:
             q = select(PaperOrder).where(
+                PaperOrder.user_id == get_current_user_id(),
                 PaperOrder.status == OrderStatus.PENDING,
                 PaperOrder.is_paper == True,
             ).order_by(PaperOrder.created_at.desc())
