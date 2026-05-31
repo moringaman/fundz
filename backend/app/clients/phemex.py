@@ -147,6 +147,24 @@ class PhemexClient:
 
     _hl_last_call: float = 0.0
     _hl_lock: asyncio.Lock = asyncio.Lock()
+    _hl_universe: Optional[set] = None
+    _hl_universe_ts: float = 0.0
+
+    async def _ensure_hl_universe(self) -> set:
+        """Cache the set of coin names available on Hyperliquid (refreshed hourly)."""
+        if self._hl_universe is not None and time.time() - self._hl_universe_ts < 3600:
+            return self._hl_universe
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post("https://api.hyperliquid.xyz/info", json={"type": "meta"})
+                resp.raise_for_status()
+                data = resp.json()
+                self._hl_universe = {u["name"] for u in data.get("universe", [])}
+                self._hl_universe_ts = time.time()
+        except Exception:
+            if self._hl_universe is None:
+                self._hl_universe = set()
+        return self._hl_universe
 
     async def get_klines(self, symbol: str, interval: str = "1h", limit: int = 100) -> List[Dict[str, Any]]:
         # Binance returns 451 from Railway — skip to Hyperliquid directly.
@@ -158,14 +176,18 @@ class PhemexClient:
         resolution_map = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d"}
         hl_interval = resolution_map.get(interval, "1h")
         coin = symbol.replace("USDT", "").replace("USD", "")
+        universe = await self._ensure_hl_universe()
+        if coin not in universe:
+            logger.debug(f"Coin {coin} not on Hyperliquid, skipping klines for {symbol}")
+            return []
         import random
-        for attempt in range(3):
+        for attempt in range(2):
             try:
                 # Rate limit: max 5 requests/sec per HL API policy
                 async with self._hl_lock:
                     now = time.time()
-                    if now - self._hl_last_call < 0.2:
-                        await asyncio.sleep(0.2 - (now - self._hl_last_call) + random.uniform(0, 0.1))
+                    if now - self._hl_last_call < 0.25:
+                        await asyncio.sleep(0.25 - (now - self._hl_last_call) + random.uniform(0, 0.1))
                     self._hl_last_call = time.time()
 
                 end = int(time.time() * 1000)
@@ -182,9 +204,14 @@ class PhemexClient:
                         result.append([ts, "60", k["o"], k["h"], k["l"], k["c"], k["v"], k["v"], symbol])
                     if result:
                         return result
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code in (400, 422, 500):
+                    logger.debug(f"Hyperliquid klines failed for {symbol} {interval}: {exc.response.status_code}")
+                    return []
+                logger.warning(f"Hyperliquid klines attempt {attempt+1} for {symbol} {interval}: {exc}")
             except Exception as exc:
                 logger.warning(f"Hyperliquid klines attempt {attempt+1} for {symbol} {interval}: {exc}")
-            if attempt < 2:
+            if attempt < 1:
                 await asyncio.sleep(1.0 + random.uniform(0, 0.5))
         return []
 

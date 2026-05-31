@@ -1,5 +1,6 @@
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
+import httpx
 import json
 import logging
 from app.config import settings
@@ -237,7 +238,8 @@ class LLMService:
                     url = url[:-len('/chat/completions')]
             key = api_key or settings.openai_api_key or "not-needed"
             if url:
-                self._client = AsyncOpenAI(api_key=key, base_url=url)
+                _http = httpx.AsyncClient(timeout=60.0, headers={"User-Agent": "Mozilla/5.0"})
+                self._client = AsyncOpenAI(api_key=key, base_url=url, http_client=_http)
                 logger.info(f"LLM client created: base_url={url}, key_prefix={key[:8]}...")
         logger.info(f"LLM Service initialized with provider: {self.provider}, model: {self.model}")
 
