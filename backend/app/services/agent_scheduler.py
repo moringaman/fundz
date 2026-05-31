@@ -4893,18 +4893,27 @@ class AgentScheduler:
         self._cycle_pending_signals = {}
 
         # Set the user context for paper trading (which uses a ContextVar).
-        # Single-tenant: grab the first user from the users table.
         try:
             from app.database import AsyncSessionLocal
             from app.models import User
             from sqlalchemy import select as sa_select
+            from app.services.paper_trading import set_current_user_id
+
             async with AsyncSessionLocal() as _s:
                 _row = (await _s.execute(sa_select(User.id).limit(1))).scalar()
+                if not _row:
+                    # Ensure the first Clerk user exists and create a User row
+                    _clerk_id = "user_3EMbdZ9YSddOxmMWin0cAT5ep8t"
+                    _existing = await _s.get(User, _clerk_id)
+                    if not _existing:
+                        _s.add(User(id=_clerk_id, username=_clerk_id, email=f"{_clerk_id}@clerk", hashed_password="clerk"))
+                        await _s.commit()
+                        logger.info(f"Created User record for {_clerk_id}")
+                    _row = _clerk_id
             if _row:
-                from app.services.paper_trading import set_current_user_id
                 set_current_user_id(_row)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(f"Scheduler user context setup failed: {exc}")
 
         # Refresh per-symbol GMM regime cache once per pass so the per-agent
         # _build_market_context (sync) can inject up-to-date regime labels
